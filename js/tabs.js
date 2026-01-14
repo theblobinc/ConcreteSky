@@ -137,6 +137,21 @@ function enablePanelResize(root) {
     return extra + (cols * CARD) + ((cols - 1) * GAP);
   };
 
+  const calcCardExtra = (panelEl, opts = {}) => {
+    const scrollbarAllowance = Math.max(0, Number(opts.scrollbarAllowance ?? 18));
+    const wrapPad = Math.max(0, Number(opts.wrapPad ?? 10));
+    const wrapBorder = Math.max(0, Number(opts.wrapBorder ?? 1));
+    const cs = window.getComputedStyle(panelEl);
+    const panelPad = pxNum(cs.paddingLeft) + pxNum(cs.paddingRight);
+    return panelPad + (wrapPad * 2) + (wrapBorder * 2) + scrollbarAllowance;
+  };
+
+  const widthForCardCols = (panelEl, cols, opts = {}) => {
+    const extra = calcCardExtra(panelEl, opts);
+    const c = Math.max(1, Math.floor(cols || 1));
+    return extra + (c * CARD) + ((c - 1) * GAP);
+  };
+
   const snapGeneric = (px) => {
     const MIN = 350;
     const MAX = 1750;
@@ -161,6 +176,95 @@ function enablePanelResize(root) {
   };
 
   const widths = loadJson('bsky_panel_widths', {});
+
+  const getVisiblePanels = () => panels.filter((p) => !p.hasAttribute('hidden'));
+
+  const autoFitVisiblePanels = () => {
+    const visible = getVisiblePanels();
+    if (!visible.length) return;
+    const wrapW = panelsWrap?.getBoundingClientRect()?.width || 0;
+    if (!wrapW || wrapW < 50) return;
+
+    // Only auto-fit panels that the user hasn't manually resized.
+    const manual = new Map();
+    const auto = [];
+    for (const p of visible) {
+      const name = p.getAttribute('data-panel') || '';
+      const saved = widths?.[name];
+      if (saved && Number.isFinite(saved)) {
+        const w = snapForPanel(p, name, saved);
+        manual.set(p, { name, width: w });
+      } else {
+        auto.push({ el: p, name });
+      }
+    }
+
+    // Apply manual widths first (they consume space).
+    let used = 0;
+    for (const { width } of manual.values()) used += width;
+
+    const gaps = Math.max(0, visible.length - 1) * PANELS_GAP;
+    let remaining = Math.max(0, wrapW - gaps - used);
+
+    // If everything is manual, still enforce the fixed basis (prevents flex-grow stretch).
+    for (const [p, { width }] of manual.entries()) {
+      p.style.flex = `0 0 ${width}px`;
+      p.style.flexBasis = `${width}px`;
+    }
+
+    if (!auto.length) return;
+
+    // Greedily distribute card columns to maximize total columns in the available width.
+    // Start each auto panel at its minimum.
+    const maxCols = DEFAULT_MAX_COLS;
+    const state = auto.map(({ el, name }) => {
+      const minW = minForPanel(el, name);
+      return { el, name, cols: 1, width: minW };
+    });
+
+    const minSum = state.reduce((s, x) => s + x.width, 0);
+    if (minSum > remaining) {
+      // Not enough room to satisfy mins; fall back to flexing so the UI remains usable.
+      for (const s of state) {
+        s.el.style.flex = `1 1 ${s.width}px`;
+        s.el.style.flexBasis = `${s.width}px`;
+      }
+      return;
+    }
+    remaining -= minSum;
+
+    // Round-robin: add one column at a time while it fits.
+    // (Keeps the distribution fair and avoids a single panel hogging all space.)
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+      for (const s of state) {
+        if (s.name !== 'posts' && s.name !== 'connections') continue;
+        if (s.cols >= maxCols) continue;
+        const nextW = widthForCardCols(s.el, s.cols + 1);
+        const delta = nextW - s.width;
+        if (delta <= remaining) {
+          s.cols += 1;
+          s.width = nextW;
+          remaining -= delta;
+          progressed = true;
+        }
+      }
+    }
+
+    // Apply widths (fixed basis, no stretch).
+    for (const s of state) {
+      const w = snapForPanel(s.el, s.name, s.width);
+      s.el.style.flex = `0 0 ${w}px`;
+      s.el.style.flexBasis = `${w}px`;
+    }
+  };
+
+  // Keep panels packed to content on load and when visible set changes.
+  // Manual resize is persisted in widths[] and overrides auto-fit.
+  const scheduleAutoFit = () => {
+    requestAnimationFrame(() => autoFitVisiblePanels());
+  };
   for (const p of panels) {
     const name = p.getAttribute('data-panel');
     if (!name) continue;
@@ -236,10 +340,18 @@ function enablePanelResize(root) {
       saveJson('bsky_panel_widths', widths);
       p.style.flex = '';
       p.style.flexBasis = '';
+      scheduleAutoFit();
       e.preventDefault();
       e.stopPropagation();
     });
   }
+
+  // Auto-fit after initial handles are installed.
+  scheduleAutoFit();
+
+  // Re-fit when tabs/panels visibility changes or viewport changes.
+  root.addEventListener('bsky-tabs-changed', scheduleAutoFit);
+  window.addEventListener('resize', scheduleAutoFit);
 }
 
 function initTabs(root) {
