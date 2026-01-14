@@ -161,6 +161,16 @@ class BskyMyPosts extends HTMLElement {
     };
   }
 
+  _cssPx(varName, fallback) {
+    try {
+      const raw = getComputedStyle(this).getPropertyValue(varName);
+      const n = Number.parseFloat(String(raw || ''));
+      return Number.isFinite(n) ? n : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
   connectedCallback(){
     this.render();
     this.load(true);
@@ -200,21 +210,47 @@ class BskyMyPosts extends HTMLElement {
       return;
     }
 
-    const host = this.shadowRoot.querySelector('.posts.magic');
+    const host = this.shadowRoot.querySelector('.entries.magic');
     if (!host) return;
+
+    const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+    const scroller = shell?.getScroller?.() || null;
+
+    const MIN = this._cssPx('--bsky-card-min-w', 350);
+    const GAP = this._cssPx('--bsky-card-gap', 8);
+
+    const updateLayout = () => {
+      try {
+        const fallback = this.getBoundingClientRect?.().width || 0;
+        const available = scroller?.clientWidth || scroller?.getBoundingClientRect?.().width || fallback || 0;
+        if (!available || available < 2) return;
+
+        // Choose columns based on *minimum* width, then compute the actual column width
+        // to fill the available space.
+        const cols = Math.max(1, Math.floor((available + GAP) / (MIN + GAP)));
+        const cardW = Math.max(1, Math.floor((available - ((cols - 1) * GAP)) / cols));
+
+        // Expose computed width to CSS and keep MagicGrid aligned.
+        this.style.setProperty('--bsky-card-w', `${cardW}px`);
+        host.style.width = '100%';
+        host.style.maxWidth = '100%';
+
+        if (this._magic) this._magic.itemWidth = cardW;
+      } catch {}
+    };
 
     if (!this._magic) {
       try {
         this._magic = new MagicGrid({
           container: host,
           static: true,
-          gutter: 12,
+          gutter: GAP,
           useTransform: false,
           animate: false,
           center: false,
           maxColumns: false,
           useMin: false,
-          itemWidth: 350,
+          itemWidth: null,
         });
       } catch {
         this._magic = null;
@@ -223,18 +259,28 @@ class BskyMyPosts extends HTMLElement {
       try { this._magic.setContainer(host); } catch {}
     }
 
+    updateLayout();
     try { this._magic?.positionItems?.(); } catch {}
 
-    if (!this._magicRO) {
-      try {
-        this._magicRO = new ResizeObserver(() => {
-          try { this._magic?.positionItems?.(); } catch {}
-        });
-        this._magicRO.observe(host);
-      } catch {
-        this._magicRO = null;
-      }
+    // The posts container is re-created on every render(), so always re-bind the observer.
+    if (this._magicRO) { try { this._magicRO.disconnect(); } catch {} this._magicRO = null; }
+    try {
+      this._magicRO = new ResizeObserver(() => {
+        updateLayout();
+        try { this._magic?.positionItems?.(); } catch {}
+      });
+      if (scroller) this._magicRO.observe(scroller);
+      // Also observe the custom element host as a fallback signal for panel width changes.
+      this._magicRO.observe(this);
+    } catch {
+      this._magicRO = null;
     }
+
+    // One extra RAF pass helps when flex layout settles after tab/show/resize.
+    requestAnimationFrame(() => {
+      updateLayout();
+      try { this._magic?.positionItems?.(); } catch {}
+    });
   }
 
   async refreshRecent(minutes=2){
@@ -314,7 +360,34 @@ class BskyMyPosts extends HTMLElement {
       const kind = cnt.getAttribute('data-kind'); // likes|reposts|replies
       const uri  = cnt.getAttribute('data-uri');
       const cid  = cnt.getAttribute('data-cid') || '';
+      // Clicking replies should open the thread/content panel.
+      if (kind === 'replies' && uri) {
+        this.dispatchEvent(new CustomEvent('bsky-open-content', {
+          detail: { uri, cid, spawnAfter: 'posts' },
+          bubbles: true,
+          composed: true,
+        }));
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+
       this.openInteractions(kind, uri, cid);
+      return;
+    }
+
+    // Open content panel when clicking a post card (but not on links/buttons).
+    const entry = e.target.closest?.('.entry');
+    if (entry) {
+      if (e.target.closest?.('a,button,input,select,textarea,[data-yt-id]')) return;
+      const uri = entry.getAttribute('data-uri') || '';
+      const cid = entry.getAttribute('data-cid') || '';
+      if (!uri) return;
+      this.dispatchEvent(new CustomEvent('bsky-open-content', {
+        detail: { uri, cid, spawnAfter: 'posts' },
+        bubbles: true,
+        composed: true,
+      }));
     }
   }
 
@@ -392,7 +465,7 @@ class BskyMyPosts extends HTMLElement {
         return;
       }
 
-      const limit = 50;
+      const limit = 100;
       const out = await call('cacheQueryMyPosts', {
         hours: Math.max(1, Number(this.filters.hours || 24)),
         limit,
@@ -448,13 +521,12 @@ class BskyMyPosts extends HTMLElement {
 
   filteredItems(){
     const allowed = this.filters.types;
-    const arr = this.items.filter(it => allowed.has(this.itemType(it)));
-    arr.sort((a,b) => {
-      const at = new Date((a.post?.record?.createdAt) || a.post?.indexedAt || 0);
-      const bt = new Date((b.post?.record?.createdAt) || b.post?.indexedAt || 0);
-      return bt - at;
-    });
-    return arr;
+    // IMPORTANT: preserve the existing list order.
+    // - Initial loads come from the DB already sorted newest→oldest.
+    // - Infinite scroll appends older entries.
+    // - Refresh prepends newer entries.
+    // Sorting here would reshuffle already-loaded entries.
+    return this.items.filter(it => allowed.has(this.itemType(it)));
   }
 
   // Build media/link preview HTML for a post
@@ -503,22 +575,20 @@ class BskyMyPosts extends HTMLElement {
             <option value="720" ${this.filters.hours===720?'selected':''}>Last 30 days</option>
           </select>
         </label>
-          <div class="filters">
-            <div class="types">
-              ${TYPES.map((t) => `
-                <label><input type="checkbox" data-type="${t}" ${this.filters.types.has(t) ? 'checked' : ''}> ${t}</label>
-              `).join('')}
-            </div>
-            <div class="actions">
-              <button id="reload" ${this.loading?'disabled':''}>Reload</button>
-              <button id="more" ${this.loading || !this.hasMore ? 'disabled' : ''}>More</button>
-            </div>
-          </div>
+        <div class="types">
+          ${TYPES.map((t) => `
+            <label><input type="checkbox" data-type="${t}" ${this.filters.types.has(t) ? 'checked' : ''}> ${t}</label>
+          `).join('')}
+        </div>
+        <div class="actions">
+          <button id="reload" ${this.loading?'disabled':''}>Reload</button>
+        </div>
+      </div>
     `;
 
     const ordered = this.filteredItems();
 
-        const cards = ordered.map((it) => {
+    const cards = ordered.map((it) => {
       const p = it.post || {};
       const rec = p.record || {};
       const text = esc(rec.text || '');
@@ -530,15 +600,13 @@ class BskyMyPosts extends HTMLElement {
       const kind = this.itemType(it);
       const embeds = this.renderEmbedsFor(it);
 
-      // data-* hooks so clicking opens the modal
       const uri = p.uri || '';
       const cid = p.cid || '';
       const key = uri || cid || String(rec.createdAt || p.indexedAt || when || '');
-          const sizeAttr = '';
 
       return {
         key,
-        html: `<article class="post"${sizeAttr} data-uri="${esc(uri)}" data-cid="${esc(cid)}">
+        html: `<article class="entry" data-uri="${esc(uri)}" data-cid="${esc(cid)}">
           <header class="meta">
             <span class="kind">${esc(kind)}</span>
             <span class="time">${esc(when)}</span>
@@ -555,30 +623,31 @@ class BskyMyPosts extends HTMLElement {
       };
     });
 
-    const postsHtml = cards.map(c => c.html).join('');
-    const listHtml = postsHtml || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No posts in this range.</div>');
+    const entriesHtml = cards.map(c => c.html).join('');
+    const listHtml = entriesHtml || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No posts in this range.</div>');
 
     this.shadowRoot.innerHTML = `
       <style>
         :host, *, *::before, *::after{box-sizing:border-box}
         :host{display:block;margin:0;--bsky-posts-ui-offset:290px}
-        .wrap{border:1px solid #333;border-radius:12px;padding:10px;background:#070707;color:#fff}
-        .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
-        .filters{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+        .filters{display:flex;gap:var(--bsky-panel-control-gap-dense, 6px);flex-wrap:wrap;align-items:center}
         .filters label{color:#ddd}
-        .types{display:flex;gap:10px;flex-wrap:wrap}
+        .types{display:flex;gap:var(--bsky-panel-control-gap-dense, 6px);flex-wrap:wrap}
         .actions{margin-left:auto}
 
-        .postsWrap{width:100%;max-height:calc(100vh - var(--bsky-posts-ui-offset));overflow:auto;padding-right:4px}
-
-        .posts{width:100%;display:block}
+        .entries{width:100%;display:block}
 
         /* MagicGrid: JS-positioned layout (library managed). */
-        .posts.magic{position:relative;display:block;width:100%;min-height:0}
-        /* Cards need a fixed width so MagicGrid can compute columns. Clamp to 350px but allow shrinking on very narrow panels. */
-        .posts.magic .post{width:350px;max-width:350px;margin:0}
+        .entries.magic{position:relative;display:block;max-width:100%;min-height:0}
+        /* Cards have a minimum width, but can expand to fill available space. */
+        .entries.magic .entry{
+          width:min(100%, var(--bsky-card-w, 350px));
+          max-width:min(100%, var(--bsky-card-w, 350px));
+          min-width:min(100%, var(--bsky-card-min-w, 350px));
+          margin:0;
+        }
 
-        .post{border:1px solid #333; border-radius:10px; padding:10px; margin:0; background:#0b0b0b; width:min(350px, 100%); max-width:350px}
+        .entry{border:1px solid #333; border-radius:10px; padding:6px; margin:0; background:#0b0b0b; width:100%; max-width:100%}
         .meta{display:flex; align-items:center; gap:10px; color:#bbb; font-size:.9rem; margin-bottom:6px}
         .meta .kind{background:#111;border:1px solid #444;border-radius:999px;padding:1px 8px}
         .meta .time{margin-left:auto}
@@ -589,54 +658,38 @@ class BskyMyPosts extends HTMLElement {
 
         /* External cards (generic) */
         .embeds{margin-top:8px}
-        .ext-card{
-          display:block; border:1px solid #333; border-radius:10px; overflow:hidden; background:#0f0f0f; width:100%;
-        }
-        .ext-card.link{ text-decoration:none; color:#fff; display:flex; flex-wrap:wrap; gap:0; width:100% }
-        .ext-card .thumb{ position:relative; flex:0 0 160px; max-width:100%; background:#111; } /* generic card */
-        .ext-card .thumb-img{ width:100%; height:100%; object-fit:cover; display:block }
-        .ext-card .meta{ padding:10px; display:flex; flex-direction:column; gap:6px; flex:1 1 220px; min-width:0; }
-        .ext-card .title{ font-weight:700; line-height:1.2 }
-        .ext-card .desc{ color:#ccc; font-size:.95rem; line-height:1.3; max-height:3.2em; overflow:hidden }
-        .ext-card .host{ color:#8aa; font-size:.85rem; margin-top:auto }
+        .ext-card{display:block;border:1px solid #333;border-radius:10px;overflow:hidden;background:#0f0f0f;width:100%}
+        .ext-card.link{text-decoration:none;color:#fff;display:flex;flex-wrap:wrap;gap:0;width:100%}
+        .ext-card .thumb{position:relative;flex:0 0 160px;max-width:100%;background:#111}
+        .ext-card .thumb-img{width:100%;height:100%;object-fit:cover;display:block}
+        .ext-card .meta{padding:10px;display:flex;flex-direction:column;gap:6px;flex:1 1 220px;min-width:0}
+        .ext-card .title{font-weight:700;line-height:1.2}
+        .ext-card .desc{color:#ccc;font-size:.95rem;line-height:1.3;max-height:3.2em;overflow:hidden}
+        .ext-card .host{color:#8aa;font-size:.85rem;margin-top:auto}
 
         /* Images grid */
-        .images-grid{
-          display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-          gap:6px; width:100%;
-        }
-        .img-wrap{margin:0; padding:0; background:#111; border-radius:8px; overflow:hidden}
-        .img-wrap img{ display:block; width:100%; height:100%; object-fit:cover }
+        .images-grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:6px;width:100%}
+        .img-wrap{margin:0;padding:0;background:#111;border-radius:8px;overflow:hidden}
+        .img-wrap img{display:block;width:100%;height:100%;object-fit:cover}
 
-        /* YouTube preview — OVERRIDE the generic card's 40% thumb.
-           This makes the preview thumb use full width of the column. */
-        .ext-card.yt{ cursor:pointer; }
-        .ext-card.yt .thumb{ width:100%; min-width:0; aspect-ratio: 16 / 9; background:#111; } /* <-- override width */
-        .ext-card.yt .thumb img{ width:100%; height:100%; object-fit:cover; display:block }
-        .ext-card.yt .play{
-          position:absolute; inset:auto; left:50%; top:50%;
-          transform:translate(-50%,-50%);
-          background:rgba(0,0,0,.55); border:2px solid #fff; border-radius:9999px;
-          padding:8px 14px; font-weight:700;
-        }
-        .ext-card.yt.iframe .yt-16x9{ position:relative; width:100%; }
-        .ext-card.yt.iframe .yt-16x9::before{ content:""; display:block; padding-top:56.25%; }
-        .ext-card.yt.iframe iframe{ position:absolute; inset:0; width:100%; height:100%; border:0; }
+        /* YouTube preview */
+        .ext-card.yt{cursor:pointer}
+        .ext-card.yt .thumb{width:100%;min-width:0;aspect-ratio:16/9;background:#111}
+        .ext-card.yt .thumb img{width:100%;height:100%;object-fit:cover;display:block}
+        .ext-card.yt .play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.55);border:2px solid #fff;border-radius:9999px;padding:8px 14px;font-weight:700}
+        .ext-card.yt.iframe .yt-16x9{position:relative;width:100%}
+        .ext-card.yt.iframe .yt-16x9::before{content:"";display:block;padding-top:56.25%}
+        .ext-card.yt.iframe iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
 
         /* Video poster (Bluesky video) */
-        .ext-card.video{ text-decoration:none; color:#fff; display:flex; gap:0; }
-        .ext-card.video{ flex-wrap:wrap; }
-        .ext-card.video .thumb{ position:relative; flex:0 0 160px; max-width:100%; background:#111; display:flex; align-items:center; justify-content:center }
-        .ext-card.video .thumb img{ width:100%; height:100%; object-fit:cover; display:block }
-        .ext-card.video .play{
-          position:absolute; left:50%; top:50%; transform:translate(-50%,-50%);
-          background:rgba(0,0,0,.55); border:2px solid #fff; border-radius:9999px; padding:8px 14px; font-weight:700;
-        }
+        .ext-card.video{text-decoration:none;color:#fff;display:flex;gap:0;flex-wrap:wrap}
+        .ext-card.video .thumb{position:relative;flex:0 0 160px;max-width:100%;background:#111;display:flex;align-items:center;justify-content:center}
+        .ext-card.video .thumb img{width:100%;height:100%;object-fit:cover;display:block}
+        .ext-card.video .play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.55);border:2px solid #fff;border-radius:9999px;padding:8px 14px;font-weight:700}
 
-        /* Stack external cards when the panel is narrow */
         @media (max-width: 520px){
-          .ext-card .thumb{ flex:0 0 100%; min-width:0 }
-          .ext-card .meta{ flex:0 0 100% }
+          .ext-card .thumb{flex:0 0 100%;min-width:0}
+          .ext-card .meta{flex:0 0 100%}
           :host{--bsky-posts-ui-offset:240px}
         }
 
@@ -644,22 +697,35 @@ class BskyMyPosts extends HTMLElement {
         button:disabled{opacity:.6;cursor:not-allowed}
         select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:10px;padding:6px 10px}
         .muted{color:#aaa}
-        .footer{margin-top:8px;display:flex;justify-content:center}
+        .footer{display:flex;justify-content:center}
       </style>
-      <div class="wrap">
-        <div class="head"><div><strong>Posts</strong></div></div>
-        ${filters}
-        <div class="postsWrap" role="region" aria-label="Posts list">
-          <div class="posts magic">
-            ${listHtml}
-          </div>
+      <bsky-panel-shell title="Posts" dense style="--bsky-panel-ui-offset: var(--bsky-posts-ui-offset)">
+        <div slot="toolbar">${filters}</div>
+
+        <div class="entries magic" role="region" aria-label="Posts list">
+          ${listHtml}
         </div>
+
         ${this.error ? `<div class="muted" style="color:#f88">Error: ${esc(this.error)}</div>` : ''}
-        <div class="footer">
+
+        <div slot="footer" class="footer">
           <button id="more" ${this.loading || !this.cursor ? 'disabled':''}>${this.cursor ? 'Load more' : 'No more'}</button>
         </div>
-      </div>
+      </bsky-panel-shell>
     `;
+
+    // Infinite scroll: load the next page when nearing the bottom.
+    const scroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.();
+    if (scroller) {
+      scroller.addEventListener('scroll', () => {
+        if (this.loading) return;
+        if (!this.cursor) return;
+        const threshold = 220;
+        if (scroller.scrollTop + scroller.clientHeight >= (scroller.scrollHeight - threshold)) {
+          this.load(false);
+        }
+      }, { passive: true });
+    }
 
     this.view = 'magic';
     queueMicrotask(() => this.ensureMagicGrid());

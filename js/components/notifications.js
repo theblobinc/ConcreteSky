@@ -149,6 +149,18 @@ class BskyNotifications extends HTMLElement {
   onClick(e){
     if (e.target.closest('#reload'))      { this.load(true); return; }
     if (e.target.closest('#follow-all'))  { this.followAll(e.target.closest('#follow-all')); return; }
+    const openBtn = e.target.closest?.('[data-open-content][data-uri]');
+    if (openBtn) {
+      const uri = openBtn.getAttribute('data-uri') || '';
+      if (uri) {
+        this.dispatchEvent(new CustomEvent('bsky-open-content', {
+          detail: { uri, cid: '' },
+          bubbles: true,
+          composed: true,
+        }));
+      }
+      return;
+    }
     const followBtn = e.target.closest('[data-follow-did]');
     if (followBtn) { this.followOne(followBtn.getAttribute('data-follow-did'), followBtn); return; }
   }
@@ -320,6 +332,7 @@ class BskyNotifications extends HTMLElement {
   }
 
   render(){
+    const embedded = this.hasAttribute('embedded');
     const bulkBadge = this._bulkState.running
       ? `<span class="bulk-progress">Following ${this._bulkState.done}/${this._bulkState.total}…</span>`
       : '';
@@ -361,9 +374,14 @@ class BskyNotifications extends HTMLElement {
       const following = !!rel.following;
       const followsYou = !!rel.followedBy;
       const open = atUriToWebPost(n.reasonSubject);
+      const canView = !!open && String(n.reasonSubject || '').startsWith('at://');
       const cta = a.did && !following
         ? `<button class="follow-btn" data-follow-did="${esc(a.did)}">${followsYou ? 'Follow back' : 'Follow'}</button>`
         : `<span class="following-badge" ${following?'':'style="display:none"'}>${followsYou ? 'Mutuals' : 'Following'}</span>`;
+
+      const viewBtn = canView
+        ? `<button class="view-btn" type="button" data-open-content data-uri="${esc(String(n.reasonSubject || ''))}">View</button>`
+        : '';
 
       return `<div class="n">
         <img class="av" src="${esc(a.avatar || '')}" alt="" onerror="this.style.display='none'">
@@ -371,16 +389,18 @@ class BskyNotifications extends HTMLElement {
           <div class="line">${esc(this.labelFor(n))} ${followsYou ? '<span class="chip">Follows you</span>' : ''}</div>
           <div class="sub">@${esc(a.handle || '')} • ${esc(t)}${open ? ` • <a class="open" href="${esc(open)}" target="_blank" rel="noopener">Open</a>` : ''}</div>
         </div>
-        <div class="act">${cta}</div>
+        <div class="act">${viewBtn}${cta}</div>
       </div>`;
     }).join('');
 
     this.shadowRoot.innerHTML = `
       <style>
         :host, *, *::before, *::after{box-sizing:border-box}
-        :host{display:block;margin:12px 0}
+        :host{display:block;margin:${embedded ? '0' : '12px 0'}}
         .wrap{border:1px solid #333;border-radius:12px;padding:10px;background:#070707;color:#fff}
+        .wrap.embedded{border:0;border-radius:0;padding:0;background:transparent}
         .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+        .head.embedded{display:none}
         .filters{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
         .filters label{color:#ddd}
         .only-not{margin-left:6px}
@@ -401,10 +421,11 @@ class BskyNotifications extends HTMLElement {
         .muted{color:#aaa}
         button{background:#111;border:1px solid #555;color:#fff;padding:6px 10px;border-radius:8px;cursor:pointer}
         button:disabled{opacity:.6;cursor:not-allowed}
+        .view-btn{margin-right:8px}
         select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:10px;padding:6px 10px}
       </style>
-      <div class="wrap">
-        <div class="head"><div><strong>Notifications</strong></div></div>
+      <div class="wrap ${embedded ? 'embedded' : ''}">
+        <div class="head ${embedded ? 'embedded' : ''}"><div><strong>Notifications</strong></div></div>
         ${filters}
         <div class="list ${esc(this.view)}">
           ${rows || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No notifications in this range.</div>')}

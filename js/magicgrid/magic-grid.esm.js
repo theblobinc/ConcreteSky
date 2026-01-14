@@ -153,18 +153,21 @@ export default class MagicGrid extends EventEmitter {
     const items = this.items();
 
     for (let i = 0; i < items.length; i++) {
-      if (this.styledItems.has(items[i])) continue;
-
       const style = items[i].style;
+
+      // Always ensure positioning is correct.
       style.position = "absolute";
-      // Force width when provided so measurement stays stable across layouts.
+
+      // If caller provided an explicit width, keep it in sync even for
+      // previously-styled items (supports responsive column widths).
       if (this.itemWidth) style.width = `${this.itemWidth}px`;
 
-      if (this.animate) {
-        style.transition = `${this.useTransform ? "transform" : "top, left"} 0.2s ease`;
+      if (!this.styledItems.has(items[i])) {
+        if (this.animate) {
+          style.transition = `${this.useTransform ? "transform" : "top, left"} 0.2s ease`;
+        }
+        this.styledItems.add(items[i]);
       }
-
-      this.styledItems.add(items[i]);
     }
   }
 
@@ -198,7 +201,9 @@ export default class MagicGrid extends EventEmitter {
   setup() {
     let width = this._containerWidth();
     const colWidth = this.colWidth();
-    let numCols = Math.floor(width / colWidth) || 1;
+    // Total width for N columns is: N * colWidth - gutter (no trailing gutter).
+    // Therefore N = floor((width + gutter) / colWidth).
+    let numCols = Math.floor((width + this.gutter) / colWidth) || 1;
     const cols = [];
 
     if (this.maxColumns && numCols > this.maxColumns) {

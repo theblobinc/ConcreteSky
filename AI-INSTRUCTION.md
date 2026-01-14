@@ -97,9 +97,34 @@ ConcreteSky supports an optional JWT (HS256) auth mode for programmatic callers 
   - `CONCRETESKY_JWT_SECRET=<long random secret>`
   - `CONCRETESKY_JWT_USERS=tbi` (comma-separated usernames)
   - `CONCRETESKY_JWT_REQUIRE_SUPERUSER=1` (recommended)
+    - If your service user is not marked as a Concrete "Super User" (for example, `tbi` on this site), set this to `0`.
+
+3. (Optional) Enable the JWT → ConcreteCMS session bridge (for browser automation):
+  - `CONCRETESKY_MCP_LOGIN_ENABLED=1`
+  - (Optional, dangerous) `CONCRETESKY_MCP_LOGIN_ALLOW_IMPERSONATE=1`
 
 3. Generate a token:
-  - `php packages/concretesky/tools/jwt.php`
+  - `php packages/concretesky/tools/jwt.php --user tbi`
+
+### Creating a ConcreteCMS login session (cookie)
+
+JWT auth is enough for API calls, but browser automation (Playwright/MCP) usually needs an actual ConcreteCMS session cookie so that `GET /concretesky` doesn’t redirect to `/login`.
+
+ConcreteSky provides an **opt-in** API method that converts a valid JWT into a ConcreteCMS session:
+
+- Endpoint: `POST /concretesky/api`
+- Body: `{ "method": "mcpLogin", "params": { "userName": "tbi" } }`
+- Header: `Authorization: Bearer <token>`
+
+Local helper scripts live under:
+
+- `packages/concretesky/_private/mcp/` (gitignored)
+
+Example (cookie jar):
+
+- `bash packages/concretesky/_private/mcp/login-cookie.sh --base https://www.theblobinc.com --user tbi`
+
+If enabled, this will write a `cookies.txt` you can reuse for subsequent requests.
 
 ### Using the token
 
@@ -110,3 +135,8 @@ ConcreteSky supports an optional JWT (HS256) auth mode for programmatic callers 
 Notes:
 - JWT auth bypasses CSRF, but still scopes data to the Concrete user in `sub`.
 - If you want to *require* JWT for all API calls, set `CONCRETESKY_JWT_ENFORCE=1`.
+
+Security notes:
+- Keep `CONCRETESKY_MCP_LOGIN_ENABLED=0` in production unless you explicitly need automation.
+- Keep `CONCRETESKY_JWT_USERS` small (service accounts only).
+- Only enable `CONCRETESKY_MCP_LOGIN_ALLOW_IMPERSONATE` when you fully control the environment.

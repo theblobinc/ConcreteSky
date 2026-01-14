@@ -114,7 +114,9 @@ class MagicGrid extends EventEmitter{
   setup () {
     let width = this.container.getBoundingClientRect().width;
     let colWidth = this.colWidth();
-    let numCols = Math.floor(width/colWidth) || 1;
+    // Total width for N columns is: N * colWidth - gutter (no trailing gutter).
+    // Therefore N = floor((width + gutter) / colWidth).
+    let numCols = Math.floor((width + this.gutter) / colWidth) || 1;
     let cols = [];
 
     if (this.maxColumns && numCols > this.maxColumns) {

@@ -189,17 +189,14 @@ class BskyPeopleSearch extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         :host{display:block}
-        .wrap{border:1px solid #333;border-radius:12px;padding:10px;background:#070707;color:#fff}
-        .head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
-        .title{font-weight:800}
         .muted{color:#aaa}
-        form{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
-        input{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:10px;padding:10px 12px;min-width:min(520px, 100%)}
-        select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:10px;padding:10px 12px}
-        button{background:#111;border:1px solid #555;color:#fff;padding:10px 12px;border-radius:10px;cursor:pointer}
+        form{display:flex;gap:var(--bsky-panel-control-gap-dense, 6px);flex-wrap:wrap;align-items:center}
+        input{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:10px;padding:8px 10px;min-width:min(520px, 100%)}
+        select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:10px;padding:8px 10px}
+        button{background:#111;border:1px solid #555;color:#fff;padding:8px 10px;border-radius:10px;cursor:pointer}
         button:disabled{opacity:.6;cursor:not-allowed}
         .list{display:flex;flex-direction:column;gap:10px}
-        .row{display:flex;gap:10px;border:1px solid #333;border-radius:12px;padding:10px;background:#0f0f0f}
+        .row{display:flex;gap:8px;border:1px solid #333;border-radius:12px;padding:6px;background:#0f0f0f}
         .av{width:40px;height:40px;border-radius:50%;background:#222;object-fit:cover;flex:0 0 auto}
         .main{min-width:0;flex:1}
         .name{color:#fff;text-decoration:underline;font-weight:700}
@@ -210,13 +207,10 @@ class BskyPeopleSearch extends HTMLElement {
         .err{color:#f88}
         ${identityCss}
       </style>
-      <div class="wrap">
-        <div class="head">
-          <div class="title">Search</div>
-          <div class="muted">${q.trim() ? `Results: ${esc(this.items.length)} / ${esc(this.total)} (${this.mode==='cache'?'cache':'live'})` : 'Search for accounts by handle/name/bio'}</div>
-        </div>
+      <bsky-panel-shell title="Search" dense>
+        <div slot="head-right" class="muted">${q.trim() ? `Results: ${esc(this.items.length)} / ${esc(this.total)} (${this.mode==='cache'?'cache':'live'})` : 'Search for accounts by handle/name/bio'}</div>
 
-        <form>
+        <form slot="toolbar">
           <input id="q" type="search" placeholder="Try: emoji 🧿, handle, or bio text…" value="${esc(q)}" />
           <select id="mode" onchange="this.getRootNode().host.mode=this.value; this.getRootNode().host.search(true);">
             <option value="cache" ${this.mode==='cache'?'selected':''}>Local cache</option>
@@ -231,7 +225,7 @@ class BskyPeopleSearch extends HTMLElement {
         <div class="list">
           ${rows || (this.loading ? '<div class="muted">Loading…</div>' : (q.trim() ? '<div class="muted">No results yet.</div>' : '<div class="muted">Enter a search query.</div>'))}
         </div>
-      </div>
+      </bsky-panel-shell>
     `;
   }
 }

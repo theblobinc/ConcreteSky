@@ -45,6 +45,18 @@ class BskyConnections extends HTMLElement {
     };
     this._magic = null;
     this._magicRO = null;
+
+    this._qTimer = null;
+  }
+
+  _cssPx(varName, fallback) {
+    try {
+      const raw = getComputedStyle(this).getPropertyValue(varName);
+      const n = Number.parseFloat(String(raw || ''));
+      return Number.isFinite(n) ? n : fallback;
+    } catch {
+      return fallback;
+    }
   }
 
   connectedCallback(){
@@ -68,21 +80,44 @@ class BskyConnections extends HTMLElement {
       return;
     }
 
-    const host = this.shadowRoot.querySelector('.list.magic');
+    const host = this.shadowRoot.querySelector('.entries.magic');
     if (!host) return;
+
+    const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+    const scroller = shell?.getScroller?.() || null;
+
+    const MIN = this._cssPx('--bsky-card-min-w', 350);
+    const GAP = this._cssPx('--bsky-card-gap', 8);
+
+    const updateLayout = () => {
+      try {
+        const fallback = this.getBoundingClientRect?.().width || 0;
+        const available = scroller?.clientWidth || scroller?.getBoundingClientRect?.().width || fallback || 0;
+        if (!available || available < 2) return;
+
+        const cols = Math.max(1, Math.floor((available + GAP) / (MIN + GAP)));
+        const cardW = Math.max(1, Math.floor((available - ((cols - 1) * GAP)) / cols));
+
+        this.style.setProperty('--bsky-card-w', `${cardW}px`);
+        host.style.width = '100%';
+        host.style.maxWidth = '100%';
+
+        if (this._magic) this._magic.itemWidth = cardW;
+      } catch {}
+    };
 
     if (!this._magic) {
       try {
         this._magic = new MagicGrid({
           container: host,
           static: true,
-          gutter: 12,
+          gutter: GAP,
           useTransform: false,
           animate: false,
           center: false,
           maxColumns: false,
           useMin: false,
-          itemWidth: 350,
+          itemWidth: null,
         });
       } catch {
         this._magic = null;
@@ -91,18 +126,26 @@ class BskyConnections extends HTMLElement {
       try { this._magic.setContainer(host); } catch {}
     }
 
+    updateLayout();
     try { this._magic?.positionItems?.(); } catch {}
 
-    if (!this._magicRO) {
-      try {
-        this._magicRO = new ResizeObserver(() => {
-          try { this._magic?.positionItems?.(); } catch {}
-        });
-        this._magicRO.observe(host);
-      } catch {
-        this._magicRO = null;
-      }
+    // The list container is re-created on every render(), so always re-bind the observer.
+    if (this._magicRO) { try { this._magicRO.disconnect(); } catch {} this._magicRO = null; }
+    try {
+      this._magicRO = new ResizeObserver(() => {
+        updateLayout();
+        try { this._magic?.positionItems?.(); } catch {}
+      });
+      if (scroller) this._magicRO.observe(scroller);
+      this._magicRO.observe(this);
+    } catch {
+      this._magicRO = null;
     }
+
+    requestAnimationFrame(() => {
+      updateLayout();
+      try { this._magic?.positionItems?.(); } catch {}
+    });
   }
 
   onClick(e){
@@ -114,7 +157,12 @@ class BskyConnections extends HTMLElement {
   onInput(e){
     if (e.target.id === 'q') {
       this.filters.q = e.target.value;
-      this.load(true);
+      // Debounce to avoid querying the DB on every keystroke.
+      if (this._qTimer) clearTimeout(this._qTimer);
+      this._qTimer = setTimeout(() => {
+        this._qTimer = null;
+        this.load(true);
+      }, 220);
     }
   }
 
@@ -237,7 +285,7 @@ class BskyConnections extends HTMLElement {
       return {
         key,
         html: `
-        <div class="row" data-did="${esc(key)}">
+        <div class="entry" data-did="${esc(key)}">
           <img class="av" src="${esc(p.avatar || '')}" alt="" onerror="this.style.display='none'">
           <div class="main">
             <div class="top">
@@ -263,24 +311,26 @@ class BskyConnections extends HTMLElement {
       <style>
         :host, *, *::before, *::after{box-sizing:border-box}
         :host{display:block;margin:0;--bsky-connections-ui-offset:290px}
-        .wrap{border:1px solid #333;border-radius:12px;padding:10px;background:#070707;color:#fff}
-        .head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
-        .title{font-weight:800}
         .muted{color:#aaa}
-        .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+        .muted{color:#aaa}
+        .controls{display:flex;gap:var(--bsky-panel-control-gap-dense, 6px);flex-wrap:wrap;align-items:center}
         input,select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:10px;padding:8px 10px}
         label{color:#ddd;font-size:.95rem;display:flex;gap:6px;align-items:center}
         button{background:#111;border:1px solid #555;color:#fff;padding:8px 10px;border-radius:10px;cursor:pointer}
         button:disabled{opacity:.6;cursor:not-allowed}
 
-        .listWrap{width:100%;max-height:calc(100vh - var(--bsky-connections-ui-offset));overflow:auto;padding-right:4px}
-        .list{display:block;gap:12px;justify-content:start;align-items:start}
+        .entries{display:block;gap:12px;justify-content:start;align-items:start}
         /* MagicGrid: absolute-positioned cards. */
-        .list.magic{position:relative;display:block;width:100%;min-height:0}
-        /* Fixed card width so MagicGrid can lay out multiple columns; clamp for very narrow panels. */
-        .list.magic .row{width:350px;max-width:350px;margin:0}
+        .entries.magic{position:relative;display:block;max-width:100%;min-height:0}
+        /* Cards have a minimum width, but can expand to fill available space. */
+        .entries.magic .entry{
+          width:min(100%, var(--bsky-card-w, 350px));
+          max-width:min(100%, var(--bsky-card-w, 350px));
+          min-width:min(100%, var(--bsky-card-min-w, 350px));
+          margin:0;
+        }
 
-        .row{display:flex;gap:10px;border:1px solid #333;border-radius:12px;padding:10px;background:#0f0f0f;width:min(350px, 100%);max-width:350px}
+        .entry{display:flex;gap:8px;border:1px solid #333;border-radius:12px;padding:6px;background:#0f0f0f;width:100%;max-width:100%}
         .av{width:40px;height:40px;border-radius:50%;background:#222;object-fit:cover;flex:0 0 auto}
         .main{min-width:0;flex:1}
         .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -296,13 +346,10 @@ class BskyConnections extends HTMLElement {
           .wrap{padding:8px}
         }
       </style>
-      <div class="wrap">
-        <div class="head">
-          <div class="title">Connections</div>
-          <div class="muted">Loaded: ${esc(this.items.length)} / ${esc(this.total)}</div>
-        </div>
+      <bsky-panel-shell title="Connections" dense style="--bsky-panel-ui-offset: var(--bsky-connections-ui-offset)">
+        <div slot="head-right" class="muted">Loaded: ${esc(this.items.length)} / ${esc(this.total)}</div>
 
-        <div class="controls">
+        <div slot="toolbar" class="controls">
           <input id="q" type="search" placeholder="Search (name/handle/bio)…" value="${esc(this.filters.q)}">
           <select id="sort">
             <option value="followers" ${this.filters.sort==='followers'?'selected':''}>Sort: followers</option>
@@ -322,13 +369,25 @@ class BskyConnections extends HTMLElement {
         </div>
 
         ${this.error ? `<div class="err">Error: ${esc(this.error)}</div>` : ''}
-        <div class="listWrap">
-          <div class="list magic">
-            ${rowsHtml || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No connections loaded.</div>')}
-          </div>
+
+        <div class="entries magic">
+          ${rowsHtml || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No connections loaded.</div>')}
         </div>
-      </div>
+      </bsky-panel-shell>
     `;
+
+    // Infinite scroll: load the next page when nearing the bottom.
+    const scroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.();
+    if (scroller) {
+      scroller.addEventListener('scroll', () => {
+        if (this.loading) return;
+        if (!this.hasMore) return;
+        const threshold = 220;
+        if (scroller.scrollTop + scroller.clientHeight >= (scroller.scrollHeight - threshold)) {
+          this.load(false);
+        }
+      }, { passive: true });
+    }
 
     queueMicrotask(() => this.ensureMagicGrid());
   }

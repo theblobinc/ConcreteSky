@@ -5,6 +5,7 @@ use Concrete\Package\Concretesky\Controller\SinglePage\Concretesky as ParentCont
 use Concrete\Core\Support\Facade\Log;
 use Concrete\Core\User\User;
 use Concrete\Core\User\UserInfo;
+use Concrete\Core\User\Login\LoginService;
 use Symfony\Component\HttpFoundation\JsonResponse;
 
 defined('C5_EXECUTE') or die('Access Denied.');
@@ -581,9 +582,6 @@ class Api extends ParentController
                     $c5UserId = (int)$u->getUserID();
                     $c5UserName = $registered ? (string)$u->getUserName() : 'Guest';
                 }
-                $u = new User();
-                $registered = (bool)$u->isRegistered();
-                $c5UserId = (int)$u->getUserID();
 
                 $out = [
                     'ok' => true,
@@ -629,6 +627,63 @@ class Api extends ParentController
                     ];
                 }, $accounts);
                 return $this->json($out);
+            }
+
+            // MCP/automation helper: convert a valid JWT into a ConcreteCMS logged-in session cookie.
+            // This is intentionally OFF by default and should only be enabled in controlled environments.
+            if ($method === 'mcpLogin') {
+                $this->loadDotEnvOnce();
+
+                if (!$this->envBool('CONCRETESKY_MCP_LOGIN_ENABLED', false)) {
+                    return $this->json(['error' => 'Not Found'], 404);
+                }
+                if (empty($jwt['ok'])) {
+                    return $this->json(['error' => 'JWT required'], 401);
+                }
+
+                $targetUserName = trim((string)($params['userName'] ?? ''));
+                if ($targetUserName === '') {
+                    $targetUserName = (string)$jwt['userName'];
+                }
+
+                // Impersonation is opt-in (separate from JWT allowlist).
+                $impersonating = ($targetUserName !== (string)$jwt['userName']);
+                if ($impersonating) {
+                    if (!$this->envBool('CONCRETESKY_MCP_LOGIN_ALLOW_IMPERSONATE', false)) {
+                        return $this->json(['error' => 'Impersonation disabled'], 403);
+                    }
+                    if (empty($jwt['isSuper'])) {
+                        return $this->json(['error' => 'JWT user must be super user'], 403);
+                    }
+                }
+
+                $ui = UserInfo::getByUserName($targetUserName);
+                if (!$ui) {
+                    return $this->json(['error' => 'User not found'], 404);
+                }
+                if (method_exists($ui, 'isActive') && !$ui->isActive()) {
+                    return $this->json(['error' => 'User inactive'], 403);
+                }
+                if (method_exists($ui, 'isValidated') && !$ui->isValidated()) {
+                    return $this->json(['error' => 'User not validated'], 403);
+                }
+
+                /** @var LoginService $login */
+                $login = app(LoginService::class);
+                $login->loginByUserID((int)$ui->getUserID());
+
+                // Note: the session cookie is written in the response; the current request won't reliably
+                // reflect the new session user when we instantiate Concrete\Core\User\User.
+                return $this->json([
+                    'ok' => true,
+                    'impersonating' => $impersonating,
+                    'jwtUserName' => (string)$jwt['userName'],
+                    'c5' => [
+                        'registered' => true,
+                        'userId' => (int)$ui->getUserID(),
+                        'userName' => (string)$ui->getUserName(),
+                    ],
+                ]);
             }
 
             // ConcreteCMS user must be logged in for all other API calls.
