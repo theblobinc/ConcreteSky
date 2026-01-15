@@ -195,20 +195,20 @@ class BskyFollowing extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         :host{display:block}
-        .wrap{border:1px solid #333;border-radius:12px;padding:10px;background:#070707;color:#fff}
+        .wrap{border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:10px;background:#070707;color:#fff}
         .head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
         .title{font-weight:800}
         .muted{color:#aaa}
         .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
-        input,select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:10px;padding:8px 10px}
+        input,select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:8px 10px}
         label{color:#ddd;font-size:.95rem;display:flex;gap:6px;align-items:center}
-        button{background:#111;border:1px solid #555;color:#fff;padding:8px 10px;border-radius:10px;cursor:pointer}
+        button{background:#111;border:1px solid #555;color:#fff;padding:8px 10px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
         button:disabled{opacity:.6;cursor:not-allowed}
-        .list{display:flex;flex-direction:column;gap:10px}
+        .list{display:flex;flex-direction:column;gap:0}
         .list.masonry{column-width:350px; column-gap:12px; display:block}
         .list.masonry .row{break-inside:avoid; display:inline-flex; width:100%}
-        .row{display:flex;gap:10px;border:1px solid #333;border-radius:12px;padding:10px;background:#0f0f0f}
-        .av{width:40px;height:40px;border-radius:50%;background:#222;object-fit:cover;flex:0 0 auto}
+        .row{display:flex;gap:10px;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:2px;background:#0f0f0f}
+        .av{width:40px;height:40px;border-radius: var(--bsky-radius, 0px);background:#222;object-fit:cover;flex:0 0 auto}
         .main{min-width:0;flex:1}
         .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
         .name{color:#fff;text-decoration:underline;font-weight:700}
@@ -216,7 +216,7 @@ class BskyFollowing extends HTMLElement {
         .sub a{color:#bbb;text-decoration:underline}
         .bio{color:#ddd;margin-top:6px;white-space:pre-wrap;word-break:break-word}
         .meta{color:#bbb;font-size:.85rem;margin-top:6px;display:flex;gap:10px;flex-wrap:wrap}
-        .chip{background:#1e2e1e;color:#89f0a2;border:1px solid #2e5a3a;border-radius:999px;padding:1px 8px;font-size:.75rem}
+        .chip{background:#1e2e1e;color:#89f0a2;border:1px solid #2e5a3a;border-radius: var(--bsky-radius, 0px);padding:1px 8px;font-size:.75rem}
         .err{color:#f88}
         ${identityCss}
       </style>

@@ -32,15 +32,15 @@ class BskyPanelShell extends HTMLElement {
           color: var(--bsky-panel-fg, #fff);
           background: var(--bsky-panel-bg, #070707);
           border: 1px solid var(--bsky-panel-border, #333);
-          border-radius: var(--bsky-panel-radius, 12px);
+          border-radius: var(--bsky-panel-radius, 0px);
 
-          --_pad: var(--bsky-panel-pad, 10px);
-          --_gap: var(--bsky-panel-gap, 10px);
+          --_pad: var(--bsky-panel-pad, 0px);
+          --_gap: var(--bsky-panel-gap, 0px);
           --_ctrl-gap: var(--bsky-panel-control-gap, 8px);
         }
         :host([dense]){
-          --_pad: var(--bsky-panel-pad-dense, 4px);
-          --_gap: var(--bsky-panel-gap-dense, 6px);
+          --_pad: var(--bsky-panel-pad-dense, 0px);
+          --_gap: var(--bsky-panel-gap-dense, 0px);
           --_ctrl-gap: var(--bsky-panel-control-gap-dense, 6px);
         }
 

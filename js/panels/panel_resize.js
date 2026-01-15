@@ -6,13 +6,24 @@ export function enablePanelResize(root) {
 
   const panelsWrap = root.querySelector('.panels');
 
-  // Allow wide screens to actually use their space.
-  // (Used for snapping + auto-fit distribution; actual width is still clamped by available space.)
-  const DEFAULT_MAX_COLS = 20;
+  // Bootstrap-ish layout columns (not cards).
+  // The idea: as the viewport shrinks, we have fewer "grid units" to allocate to panels.
+  // Smallest panel should be 2 units.
+  const getLayoutCols = (w) => {
+    const ww = Number(w || 0);
+    // Bootstrap 5 breakpoints:
+    // sm>=576, md>=768, lg>=992, xl>=1200, xxl>=1400.
+    // We keep 2 as the minimum so panels never go below 2 grid units.
+    if (ww >= 1400) return 12; // xxl
+    if (ww >= 1200) return 10; // xl
+    if (ww >= 992) return 8;   // lg
+    if (ww >= 768) return 6;   // md
+    if (ww >= 576) return 4;   // sm
+    return 2;                  // xs
+  };
 
-  // Mobile target: one panel per screen (swipe between panels).
-  // Keep this higher than typical "tiny" phones to ensure no overflow.
-  const MOBILE_BREAKPOINT_PX = 560;
+  // Below md, use one panel per screen (swipe between panels).
+  const MOBILE_BREAKPOINT_PX = 768;
 
   const pxNum = (v) => {
     const n = Number.parseFloat(String(v || '0'));
@@ -51,40 +62,38 @@ export function enablePanelResize(root) {
     }
   };
 
-  // Snap widths so content can fit N cards.
-  // This avoids the "snaps to 700 but needs ~712+" problem caused by gaps/padding/borders.
-  const snapToCardColumns = (panelEl, px, opts = {}) => {
-    const CARD = getCardWidth();
-    const GAP = getCardGap();
-    const maxCols = Math.max(1, Math.min(10, Number(opts.maxCols || DEFAULT_MAX_COLS)));
-    // Since panels now use <bsky-panel-shell dense>, the horizontal "chrome" is much smaller.
-    // Model it using CSS vars defined on the app shell.
-    const densePad = cssPx(panelsWrap || document.documentElement, '--bsky-panel-pad-dense', 4);
-    const wrapPad = Math.max(0, Number(opts.wrapPad ?? densePad));
-    const wrapBorder = Math.max(0, Number(opts.wrapBorder ?? 1));
-    // Prefer 0 here; the grid itself sizes against scroller.clientWidth.
-    const scrollbarAllowance = Math.max(0, Number(opts.scrollbarAllowance ?? 0));
-
-    const cs = window.getComputedStyle(panelEl);
-    const panelPad = pxNum(cs.paddingLeft) + pxNum(cs.paddingRight);
-
-    // Most components use a .wrap with 10px padding and 1px border.
-    // We can't read inside shadow DOM reliably, so we model it here.
-    const extra = panelPad + (wrapPad * 2) + (wrapBorder * 2) + scrollbarAllowance;
-
-    const min = extra + CARD;
-    const max = extra + (maxCols * CARD) + ((maxCols - 1) * GAP);
-    const v = Math.max(min, Math.min(max, px));
-
-    const avail = Math.max(0, v - extra);
-    // Use floor so we never snap to a width larger than what is actually available.
-    let cols = Math.floor((avail + GAP) / (CARD + GAP));
-    cols = Math.max(1, Math.min(maxCols, cols));
-
-    return extra + (cols * CARD) + ((cols - 1) * GAP);
+  const getGridGutter = () => {
+    return cssPx(panelsWrap || document.documentElement, '--bsky-grid-gutter', getPanelsGap() || 12);
   };
 
-  const isCardPanel = (name) => (name === 'posts' || name === 'connections' || name === 'content');
+  const getGridCols = (wrapW) => {
+    // Prefer viewport width for breakpoint logic.
+    const w = window.innerWidth || wrapW || 0;
+    return getLayoutCols(w);
+  };
+
+  const getGridUnit = (wrapW, cols, gutter) => {
+    // Bootstrap-like: across the full row we have (cols-1) gutters.
+    const gaps = Math.max(0, Number(cols || 0) - 1) * gutter;
+    const avail = Math.max(0, Number(wrapW || 0) - gaps);
+    return cols > 0 ? (avail / cols) : 0;
+  };
+
+  const spanWidthPx = (span, unit, gutter) => {
+    const s = Math.max(1, Math.floor(Number(span || 1)));
+    return (s * unit) + ((s - 1) * gutter);
+  };
+
+  const snapToGrid = (px, unit, cols, gutter, opts = {}) => {
+    const minSpan = Math.max(1, Number(opts.minSpan ?? 2));
+    const maxSpan = Math.max(minSpan, Number(opts.maxSpan ?? cols));
+    if (!Number.isFinite(unit) || unit <= 0) return px;
+    const stride = unit + gutter;
+    const span = Math.max(minSpan, Math.min(maxSpan, Math.round((px + gutter) / stride)));
+    return spanWidthPx(span, unit, gutter);
+  };
+
+  const isCardPanel = (name) => (name === 'posts' || name === 'connections');
 
   const getDenseExtra = (panelEl, opts = {}) => {
     const densePad = cssPx(panelsWrap || document.documentElement, '--bsky-panel-pad-dense', 4);
@@ -130,17 +139,17 @@ export function enablePanelResize(root) {
     return Math.max(MIN, Math.floor(v / STEP) * STEP);
   };
 
-  const snapForPanel = (panelEl, name, px) => {
-    // Posts + Connections are card-based and need gap/padding-aware snapping.
-    if (isCardPanel(name)) {
-      return snapToCardColumns(panelEl, px);
+  const snapForPanel = (panelEl, name, px, snapCtx = null) => {
+    const { unit, cols, gutter } = snapCtx || {};
+    if (Number.isFinite(unit) && unit > 0 && Number.isFinite(cols) && cols > 0) {
+      return snapToGrid(px, unit, cols, gutter || 0, { minSpan: 2, maxSpan: cols });
     }
     return snapGeneric(px);
   };
 
-  const minForPanel = (panelEl, name) => {
-    // By passing a tiny value, snapToCardColumns will clamp to its computed minimum.
-    if (isCardPanel(name)) return snapToCardColumns(panelEl, 0);
+  const minForPanel = (snapCtx = null) => {
+    const { unit, gutter } = snapCtx || {};
+    if (Number.isFinite(unit) && unit > 0) return Math.max(1, spanWidthPx(2, unit, gutter || 0));
     return 350;
   };
 
@@ -165,6 +174,17 @@ export function enablePanelResize(root) {
     const wrapW = panelsWrap?.getBoundingClientRect()?.width || 0;
     if (!wrapW || wrapW < 50) return;
 
+    const gutter = getGridGutter();
+    const cols = getGridCols(wrapW);
+    const unit = getGridUnit(wrapW, cols, gutter);
+    const snapCtx = { unit, cols, gutter };
+
+    // Expose grid diagnostics to CSS consumers.
+    try {
+      panelsWrap?.style?.setProperty?.('--bsky-layout-cols', String(cols));
+      panelsWrap?.style?.setProperty?.('--bsky-grid-unit', `${Math.max(0, unit)}px`);
+    } catch {}
+
     // Mobile: always force one panel per screen and rely on horizontal scrolling + snap.
     // This guarantees we never exceed 100% viewport width.
     if (wrapW <= MOBILE_BREAKPOINT_PX || isMobilePanelsViewport()) {
@@ -172,6 +192,12 @@ export function enablePanelResize(root) {
         p.style.flex = '0 0 100%';
         p.style.flexBasis = '100%';
         p.style.minWidth = '100%';
+
+        // Still expose a reasonable span/unit for components.
+        try {
+          p.style.setProperty('--bsky-panel-span', String(cols));
+          p.style.setProperty('--bsky-grid-unit', `${Math.max(0, unit)}px`);
+        } catch {}
       }
       return;
     }
@@ -186,7 +212,7 @@ export function enablePanelResize(root) {
       const fixedPxRaw = p.getAttribute('data-bsky-fixed-px');
       const fixedPx = fixedPxRaw !== null ? Number.parseFloat(String(fixedPxRaw || '')) : NaN;
       if (Number.isFinite(fixedPx) && fixedPx > 0) {
-        const minW = minForPanel(p, name);
+        const minW = minForPanel(snapCtx);
         const w = Math.max(minW, fixedPx);
         manual.set(p, { name, width: w });
         continue;
@@ -196,14 +222,14 @@ export function enablePanelResize(root) {
       const fixedRaw = p.getAttribute('data-bsky-fixed-cols');
       const fixedCols = fixedRaw !== null ? Number.parseInt(String(fixedRaw || ''), 10) : NaN;
       if (Number.isFinite(fixedCols) && fixedCols > 0 && isCardPanel(name)) {
-        const w = snapForPanel(p, name, widthForFixedCols(p, fixedCols));
+        const w = snapForPanel(p, name, widthForFixedCols(p, fixedCols), snapCtx);
         manual.set(p, { name, width: w });
         continue;
       }
 
       const saved = widths?.[name];
       if (saved && Number.isFinite(saved)) {
-        const w = snapForPanel(p, name, saved);
+        const w = snapForPanel(p, name, saved, snapCtx);
         manual.set(p, { name, width: w });
       } else {
         auto.push({ el: p, name });
@@ -214,7 +240,7 @@ export function enablePanelResize(root) {
     let used = 0;
     for (const { width } of manual.values()) used += width;
 
-    const gaps = Math.max(0, visible.length - 1) * getPanelsGap();
+    const gaps = Math.max(0, visible.length - 1) * gutter;
     let remaining = Math.max(0, wrapW - gaps - used);
 
     // If everything is manual, still enforce a fixed basis.
@@ -225,57 +251,39 @@ export function enablePanelResize(root) {
       const grow = pinned ? 0 : 1;
       p.style.flex = `${grow} 0 ${width}px`;
       p.style.flexBasis = `${width}px`;
+
+      // Expose an approximate span for components that want to compute columns.
+      try {
+        const stride = (unit + gutter) || 1;
+        const span = (Number.isFinite(unit) && unit > 0) ? Math.max(2, Math.round((width + gutter) / stride)) : cols;
+        p.style.setProperty('--bsky-panel-span', String(span));
+        p.style.setProperty('--bsky-grid-unit', `${Math.max(0, unit)}px`);
+      } catch {}
     }
 
     if (!auto.length) return;
 
-    // Greedily distribute card columns to maximize total columns in the available width.
-    // Start each auto panel at its minimum.
-    const maxCols = DEFAULT_MAX_COLS;
-    const state = auto.map(({ el, name }) => {
-      const minW = minForPanel(el, name);
-      return { el, name, cols: 1, width: minW };
-    });
+    // Bootstrap-ish: distribute grid spans across auto panels.
+    const minSpan = 2;
+    const n = auto.length;
+    const base = Math.floor(cols / n);
+    const rem = cols % n;
+    const spans = auto.map((_, i) => Math.max(minSpan, base + (i < rem ? 1 : 0)));
 
-    const minSum = state.reduce((s, x) => s + x.width, 0);
-    if (minSum > remaining) {
-      // Not enough room to satisfy mins; fall back to flexing so the UI remains usable.
-      for (const s of state) {
-        s.el.style.flex = `1 1 ${s.width}px`;
-        s.el.style.flexBasis = `${s.width}px`;
-      }
-      return;
-    }
-    remaining -= minSum;
-
-    // Round-robin: add one column at a time while it fits.
-    // (Keeps the distribution fair and avoids a single panel hogging all space.)
-    let progressed = true;
-    while (progressed) {
-      progressed = false;
-      for (const s of state) {
-        if (s.name !== 'posts' && s.name !== 'connections') continue;
-        if (s.cols >= maxCols) continue;
-        const nextW = widthForCardCols(s.el, s.cols + 1);
-        const delta = nextW - s.width;
-        if (delta <= remaining) {
-          s.cols += 1;
-          s.width = nextW;
-          remaining -= delta;
-          progressed = true;
-        }
-      }
-    }
-
-    // Apply widths.
-    // Allow flex-grow so remaining pixels (not enough for a whole new column) still get used.
-    // Keep flex-shrink at 0 so we scroll horizontally instead of squeezing columns.
-    for (const s of state) {
-      const w = snapForPanel(s.el, s.name, s.width);
-      const pinned = s.el.getAttribute('data-bsky-fixed-pin') === '1';
-      const grow = pinned ? 0 : 1;
-      s.el.style.flex = `${grow} 0 ${w}px`;
+    // Apply widths (snap to whole units). If spans exceed total cols due to minSpan,
+    // horizontal scrolling will kick in, which is acceptable.
+    for (let i = 0; i < auto.length; i++) {
+      const s = auto[i];
+      const span = spans[i] || minSpan;
+      const w0 = spanWidthPx(span, unit, gutter);
+      const w = snapForPanel(s.el, s.name, w0, snapCtx);
+      s.el.style.flex = `1 0 ${w}px`;
       s.el.style.flexBasis = `${w}px`;
+      s.el.style.minWidth = `${Math.max(1, spanWidthPx(minSpan, unit, gutter))}px`;
+      try {
+        s.el.style.setProperty('--bsky-panel-span', String(span));
+        s.el.style.setProperty('--bsky-grid-unit', `${Math.max(0, unit)}px`);
+      } catch {}
     }
   };
 
@@ -289,13 +297,17 @@ export function enablePanelResize(root) {
     const name = p.getAttribute('data-panel');
     if (!name) continue;
 
-    // Ensure flex items can shrink, but not below a sensible minimum for their content.
-    const minPx = minForPanel(p, name);
-    p.style.minWidth = `${minPx}px`;
+    // minWidth is applied during auto-fit (depends on current grid unit).
 
     const saved = widths?.[name];
     if (saved && Number.isFinite(saved)) {
-      const next = snapForPanel(p, name, saved);
+      // Snap against the current grid when possible.
+      const wrapW = panelsWrap?.getBoundingClientRect()?.width || 0;
+      const visibleNow = getVisiblePanels();
+      const gutter = getGridGutter();
+      const cols = getGridCols(wrapW);
+      const unit = getGridUnit(wrapW, cols, gutter);
+      const next = snapForPanel(p, name, saved, { unit, cols, gutter });
       // Saved widths act as a basis. Allow grow, but do not shrink (we scroll instead).
       p.style.flex = `1 0 ${next}px`;
       p.style.flexBasis = `${next}px`;
@@ -386,8 +398,15 @@ export function enablePanelResize(root) {
       startRightW = right.getBoundingClientRect().width;
       totalW = startLeftW + startRightW;
 
-      minLeftW = minForPanel(left, leftName);
-      minRightW = minForPanel(right, rightName);
+      const wrapW = panelsWrap?.getBoundingClientRect()?.width || 0;
+      const visibleNow = getVisiblePanels();
+      const gutter = getGridGutter();
+      const cols = getGridCols(wrapW);
+      const unit = getGridUnit(wrapW, cols, gutter);
+      const snapCtx = { unit, cols, gutter };
+
+      minLeftW = minForPanel(snapCtx);
+      minRightW = minForPanel(snapCtx);
       if (totalW < (minLeftW + minRightW)) {
         // Ensure we can always satisfy mins.
         totalW = minLeftW + minRightW;

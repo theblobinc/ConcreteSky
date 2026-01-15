@@ -1,8 +1,7 @@
 // application/single_pages/bluesky_feed/js/components/my_posts.js
 import { call } from '../api.js';
 import { getAuthStatusCached, isNotConnectedError } from '../auth_state.js';
-// Versioned import to bust aggressive browser module cache when MagicGrid changes.
-import MagicGrid from '../magicgrid/magic-grid.esm.js?v=0.1.28';
+import { bindInfiniteScroll } from '../panels/panel_api.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
   ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[m])
@@ -141,24 +140,83 @@ class BskyMyPosts extends HTMLElement {
   constructor(){
     super();
     this.attachShadow({mode:'open'});
-    this.items = [];
+    this._batches = []; // [{ id, items: [] }]
     this.loading = false;
     this.error = null;
     this.cursor = null;
-    this.filters = { hours: 24, types: new Set(TYPES) };
+    this.filters = { from: '', to: '', types: new Set(TYPES) };
     // Single layout mode: MagicGrid.
     this.view = 'magic';
 
-    this._magic = null;
-    this._magicRO = null;
+    this._batchSeq = 0;
+    this._layoutRO = null;
     this._cutoff = null;
     this._pagesMax = 15;
     this._offset = 0;
+
+    this._latestIso = '';
+
+    this._unbindInfiniteScroll = null;
+    this._infiniteScrollEl = null;
+    this._backfillInFlight = false;
+    this._backfillDone = false;
+
+    this._scrollTop = 0;
+    this._restoreScrollNext = false;
+    this._scrollAnchor = null; // { key, offsetY, scrollTop }
+    this._scrollAnchorApplyTries = 0;
+    this._autoFillPending = true;
+    this._autoFillTries = 0;
 
     this._refreshRecentHandler = (e) => {
       const mins = Number(e?.detail?.minutes ?? 2);
       this.refreshRecent(mins);
     };
+  }
+
+  _toInputValue(iso){
+    try {
+      if (!iso) return '';
+      const d = new Date(String(iso));
+      if (!Number.isFinite(d.getTime())) return '';
+      const pad = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+    } catch {
+      return '';
+    }
+  }
+
+  _fromInputValue(v){
+    try {
+      const s = String(v || '').trim();
+      if (!s) return '';
+      const d = new Date(s);
+      return Number.isFinite(d.getTime()) ? d.toISOString() : '';
+    } catch {
+      return '';
+    }
+  }
+
+  selectedTypes(){
+    try {
+      return Array.from(this.filters.types || []).map(String).filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  remoteFilterForSelection(){
+    // Remote filter only supports replies on/off; DB filtering handles kind.
+    const wantsReplies = (this.filters.types || new Set()).has('reply');
+    return wantsReplies ? 'posts_with_replies' : 'posts_no_replies';
+  }
+
+  currentSinceIso(){
+    return this.filters.from ? String(this.filters.from) : null;
+  }
+
+  currentUntilIso(){
+    return this.filters.to ? String(this.filters.to) : null;
   }
 
   _cssPx(varName, fallback) {
@@ -183,7 +241,7 @@ class BskyMyPosts extends HTMLElement {
     this._authChangedHandler = (e) => {
       const connected = !!e?.detail?.connected;
       if (!connected) {
-        this.items = [];
+        this._batches = [];
         this.cursor = null;
         this._offset = 0;
         this.error = 'Bluesky not connected.';
@@ -199,94 +257,265 @@ class BskyMyPosts extends HTMLElement {
   disconnectedCallback(){
     window.removeEventListener('bsky-refresh-recent', this._refreshRecentHandler);
     if (this._authChangedHandler) window.removeEventListener('bsky-auth-changed', this._authChangedHandler);
-    if (this._magicRO) { try { this._magicRO.disconnect(); } catch {} this._magicRO = null; }
-    this._magic = null;
+    if (this._layoutRO) { try { this._layoutRO.disconnect(); } catch {} this._layoutRO = null; }
+    if (this._unbindInfiniteScroll) { try { this._unbindInfiniteScroll(); } catch {} this._unbindInfiniteScroll = null; }
+    this._infiniteScrollEl = null;
+  }
+
+  _allItems(){
+    try {
+      return (this._batches || []).flatMap(b => Array.isArray(b?.items) ? b.items : []);
+    } catch {
+      return [];
+    }
+  }
+
+  _newBatchId(prefix='b'){
+    this._batchSeq++;
+    return `${prefix}${this._batchSeq}`;
+  }
+
+  async _kickAutoFillViewport(){
+    // Load additional pages until the scroller becomes scrollable (or we hit a cap).
+    if (!this._autoFillPending) return;
+    if (this.loading) return;
+
+    const scroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.();
+    if (!scroller) return;
+
+    const MAX_TRIES = 6;
+    if (this._autoFillTries >= MAX_TRIES) {
+      this._autoFillPending = false;
+      return;
+    }
+
+    // If the content doesn't fill the viewport yet, we can't scroll to trigger near-bottom.
+    const notScrollable = scroller.scrollHeight <= (scroller.clientHeight + 8);
+    if (!notScrollable) {
+      this._autoFillPending = false;
+      return;
+    }
+
+    if (!this.cursor) {
+      // No more cached rows to page; stop trying.
+      this._autoFillPending = false;
+      return;
+    }
+
+    this._autoFillTries++;
+    await this.load(false);
+  }
+
+  _cssEscape(s) {
+    try {
+      const v = String(s ?? '');
+      if (typeof CSS !== 'undefined' && typeof CSS.escape === 'function') return CSS.escape(v);
+      // Fallback: escape characters that would break an attribute selector.
+      return v.replace(/[^a-zA-Z0-9_\-]/g, (m) => `\\${m}`);
+    } catch {
+      return '';
+    }
+  }
+
+  _captureScrollAnchor(){
+    try {
+      const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+      const scroller = shell?.getScroller?.();
+      if (!scroller) return;
+
+      const scRect = scroller.getBoundingClientRect();
+      const entries = Array.from(this.shadowRoot.querySelectorAll('.entry[data-uri]'));
+
+      let best = null;
+      let bestRect = null;
+      let bestTop = Infinity;
+
+      for (const el of entries) {
+        const r = el.getBoundingClientRect();
+        const visible = (r.bottom > scRect.top + 8) && (r.top < scRect.bottom - 8);
+        if (!visible) continue;
+        if (r.top < bestTop) {
+          best = el;
+          bestRect = r;
+          bestTop = r.top;
+        }
+      }
+
+      const key = best?.getAttribute?.('data-uri') || '';
+      const offsetY = bestRect ? (bestRect.top - scRect.top) : 0;
+
+      this._scrollAnchor = {
+        key,
+        offsetY,
+        scrollTop: scroller.scrollTop || 0,
+      };
+      this._scrollAnchorApplyTries = 0;
+    } catch {
+      // ignore
+    }
+  }
+
+  _applyScrollAnchor(){
+    if (!this._restoreScrollNext) return;
+
+    try {
+      const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+      const scroller = shell?.getScroller?.();
+      if (!scroller) return;
+
+      const a = this._scrollAnchor;
+      if (!a) {
+        this._restoreScrollNext = false;
+        return;
+      }
+
+      this._scrollAnchorApplyTries++;
+
+      if (a.key) {
+        const sel = `.entry[data-uri="${this._cssEscape(a.key)}"]`;
+        const el = this.shadowRoot.querySelector(sel);
+        if (el) {
+          const scRect = scroller.getBoundingClientRect();
+          const r = el.getBoundingClientRect();
+          const newOffsetY = r.top - scRect.top;
+          const delta = newOffsetY - (Number(a.offsetY) || 0);
+          if (Number.isFinite(delta) && delta !== 0) {
+            scroller.scrollTop = Math.max(0, (scroller.scrollTop || 0) + delta);
+          }
+          this._scrollAnchor = null;
+          this._restoreScrollNext = false;
+          return;
+        }
+      }
+
+      if (Number.isFinite(a.scrollTop)) {
+        scroller.scrollTop = Math.max(0, Number(a.scrollTop) || 0);
+        this._scrollAnchor = null;
+        this._restoreScrollNext = false;
+        return;
+      }
+
+      // Give layout a couple frames; then stop trying.
+      if (this._scrollAnchorApplyTries >= 3) {
+        this._scrollAnchor = null;
+        this._restoreScrollNext = false;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  _computeColumns(){
+    try {
+      const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+      const scroller = shell?.getScroller?.() || null;
+
+      const UNIT = this._cssPx('--bsky-grid-unit', 0);
+      const panelSpanRaw = this._cssPx('--bsky-panel-span', 0);
+      const panelSpan = Math.max(0, Math.round(panelSpanRaw || 0));
+      const GAP = this._cssPx('--bsky-grid-gutter', this._cssPx('--bsky-card-gap', 0));
+
+      const MIN_SPAN = 2;
+      const MIN = (UNIT && UNIT > 0)
+        ? Math.max(1, Math.floor((UNIT * MIN_SPAN) + GAP))
+        : this._cssPx('--bsky-card-min-w', 350);
+
+      const fallback = this.getBoundingClientRect?.().width || 0;
+      const available = scroller?.clientWidth || scroller?.getBoundingClientRect?.().width || fallback || 0;
+      if (!available || available < 2) return { cols: 1, cardW: Math.max(1, Math.floor(available || MIN)), gap: GAP };
+
+      const colsBySpan = (panelSpan >= MIN_SPAN) ? Math.max(1, Math.floor(panelSpan / MIN_SPAN)) : 0;
+      const colsByMin = Math.max(1, Math.floor((available + GAP) / (MIN + GAP)));
+      const cols = colsBySpan ? Math.min(colsBySpan, colsByMin) : colsByMin;
+      const cardW = Math.max(1, Math.floor((available - ((cols - 1) * GAP)) / cols));
+
+      return { cols: Math.max(1, cols), cardW, gap: GAP };
+    } catch {
+      return { cols: 1, cardW: this._cssPx('--bsky-card-min-w', 350), gap: this._cssPx('--bsky-grid-gutter', 0) };
+    }
   }
 
   ensureMagicGrid(){
     if (this.view !== 'magic') {
-      if (this._magicRO) { try { this._magicRO.disconnect(); } catch {} this._magicRO = null; }
-      this._magic = null;
+      if (this._layoutRO) { try { this._layoutRO.disconnect(); } catch {} this._layoutRO = null; }
       return;
     }
 
-    const host = this.shadowRoot.querySelector('.entries.magic');
-    if (!host) return;
+    const hosts = Array.from(this.shadowRoot.querySelectorAll('.entries.magic[data-batch]'));
+    if (!hosts.length) return;
 
-    const shell = this.shadowRoot.querySelector('bsky-panel-shell');
-    const scroller = shell?.getScroller?.() || null;
+    const rebalance = () => {
+      const { cols, cardW, gap } = this._computeColumns();
+      this.style.setProperty('--bsky-card-w', `${cardW}px`);
+      this.style.setProperty('--bsky-grid-gutter', `${gap}px`);
 
-    const MIN = this._cssPx('--bsky-card-min-w', 350);
-    const GAP = this._cssPx('--bsky-card-gap', 8);
+      for (const host of hosts) {
+        try {
+          const entries = Array.from(host.querySelectorAll(':scope > .entry, :scope > .cols > .col > .entry'));
+          if (!entries.length) continue;
 
-    const updateLayout = () => {
-      try {
-        const fallback = this.getBoundingClientRect?.().width || 0;
-        const available = scroller?.clientWidth || scroller?.getBoundingClientRect?.().width || fallback || 0;
-        if (!available || available < 2) return;
+          if (cols <= 1) {
+            host.innerHTML = '';
+            for (const el of entries) host.appendChild(el);
+            continue;
+          }
 
-        // Choose columns based on *minimum* width, then compute the actual column width
-        // to fill the available space.
-        const cols = Math.max(1, Math.floor((available + GAP) / (MIN + GAP)));
-        const cardW = Math.max(1, Math.floor((available - ((cols - 1) * GAP)) / cols));
+          const colsWrap = document.createElement('div');
+          colsWrap.className = 'cols';
 
-        // Expose computed width to CSS and keep MagicGrid aligned.
-        this.style.setProperty('--bsky-card-w', `${cardW}px`);
-        host.style.width = '100%';
-        host.style.maxWidth = '100%';
+          const colEls = [];
+          for (let i = 0; i < cols; i++) {
+            const c = document.createElement('div');
+            c.className = 'col';
+            colEls.push(c);
+            colsWrap.appendChild(c);
+          }
 
-        if (this._magic) this._magic.itemWidth = cardW;
-      } catch {}
+          host.innerHTML = '';
+          host.appendChild(colsWrap);
+
+          // Populate horizontally: round-robin left→right across columns.
+          // This preserves the natural load order more predictably than height-based packing.
+          for (let i = 0; i < entries.length; i++) {
+            const el = entries[i];
+            colEls[i % cols].appendChild(el);
+          }
+        } catch {
+          // ignore
+        }
+      }
     };
 
-    if (!this._magic) {
-      try {
-        this._magic = new MagicGrid({
-          container: host,
-          static: true,
-          gutter: GAP,
-          useTransform: false,
-          animate: false,
-          center: false,
-          maxColumns: false,
-          useMin: false,
-          itemWidth: null,
-        });
-      } catch {
-        this._magic = null;
-      }
-    } else {
-      try { this._magic.setContainer(host); } catch {}
-    }
+    // Run immediately, then once more after layout settles.
+    rebalance();
+    requestAnimationFrame(() => rebalance());
 
-    updateLayout();
-    try { this._magic?.positionItems?.(); } catch {}
-
-    // The posts container is re-created on every render(), so always re-bind the observer.
-    if (this._magicRO) { try { this._magicRO.disconnect(); } catch {} this._magicRO = null; }
+    // The posts DOM is re-created on every render(), so always re-bind observer.
+    if (this._layoutRO) { try { this._layoutRO.disconnect(); } catch {} this._layoutRO = null; }
     try {
-      this._magicRO = new ResizeObserver(() => {
-        updateLayout();
-        try { this._magic?.positionItems?.(); } catch {}
+      let t = null;
+      this._layoutRO = new ResizeObserver(() => {
+        if (t) clearTimeout(t);
+        t = setTimeout(() => {
+          t = null;
+          rebalance();
+        }, 60);
       });
-      if (scroller) this._magicRO.observe(scroller);
-      // Also observe the custom element host as a fallback signal for panel width changes.
-      this._magicRO.observe(this);
+      // Observe the panel scroller width via the shell.
+      const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+      const scroller = shell?.getScroller?.() || null;
+      if (scroller) this._layoutRO.observe(scroller);
+      this._layoutRO.observe(this);
     } catch {
-      this._magicRO = null;
+      this._layoutRO = null;
     }
-
-    // One extra RAF pass helps when flex layout settles after tab/show/resize.
-    requestAnimationFrame(() => {
-      updateLayout();
-      try { this._magic?.positionItems?.(); } catch {}
-    });
   }
 
   async refreshRecent(minutes=2){
     if (this.loading) return;
     const mins = Math.max(1, Number(minutes || 2));
-    const sinceIso = new Date(Date.now() - (mins * 60 * 1000)).toISOString();
+    const floorIso = new Date(Date.now() - (mins * 60 * 1000)).toISOString();
+    const sinceIso = this._latestIso || floorIso;
 
     try {
       const auth = await getAuthStatusCached();
@@ -294,7 +523,9 @@ class BskyMyPosts extends HTMLElement {
 
       const out = await call('cacheQueryMyPosts', {
         since: sinceIso,
-        hours: Math.max(1, Number(this.filters.hours || 24)),
+        until: this.currentUntilIso(),
+        hours: 0,
+        types: this.selectedTypes(),
         limit: 100,
         offset: 0,
         newestFirst: true,
@@ -303,7 +534,7 @@ class BskyMyPosts extends HTMLElement {
       const batch = out?.items || [];
       if (!batch.length) return;
 
-      const have = new Set(this.items.map(it => it?.post?.uri).filter(Boolean));
+      const have = new Set(this._allItems().map(it => it?.post?.uri).filter(Boolean));
       const fresh = [];
       for (const it of batch) {
         const uri = it?.post?.uri;
@@ -313,7 +544,17 @@ class BskyMyPosts extends HTMLElement {
       }
 
       if (fresh.length) {
-        this.items = [...fresh, ...this.items];
+        this._restoreScrollNext = true;
+        this._batches = [{ id: this._newBatchId('new'), items: fresh }, ...(this._batches || [])];
+        // Track newest seen timestamp for subsequent refreshes.
+        try {
+          const maxIso = fresh
+            .map(it => it?.post?.record?.createdAt || it?.post?.indexedAt || '')
+            .filter(Boolean)
+            .sort()
+            .slice(-1)[0];
+          if (maxIso && (!this._latestIso || maxIso > this._latestIso)) this._latestIso = maxIso;
+        } catch {}
         this.render();
       }
     } catch (e) {
@@ -323,16 +564,12 @@ class BskyMyPosts extends HTMLElement {
   }
 
   onChange(e){
-    if (e.target.id === 'range') {
-      this.filters.hours = Number(e.target.value || 24);
-      this.load(true);
-      return;
-    }
     const t = e.target?.getAttribute?.('data-type');
     if (t) {
       if (e.target.checked) this.filters.types.add(t);
       else this.filters.types.delete(t);
-      this.render();
+      // Reload so limit/offset apply to the selected types.
+      this.load(true);
     }
 
     if (e.target.id === 'view') {
@@ -345,7 +582,65 @@ class BskyMyPosts extends HTMLElement {
 
   onClick(e){
     if (e.target.id === 'reload') { this.load(true); return; }
-    if (e.target.id === 'more')   { this.load(false); return; }
+    if (e.target.id === 'more') {
+      if (this.loading) return;
+      if (this.cursor) { this.load(false); return; }
+      this.queueOlderFromServer().then(() => this.load(false));
+      return;
+    }
+
+    if (e.target.id === 'open-range') {
+      const dlg = this.shadowRoot.querySelector('#range-dlg');
+      if (dlg) {
+        try { dlg.showModal(); } catch { dlg.setAttribute('open', ''); }
+      }
+      return;
+    }
+    if (e.target.id === 'clear-range') {
+      if (this.loading) return;
+      this.filters.from = '';
+      this.filters.to = '';
+      this.load(true);
+      return;
+    }
+    if (e.target.id === 'dlg-clear') {
+      const f = this.shadowRoot.querySelector('#dlg-from');
+      const t = this.shadowRoot.querySelector('#dlg-to');
+      if (f) f.value = '';
+      if (t) t.value = '';
+      this.filters.from = '';
+      this.filters.to = '';
+      const dlg = this.shadowRoot.querySelector('#range-dlg');
+      if (dlg) {
+        try { dlg.close(); } catch { dlg.removeAttribute('open'); }
+      }
+      this.load(true);
+      return;
+    }
+    if (e.target.id === 'dlg-apply') {
+      const dlg = this.shadowRoot.querySelector('#range-dlg');
+      const f = String(this.shadowRoot.querySelector('#dlg-from')?.value || '').trim();
+      const t = String(this.shadowRoot.querySelector('#dlg-to')?.value || '').trim();
+
+      const toIsoStart = (d) => {
+        if (!d) return '';
+        const dt = new Date(`${d}T00:00:00`);
+        return Number.isFinite(dt.getTime()) ? dt.toISOString() : '';
+      };
+      const toIsoEnd = (d) => {
+        if (!d) return '';
+        const dt = new Date(`${d}T23:59:59.999`);
+        return Number.isFinite(dt.getTime()) ? dt.toISOString() : '';
+      };
+
+      this.filters.from = toIsoStart(f);
+      this.filters.to = toIsoEnd(t);
+      if (dlg) {
+        try { dlg.close(); } catch { dlg.removeAttribute('open'); }
+      }
+      this.load(true);
+      return;
+    }
 
     // Click → swap YouTube thumb to iframe
     const yt = e.target.closest?.('[data-yt-id]');
@@ -444,21 +739,27 @@ class BskyMyPosts extends HTMLElement {
     if (this.loading) return;
 
     if (reset) {
-      this.items = [];
+      this._batches = [];
       this.cursor = null;
       this._offset = 0;
       this._cutoff = new Date();
-      this._cutoff.setHours(this._cutoff.getHours() - (this.filters.hours || 24));
+      this._latestIso = '';
+      this._backfillDone = false;
+      this._restoreScrollNext = false;
+      this._scrollTop = 0;
+      this._autoFillPending = true;
+      this._autoFillTries = 0;
+    } else {
+      this._restoreScrollNext = true;
     }
 
     this.loading = true;
     this.error = null;
-    this.render();
 
     try {
       const auth = await getAuthStatusCached();
       if (!auth?.connected) {
-        this.items = [];
+        this._batches = [];
         this.cursor = null;
         this._offset = 0;
         this.error = 'Not connected. Use the Connect button.';
@@ -466,48 +767,98 @@ class BskyMyPosts extends HTMLElement {
       }
 
       const limit = 100;
-      const out = await call('cacheQueryMyPosts', {
-        hours: Math.max(1, Number(this.filters.hours || 24)),
+      let out = await call('cacheQueryMyPosts', {
+        since: this.currentSinceIso(),
+        until: this.currentUntilIso(),
+        hours: 0,
+        types: this.selectedTypes(),
         limit,
         offset: this._offset,
         newestFirst: true,
       });
 
       let batch = out?.items || [];
+      let hasMore = !!out?.hasMore;
 
       // If cache is empty on first load, do a one-time seed sync.
       if (reset && batch.length === 0) {
-        const wantsReplies = this.filters.types.has('reply');
-        const filter = wantsReplies ? 'posts_with_replies' : 'posts_no_replies';
+        const filter = this.remoteFilterForSelection();
         await call('cacheSyncMyPosts', {
-          hours: Math.max(1, Number(this.filters.hours || 24)),
+          // Seed sync should always use a small recent window.
+          hours: 24,
           pagesMax: this._pagesMax,
           filter,
         });
-        const out2 = await call('cacheQueryMyPosts', {
-          hours: Math.max(1, Number(this.filters.hours || 24)),
+        out = await call('cacheQueryMyPosts', {
+          since: this.currentSinceIso(),
+          until: this.currentUntilIso(),
+          hours: 0,
+          types: this.selectedTypes(),
           limit,
           offset: this._offset,
           newestFirst: true,
         });
-        batch = out2?.items || [];
+        batch = out?.items || [];
+        hasMore = !!out?.hasMore;
       }
 
-      const have = new Set(this.items.map(it => it?.post?.uri).filter(Boolean));
+      const have = new Set(this._allItems().map(it => it?.post?.uri).filter(Boolean));
+      const unique = [];
       for (const it of batch) {
         const uri = it?.post?.uri;
         if (uri && have.has(uri)) continue;
         if (uri) have.add(uri);
-        this.items.push(it);
+        unique.push(it);
       }
 
+      if (unique.length) {
+        const id = this._newBatchId(reset ? 'b' : 'p');
+        this._batches = [...(this._batches || []), { id, items: unique }];
+      }
+
+      // Track newest seen timestamp for refreshRecent.
+      try {
+        const maxIso = batch
+          .map(it => it?.post?.record?.createdAt || it?.post?.indexedAt || '')
+          .filter(Boolean)
+          .sort()
+          .slice(-1)[0];
+        if (maxIso && (!this._latestIso || maxIso > this._latestIso)) this._latestIso = maxIso;
+      } catch {}
+
       this._offset += batch.length;
-      this.cursor = out?.hasMore ? 'more' : null;
+      this.cursor = hasMore ? 'more' : null;
     } catch (e) {
       this.error = isNotConnectedError(e) ? 'Not connected. Use the Connect button.' : e.message;
     } finally {
       this.loading = false;
       this.render();
+    }
+  }
+
+  async queueOlderFromServer(){
+    if (this._backfillInFlight) return;
+    if (this._backfillDone) return;
+
+    this._backfillInFlight = true;
+    try {
+      const res = await call('cacheBackfillMyPosts', {
+        // One author-feed page = 100 posts.
+        pagesMax: 1,
+        filter: this.remoteFilterForSelection(),
+      });
+
+      const done = !!res?.done;
+      const inserted = Number(res?.inserted || 0);
+      const updated = Number(res?.updated || 0);
+
+      if (done || (inserted + updated) === 0) {
+        this._backfillDone = true;
+      }
+    } catch {
+      // Silent; the next query will surface if nothing changes.
+    } finally {
+      this._backfillInFlight = false;
     }
   }
 
@@ -526,7 +877,15 @@ class BskyMyPosts extends HTMLElement {
     // - Infinite scroll appends older entries.
     // - Refresh prepends newer entries.
     // Sorting here would reshuffle already-loaded entries.
-    return this.items.filter(it => allowed.has(this.itemType(it)));
+    return this._allItems().filter(it => allowed.has(this.itemType(it)));
+  }
+
+  filteredBatches(){
+    const allowed = this.filters.types;
+    return (this._batches || []).map((b) => ({
+      id: String(b?.id || ''),
+      items: (Array.isArray(b?.items) ? b.items : []).filter(it => allowed.has(this.itemType(it)))
+    }));
   }
 
   // Build media/link preview HTML for a post
@@ -565,16 +924,30 @@ class BskyMyPosts extends HTMLElement {
   }
 
   render(){
+    // Preserve scroll position across re-renders.
+    // For paging renders, capture a visible-entry anchor so masonry reflows don't jump the user.
+    if (this._restoreScrollNext) {
+      this._captureScrollAnchor();
+    } else {
+      try {
+        const prevScroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.();
+        if (prevScroller) this._scrollTop = prevScroller.scrollTop || 0;
+      } catch {}
+    }
+
+    const fromVal = this._toInputValue(this.filters.from);
+    const toVal = this._toInputValue(this.filters.to);
+    const fromDate = fromVal ? fromVal.slice(0, 10) : '';
+    const toDate = toVal ? toVal.slice(0, 10) : '';
+    const rangeLabel = (this.filters.from || this.filters.to)
+      ? `${fromDate || '…'} → ${toDate || '…'}`
+      : 'All time';
+
     const filters = `
       <div class="filters">
-        <label>Range:
-          <select id="range">
-            <option value="24"  ${this.filters.hours===24?'selected':''}>Last 24h</option>
-            <option value="72"  ${this.filters.hours===72?'selected':''}>Last 3 days</option>
-            <option value="168" ${this.filters.hours===168?'selected':''}>Last 7 days</option>
-            <option value="720" ${this.filters.hours===720?'selected':''}>Last 30 days</option>
-          </select>
-        </label>
+        <button id="open-range" title="Select date range" aria-label="Select date range">📅</button>
+        <span class="range-label" title="Current date range">${rangeLabel}</span>
+        <button id="clear-range" ${(!this.filters.from && !this.filters.to) ? 'disabled' : ''}>Clear</button>
         <div class="types">
           ${TYPES.map((t) => `
             <label><input type="checkbox" data-type="${t}" ${this.filters.types.has(t) ? 'checked' : ''}> ${t}</label>
@@ -586,9 +959,9 @@ class BskyMyPosts extends HTMLElement {
       </div>
     `;
 
-    const ordered = this.filteredItems();
+    const batchViews = this.filteredBatches();
 
-    const cards = ordered.map((it) => {
+    const renderCard = (it) => {
       const p = it.post || {};
       const rec = p.record || {};
       const text = esc(rec.text || '');
@@ -621,35 +994,48 @@ class BskyMyPosts extends HTMLElement {
           </footer>
         </article>`
       };
-    });
+    };
 
-    const entriesHtml = cards.map(c => c.html).join('');
-    const listHtml = entriesHtml || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No posts in this range.</div>');
+    const batchesHtml = batchViews.map((b, idx) => {
+      const cards = (b.items || []).map(renderCard);
+      const entriesHtml = cards.map(c => c.html).join('');
+      const divider = idx > 0 ? `<hr class="batch-hr" aria-hidden="true">` : '';
+      return `
+        ${divider}
+        <section class="batch" data-batch="${esc(b.id)}">
+          <div class="entries magic" data-batch="${esc(b.id)}" role="region" aria-label="Posts batch">
+            ${entriesHtml}
+          </div>
+        </section>
+      `;
+    }).join('');
+
+    const listHtml = batchesHtml || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No posts.</div>');
 
     this.shadowRoot.innerHTML = `
       <style>
         :host, *, *::before, *::after{box-sizing:border-box}
         :host{display:block;margin:0;--bsky-posts-ui-offset:290px}
+        :host{--bsky-grid-gutter:0px; --bsky-card-gap:0px; --bsky-panels-gap:0px}
         .filters{display:flex;gap:var(--bsky-panel-control-gap-dense, 6px);flex-wrap:wrap;align-items:center}
         .filters label{color:#ddd}
+        .range-label{color:#bbb;font-size:.9rem;white-space:nowrap;max-width:45ch;overflow:hidden;text-overflow:ellipsis}
         .types{display:flex;gap:var(--bsky-panel-control-gap-dense, 6px);flex-wrap:wrap}
         .actions{margin-left:auto}
 
         .entries{width:100%;display:block}
+        .batch{width:100%}
+        .batch-hr{border:0;border-top:1px solid #222;margin:0}
 
-        /* MagicGrid: JS-positioned layout (library managed). */
-        .entries.magic{position:relative;display:block;max-width:100%;min-height:0}
-        /* Cards have a minimum width, but can expand to fill available space. */
-        .entries.magic .entry{
-          width:min(100%, var(--bsky-card-w, 350px));
-          max-width:min(100%, var(--bsky-card-w, 350px));
-          min-width:min(100%, var(--bsky-card-min-w, 350px));
-          margin:0;
-        }
+        /* Balanced-columns layout: each batch becomes N columns, entries placed by measured height. */
+        .entries.magic{display:block;max-width:100%;min-height:0}
+        .entries.magic .cols{display:flex;gap:var(--bsky-grid-gutter, 0px);align-items:flex-start;justify-content:flex-start;width:100%}
+        .entries.magic .col{flex:0 0 auto;width:min(100%, var(--bsky-card-w, 350px));display:flex;flex-direction:column;gap:0;min-width:0}
+        .entries.magic .entry{width:100%;max-width:100%;min-width:0;margin:0;}
 
-        .entry{border:1px solid #333; border-radius:10px; padding:6px; margin:0; background:#0b0b0b; width:100%; max-width:100%}
+        .entry{border:2px solid #333; border-radius:0; padding:5px; margin:0; background:#0b0b0b; width:100%; max-width:100%}
         .meta{display:flex; align-items:center; gap:10px; color:#bbb; font-size:.9rem; margin-bottom:6px}
-        .meta .kind{background:#111;border:1px solid #444;border-radius:999px;padding:1px 8px}
+        .meta .kind{background:#111;border:1px solid #444;border-radius:0;padding:1px 8px}
         .meta .time{margin-left:auto}
         .open{color:#9cd3ff}
         .text{white-space:pre-wrap;line-height:1.35}
@@ -658,7 +1044,7 @@ class BskyMyPosts extends HTMLElement {
 
         /* External cards (generic) */
         .embeds{margin-top:8px}
-        .ext-card{display:block;border:1px solid #333;border-radius:10px;overflow:hidden;background:#0f0f0f;width:100%}
+        .ext-card{display:block;border:1px solid #333;border-radius:0;overflow:hidden;background:#0f0f0f;width:100%}
         .ext-card.link{text-decoration:none;color:#fff;display:flex;flex-wrap:wrap;gap:0;width:100%}
         .ext-card .thumb{position:relative;flex:0 0 160px;max-width:100%;background:#111}
         .ext-card .thumb-img{width:100%;height:100%;object-fit:cover;display:block}
@@ -668,15 +1054,15 @@ class BskyMyPosts extends HTMLElement {
         .ext-card .host{color:#8aa;font-size:.85rem;margin-top:auto}
 
         /* Images grid */
-        .images-grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:6px;width:100%}
-        .img-wrap{margin:0;padding:0;background:#111;border-radius:8px;overflow:hidden}
+        .images-grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:0;width:100%}
+        .img-wrap{margin:0;padding:0;background:#111;border-radius:0;overflow:hidden}
         .img-wrap img{display:block;width:100%;height:100%;object-fit:cover}
 
         /* YouTube preview */
         .ext-card.yt{cursor:pointer}
         .ext-card.yt .thumb{width:100%;min-width:0;aspect-ratio:16/9;background:#111}
         .ext-card.yt .thumb img{width:100%;height:100%;object-fit:cover;display:block}
-        .ext-card.yt .play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.55);border:2px solid #fff;border-radius:9999px;padding:8px 14px;font-weight:700}
+        .ext-card.yt .play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.55);border:2px solid #fff;border-radius:0;padding:8px 14px;font-weight:700}
         .ext-card.yt.iframe .yt-16x9{position:relative;width:100%}
         .ext-card.yt.iframe .yt-16x9::before{content:"";display:block;padding-top:56.25%}
         .ext-card.yt.iframe iframe{position:absolute;inset:0;width:100%;height:100%;border:0}
@@ -685,7 +1071,7 @@ class BskyMyPosts extends HTMLElement {
         .ext-card.video{text-decoration:none;color:#fff;display:flex;gap:0;flex-wrap:wrap}
         .ext-card.video .thumb{position:relative;flex:0 0 160px;max-width:100%;background:#111;display:flex;align-items:center;justify-content:center}
         .ext-card.video .thumb img{width:100%;height:100%;object-fit:cover;display:block}
-        .ext-card.video .play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.55);border:2px solid #fff;border-radius:9999px;padding:8px 14px;font-weight:700}
+        .ext-card.video .play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.55);border:2px solid #fff;border-radius:0;padding:8px 14px;font-weight:700}
 
         @media (max-width: 520px){
           .ext-card .thumb{flex:0 0 100%;min-width:0}
@@ -693,38 +1079,85 @@ class BskyMyPosts extends HTMLElement {
           :host{--bsky-posts-ui-offset:240px}
         }
 
-        button{background:#111;border:1px solid #555;color:#fff;padding:6px 10px;border-radius:8px;cursor:pointer}
+        button{background:#111;border:1px solid #555;color:#fff;padding:6px 10px;border-radius:0;cursor:pointer}
         button:disabled{opacity:.6;cursor:not-allowed}
-        select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:10px;padding:6px 10px}
+        select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:0;padding:6px 10px}
         .muted{color:#aaa}
         .footer{display:flex;justify-content:center}
+
+        dialog{border:1px solid #333;border-radius:0;background:#0b0b0b;color:#fff;padding:0;max-width:min(520px, 92vw)}
+        dialog::backdrop{background:rgba(0,0,0,.55)}
+        .dlg{padding:14px}
+        .dlg-head{padding-bottom:10px;border-bottom:1px solid #222}
+        .dlg-body{display:grid;gap:10px;padding:10px 0}
+        .dlg-body label{display:grid;gap:6px;color:#ddd}
+        .dlg-body input{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:0;padding:8px 10px}
+        .dlg-actions{display:flex;gap:8px;justify-content:flex-end;padding-top:10px;border-top:1px solid #222}
       </style>
       <bsky-panel-shell title="Posts" dense style="--bsky-panel-ui-offset: var(--bsky-posts-ui-offset)">
         <div slot="toolbar">${filters}</div>
 
-        <div class="entries magic" role="region" aria-label="Posts list">
-          ${listHtml}
-        </div>
+        ${listHtml}
 
         ${this.error ? `<div class="muted" style="color:#f88">Error: ${esc(this.error)}</div>` : ''}
 
         <div slot="footer" class="footer">
-          <button id="more" ${this.loading || !this.cursor ? 'disabled':''}>${this.cursor ? 'Load more' : 'No more'}</button>
+          <button id="more" ${this.loading || (this._backfillDone && !this.cursor) ? 'disabled':''}>
+            ${this.cursor ? 'Load more' : (this._backfillDone ? 'No more' : 'Load more')}
+          </button>
         </div>
       </bsky-panel-shell>
+
+      <dialog id="range-dlg">
+        <form method="dialog" class="dlg">
+          <div class="dlg-head"><strong>Date range</strong></div>
+          <div class="dlg-body">
+            <label>From
+              <input id="dlg-from" type="date" value="${esc(fromDate)}">
+            </label>
+            <label>To
+              <input id="dlg-to" type="date" value="${esc(toDate)}">
+            </label>
+            <div class="muted">Pick a lower/upper timeframe to filter posts.</div>
+          </div>
+          <div class="dlg-actions">
+            <button value="cancel">Cancel</button>
+            <button id="dlg-clear" type="button">Clear</button>
+            <button id="dlg-apply" type="button">Apply</button>
+          </div>
+        </form>
+      </dialog>
     `;
+
+    // After re-render + relayout, lock the user's view to the same top-most visible entry.
+    // We do this *after* column balancing so the anchor survives DOM reparenting.
+    queueMicrotask(() => {
+      requestAnimationFrame(() => {
+        this._applyScrollAnchor();
+        setTimeout(() => this._applyScrollAnchor(), 160);
+      });
+    });
 
     // Infinite scroll: load the next page when nearing the bottom.
     const scroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.();
-    if (scroller) {
-      scroller.addEventListener('scroll', () => {
-        if (this.loading) return;
-        if (!this.cursor) return;
-        const threshold = 220;
-        if (scroller.scrollTop + scroller.clientHeight >= (scroller.scrollHeight - threshold)) {
-          this.load(false);
-        }
-      }, { passive: true });
+    if (scroller && scroller !== this._infiniteScrollEl) {
+      try { this._unbindInfiniteScroll?.(); } catch {}
+      this._infiniteScrollEl = scroller;
+      this._unbindInfiniteScroll = bindInfiniteScroll(scroller, () => this.load(false), {
+        threshold: 220,
+        enabled: () => true,
+        isLoading: () => !!this.loading,
+        hasMore: () => !!this.cursor,
+        onExhausted: () => this.queueOlderFromServer(),
+        exhaustedCooldownMs: 5000,
+        // We do a smarter "fill viewport" loop ourselves.
+        initialTick: false,
+      });
+    }
+
+    // After initial/reset load, auto-fetch until the viewport is scrollable.
+    if (this._autoFillPending) {
+      queueMicrotask(() => this._kickAutoFillViewport());
     }
 
     this.view = 'magic';

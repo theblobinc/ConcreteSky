@@ -51,11 +51,11 @@ export class BskyCommentComposer extends HTMLElement {
         .bar .who{font-weight:700; color:#eaeaea; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
         .bar button{margin-left:auto}
 
-        textarea{width:100%; min-height:80px; resize:vertical; border-radius:10px; border:1px solid #222; background:#0b0b0b; color:#fff; padding:8px; outline:none}
+        textarea{width:100%; min-height:80px; resize:vertical; border-radius: var(--bsky-radius, 0px); border:1px solid #222; background:#0b0b0b; color:#fff; padding:8px; outline:none}
         textarea:focus{border-color:#2f4b7a; box-shadow:0 0 0 2px rgba(47,75,122,.25)}
 
         .actions{display:flex; justify-content:flex-end; gap:8px; margin-top:8px}
-        button{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius:10px; padding:6px 10px; cursor:pointer}
+        button{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius: var(--bsky-radius, 0px); padding:6px 10px; cursor:pointer}
         button:hover{border-color:#3b5a8f}
         .muted{color:#aaa}
       </style>

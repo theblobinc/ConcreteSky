@@ -28,8 +28,8 @@ class BskyProfile extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         :host{display:block;margin-bottom:16px}
-          .card{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:#0b0b0b;border:1px solid #333;border-radius:10px;padding:10px;color:#fff}
-        .avatar{width:48px;height:48px;border-radius:50%;background:#222;object-fit:cover}
+          .card{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:#0b0b0b;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:10px;color:#fff}
+        .avatar{width:48px;height:48px;border-radius: var(--bsky-radius, 0px);background:#222;object-fit:cover}
           .taskbar{flex:0 0 100%;width:100%;margin-top:10px}
         .name{font-weight:700}
         .handle a{color:#bbb;text-decoration:none}
@@ -44,12 +44,12 @@ class BskyProfile extends HTMLElement {
         this.shadowRoot.innerHTML = `
           <style>
             :host{display:block;margin-bottom:16px}
-            .card{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:#0b0b0b;border:1px solid #333;border-radius:10px;padding:10px;color:#fff}
+            .card{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:#0b0b0b;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:10px;color:#fff}
             .muted{color:#bbb}
             .name{font-weight:700}
             .auth{margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
             .auth-status{color:#bbb;font-size:.9rem}
-            .auth-btn{appearance:none;background:#111;color:#fff;border:1px solid #333;border-radius:999px;padding:8px 12px;cursor:pointer;font-weight:700}
+            .auth-btn{appearance:none;background:#111;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:8px 12px;cursor:pointer;font-weight:700}
             .auth-btn:hover{background:#1b1b1b}
             .taskbar{flex:0 0 100%;width:100%;margin-top:10px}
           </style>
@@ -83,8 +83,8 @@ class BskyProfile extends HTMLElement {
       this.shadowRoot.innerHTML = `
         <style>
           :host{display:block;margin-bottom:16px}
-          .card{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:#0b0b0b;border:1px solid #333;border-radius:10px;padding:10px;color:#fff}
-          .avatar{width:48px;height:48px;border-radius:50%;background:#222;object-fit:cover}
+          .card{display:flex;align-items:center;gap:12px;flex-wrap:wrap;background:#0b0b0b;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:10px;color:#fff}
+          .avatar{width:48px;height:48px;border-radius: var(--bsky-radius, 0px);background:#222;object-fit:cover}
           .left{min-width:0;flex:1 1 auto}
           .name{font-weight:700}
           .handle a{color:#bbb;text-decoration:none}
@@ -92,10 +92,10 @@ class BskyProfile extends HTMLElement {
           .muted{color:#bbb;font-size:.9rem;margin-top:2px}
           .auth{margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
           .auth-status{color:#bbb;font-size:.9rem}
-          .auth-btn{appearance:none;background:#111;color:#fff;border:1px solid #333;border-radius:999px;padding:8px 12px;cursor:pointer;font-weight:700}
+          .auth-btn{appearance:none;background:#111;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:8px 12px;cursor:pointer;font-weight:700}
           .auth-btn:hover{background:#1b1b1b}
           .right{margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px}
-          .gear{appearance:none;background:transparent;border:1px solid #333;color:#fff;border-radius:10px;padding:6px 8px;cursor:pointer}
+          .gear{appearance:none;background:transparent;border:1px solid #333;color:#fff;border-radius: var(--bsky-radius, 0px);padding:6px 8px;cursor:pointer}
           .gear:hover{background:#1b1b1b}
           .taskbar{flex:0 0 100%;width:100%;margin-top:10px}
           ${identityCss}

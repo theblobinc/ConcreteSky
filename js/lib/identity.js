@@ -105,7 +105,7 @@ export const identityCss = `
   .bsky-id{display:inline-flex;align-items:center;gap:8px;min-width:0}
   .bsky-id-name{color:#fff;text-decoration:underline;font-weight:700;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .bsky-id-handle{color:#bbb;text-decoration:underline;font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-  .bsky-id-copy{appearance:none;border:1px solid rgba(255,255,255,.18);background:transparent;color:#ddd;border-radius:8px;padding:2px 6px;cursor:pointer;line-height:1}
+  .bsky-id-copy{appearance:none;border:1px solid rgba(255,255,255,.18);background:transparent;color:#ddd;border-radius: var(--bsky-radius, 0px);padding:2px 6px;cursor:pointer;line-height:1}
   .bsky-id-copy:hover{background:rgba(255,255,255,.06)}
   .bsky-id-copy[data-copied="1"]{border-color:#2e5a3a;color:#89f0a2}
   .bsky-id-copy[data-copied="0"]{border-color:#7a2f2f;color:#f0a2a2}

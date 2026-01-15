@@ -84,19 +84,19 @@ export function bindAuthControls(root) {
         #bsky-auth-modal{position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center}
         #bsky-auth-modal[hidden]{display:none}
         #bsky-auth-modal .bsky-backdrop{position:absolute;inset:0;background:rgba(0,0,0,.7)}
-        #bsky-auth-modal .bsky-card{position:relative;max-width:520px;width:calc(100vw - 24px);background:#11161d;color:#fff;border:1px solid rgba(255,255,255,.12);border-radius:10px;box-shadow:0 20px 60px rgba(0,0,0,.6)}
+        #bsky-auth-modal .bsky-card{position:relative;max-width:520px;width:calc(100vw - 24px);background:#11161d;color:#fff;border:1px solid rgba(255,255,255,.12);border-radius: var(--bsky-radius, 0px);box-shadow:0 20px 60px rgba(0,0,0,.6)}
         #bsky-auth-modal .bsky-hd{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.10)}
         #bsky-auth-modal .bsky-hd .t{font-weight:700}
         #bsky-auth-modal .bsky-bd{padding:14px;display:flex;flex-direction:column;gap:10px}
         #bsky-auth-modal label{font-size:12px;color:rgba(255,255,255,.7)}
-        #bsky-auth-modal input{width:100%;padding:10px 10px;border-radius:8px;border:1px solid rgba(255,255,255,.16);background:#0b0d10;color:#fff}
+        #bsky-auth-modal input{width:100%;padding:10px 10px;border-radius: var(--bsky-radius, 0px);border:1px solid rgba(255,255,255,.16);background:#0b0d10;color:#fff}
         #bsky-auth-modal .row{display:flex;gap:10px;flex-wrap:wrap}
         #bsky-auth-modal .row>*{flex:1 1 auto}
-        #bsky-auth-modal button{padding:10px 12px;border-radius:8px;border:1px solid rgba(255,255,255,.18);background:#1d2733;color:#fff;cursor:pointer}
+        #bsky-auth-modal button{padding:10px 12px;border-radius: var(--bsky-radius, 0px);border:1px solid rgba(255,255,255,.18);background:#1d2733;color:#fff;cursor:pointer}
         #bsky-auth-modal button.primary{background:#2b6cb0;border-color:#2b6cb0}
         #bsky-auth-modal button.ghost{background:transparent}
         #bsky-auth-modal .muted{font-size:12px;color:rgba(255,255,255,.7)}
-        #bsky-auth-modal details{border:1px solid rgba(255,255,255,.10);border-radius:8px;padding:10px}
+        #bsky-auth-modal details{border:1px solid rgba(255,255,255,.10);border-radius: var(--bsky-radius, 0px);padding:10px}
         #bsky-auth-modal details>summary{cursor:pointer}
       `;
       document.head.appendChild(style);

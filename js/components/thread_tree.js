@@ -93,13 +93,13 @@ export class BskyThreadTree extends HTMLElement {
         .muted{color:#aaa}
 
         .node{margin: 0 0 8px 0; padding-left: calc(var(--depth, 0) * 12px); border-left: 2px solid rgba(255,255,255,0.06)}
-        .card{border:1px solid #222; border-radius:10px; background:#0b0b0b; padding:8px}
+        .card{border:1px solid #222; border-radius: var(--bsky-radius, 0px); background:#0b0b0b; padding:8px}
         .meta{display:flex; align-items:center; gap:10px; color:#bbb; font-size:0.9rem; margin-bottom:6px}
         .who{font-weight:700; color:#eaeaea; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
         .when{margin-left:auto; white-space:nowrap}
         .text{white-space:pre-wrap; line-height:1.25}
 
-        .reply{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius:999px; padding:4px 10px; cursor:pointer}
+        .reply{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius: var(--bsky-radius, 0px); padding:4px 10px; cursor:pointer}
         .reply:hover{border-color:#3b5a8f}
 
         .replies{margin-top:8px}

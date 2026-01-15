@@ -447,9 +447,9 @@ class Api extends ParentController
         return ['actorDid' => $actorDid, 'pages' => $pages, 'inserted' => $inserted, 'updated' => $updated, 'skipped' => $skipped, 'cursor' => null, 'done' => true, 'stoppedEarly' => $stoppedEarly, 'stopBeforeIso' => $stopBeforeIso];
     }
 
-    protected function cacheQueryMyPosts(\PDO $pdo, string $actorDid, ?string $sinceIso, int $hours, array $types, int $limit, int $offset, bool $newestFirst): array
+    protected function cacheQueryMyPosts(\PDO $pdo, string $actorDid, ?string $sinceIso, ?string $untilIso, int $hours, array $types, int $limit, int $offset, bool $newestFirst): array
     {
-        $cutoffIso = gmdate('c', time() - ($hours * 3600));
+        $cutoffIso = $hours > 0 ? gmdate('c', time() - ($hours * 3600)) : null;
 
         $where = ['actor_did = :actor_did'];
         $bind = [':actor_did' => $actorDid];
@@ -457,9 +457,14 @@ class Api extends ParentController
         if ($sinceIso) {
             $where[] = 'created_at >= :since';
             $bind[':since'] = $sinceIso;
-        } else {
+        } elseif ($cutoffIso) {
             $where[] = 'created_at >= :cutoff';
             $bind[':cutoff'] = $cutoffIso;
+        }
+
+        if ($untilIso) {
+            $where[] = 'created_at <= :until';
+            $bind[':until'] = $untilIso;
         }
 
         if ($types) {
@@ -492,15 +497,18 @@ class Api extends ParentController
         }
 
         // Provide a cheap hasMore hint.
-        $stmtMore = $pdo->prepare('SELECT 1 FROM posts WHERE actor_did = :actor_did AND created_at >= :cutoff LIMIT 1 OFFSET :off');
-        $stmtMore->bindValue(':actor_did', $actorDid);
-        $stmtMore->bindValue(':cutoff', $sinceIso ?: $cutoffIso);
+        // Must reuse the exact same filters (types + since/until) to avoid lying to the client.
+        $sqlMore = 'SELECT 1 FROM posts WHERE ' . implode(' AND ', $where) . ' LIMIT 1 OFFSET :off';
+        $stmtMore = $pdo->prepare($sqlMore);
+        foreach ($bind as $k => $v) $stmtMore->bindValue($k, $v);
         $stmtMore->bindValue(':off', $offset + $limit, \PDO::PARAM_INT);
         $stmtMore->execute();
         $hasMore = (bool)$stmtMore->fetchColumn();
 
         return [
             'actorDid' => $actorDid,
+            'since' => $sinceIso,
+            'until' => $untilIso,
             'cutoffIso' => $sinceIso ?: $cutoffIso,
             'limit' => $limit,
             'offset' => $offset,
@@ -1888,8 +1896,14 @@ class Api extends ParentController
                 }
 
                 case 'cacheQueryMyPosts': {
-                    $hours = min(24 * 365 * 50, max(1, (int)($params['hours'] ?? 24)));
+                    // Query cached posts.
+                    // Params:
+                    // - since: optional ISO timestamp (inclusive)
+                    // - until: optional ISO timestamp (inclusive)
+                    // - hours: if >0 and since is not provided, use now-hours as cutoff; if 0, no cutoff
+                    $hours = min(24 * 365 * 50, max(0, (int)($params['hours'] ?? 24)));
                     $since = isset($params['since']) ? (string)$params['since'] : null;
+                    $until = isset($params['until']) ? (string)$params['until'] : null;
                     $types = (isset($params['types']) && is_array($params['types'])) ? array_values(array_unique(array_map('strval', $params['types']))) : [];
                     $limit = min(200, max(1, (int)($params['limit'] ?? 100)));
                     $offset = max(0, (int)($params['offset'] ?? 0));
@@ -1901,7 +1915,7 @@ class Api extends ParentController
                     $pdo = $this->cacheDb();
                     $this->cacheMigrate($pdo);
 
-                    $out = $this->cacheQueryMyPosts($pdo, $meDid, $since, $hours, $types, $limit, $offset, $newestFirst);
+                    $out = $this->cacheQueryMyPosts($pdo, $meDid, $since, $until, $hours, $types, $limit, $offset, $newestFirst);
                     return $this->json($out);
                 }
 

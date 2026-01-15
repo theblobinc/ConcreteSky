@@ -106,10 +106,10 @@ export class BskyEngagementLightbox extends HTMLElement {
     this.shadowRoot.innerHTML = open ? `
       <style>
         #overlay{ position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; z-index:999999; }
-        .modal{ background:#0b0b0b; color:#fff; border:1px solid #444; border-radius:12px; width:min(720px, 96vw); max-height:90vh; overflow:auto; }
+        .modal{ background:#0b0b0b; color:#fff; border:1px solid #444; border-radius: var(--bsky-radius, 0px); width:min(720px, 96vw); max-height:90vh; overflow:auto; }
         .head{ display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-bottom:1px solid #333; position:sticky; top:0; background:#0b0b0b; }
         .title{ font-weight:700; }
-        #close, #follow-all{ background:#111; border:1px solid #555; color:#fff; padding:6px 10px; border-radius:8px; cursor:pointer }
+        #close, #follow-all{ background:#111; border:1px solid #555; color:#fff; padding:6px 10px; border-radius: var(--bsky-radius, 0px); cursor:pointer }
         a{ color:#fff; text-decoration:underline }
         a:hover{ color:#aaa }
 
@@ -119,16 +119,16 @@ export class BskyEngagementLightbox extends HTMLElement {
           display:block;
         }
 
-        .list{ padding:10px 12px; display:grid; gap:8px }
-        .row{ display:flex; align-items:center; gap:10px; border:1px solid #333; border-radius:10px; padding:8px }
+        .list{ padding:10px 12px; display:grid; gap:0 }
+        .row{ display:flex; align-items:center; gap:10px; border:1px solid #333; border-radius: var(--bsky-radius, 0px); padding:2px }
         .avatar{
-          width:48px; height:48px; border-radius:50%; object-fit:cover; flex:0 0 auto;
+          width:48px; height:48px; border-radius: var(--bsky-radius, 0px); object-fit:cover; flex:0 0 auto;
           max-width:300px; /* hard cap to prevent stretch if external CSS leaks */
         }
         .who{ flex:1 1 auto; min-width:0 }
         .name{ font-weight:700 }
         .sub{ color:#bbb; font-size:.9rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap }
-        .btn{ background:#111; border:1px solid #555; color:#fff; padding:6px 10px; border-radius:8px; cursor:pointer }
+        .btn{ background:#111; border:1px solid #555; color:#fff; padding:6px 10px; border-radius: var(--bsky-radius, 0px); cursor:pointer }
         ${identityCss}
       </style>
       <div id="overlay">

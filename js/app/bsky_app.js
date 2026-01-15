@@ -44,12 +44,15 @@ class BskyApp extends HTMLElement {
         // If the content panel is not active anymore (user closed it via tab),
         // drop the temporary sizing + selection.
         if (!visible.includes('content')) {
-          this.clearFixedPx(['posts', 'content']);
+          const base = String(this._contentSplitBasePanel || '');
+          const toClear = base ? [base, 'content'] : ['posts', 'content'];
+          this.clearFixedPx(toClear);
           if (Array.isArray(this._contentPinnedPanels) && this._contentPinnedPanels.length) {
             this.clearFixedPx(this._contentPinnedPanels);
             this._contentPinnedPanels = [];
           }
           this.clearFixedCols(['posts', 'content']);
+          this._contentSplitBasePanel = null;
           const cp = this.shadowRoot.querySelector('bsky-content-panel');
           cp?.setSelection?.(null);
         }
@@ -236,6 +239,11 @@ class BskyApp extends HTMLElement {
     // We currently only use this for Posts → replies click.
     const spawnAfter = String(detail?.spawnAfter || '');
 
+    // If the caller wants a "subpanel" split behavior, they can specify the base panel.
+    // For back-compat, Posts continues to be the default base.
+    const requestedSplitFrom = String(detail?.splitFrom || '');
+    const splitFrom = (spawnAfter === 'posts' || requestedSplitFrom === 'posts') ? 'posts' : '';
+
     const contentSection = this.shadowRoot.querySelector('.panel[data-panel="content"]');
     const contentWasVisibleAtCall = !!(contentSection && !contentSection.hasAttribute('hidden'));
 
@@ -243,7 +251,8 @@ class BskyApp extends HTMLElement {
 
     // Posts side-panel behavior: pin all other visible panels so Comments only
     // takes space from Posts (not from Connections/Search/etc).
-    if (spawnAfter === 'posts' && !contentWasVisibleAtCall) {
+    const pinOthers = (detail?.pinOthers === undefined) ? true : !!detail.pinOthers;
+    if (splitFrom && pinOthers && !contentWasVisibleAtCall) {
       try {
         const panelsWrap = this.shadowRoot.querySelector('.panels');
         const visiblePanels = Array.from(this.shadowRoot.querySelectorAll('.panel[data-panel]:not([hidden])'));
@@ -260,6 +269,7 @@ class BskyApp extends HTMLElement {
         }
         // Remember so closeContent can unpin.
         this._contentPinnedPanels = pinned;
+        this._contentSplitBasePanel = 'posts';
         // Small nudge so the pinning takes effect before we insert Comments.
         requestAnimationFrame(() => {
           try { panelsWrap && window.dispatchEvent(new Event('resize')); } catch {}
@@ -278,10 +288,11 @@ class BskyApp extends HTMLElement {
       // Posts-only behavior: on desktop, shrink Posts by one *actual* column width
       // and allocate that column to the Comments panel.
       try {
-        const isMobile = window.matchMedia('(max-width: 560px)').matches;
+        // Bootstrap-ish: stack below md.
+        const isMobile = window.matchMedia('(max-width: 767px)').matches;
         if (isMobile) return;
 
-        if (spawnAfter !== 'posts') return;
+        if (!splitFrom) return;
         // If Comments is already open, only update selection (no resizing/pinning).
         if (contentWasVisibleAtCall) return;
 
@@ -289,9 +300,7 @@ class BskyApp extends HTMLElement {
         const contentPanel = this.shadowRoot.querySelector('.panel[data-panel="content"]');
         if (!postsPanel || !contentPanel) return;
 
-        const GAP = this._cssPx('--bsky-card-gap', 8);
-        const CARD = this._getPostsCardWidthPx();
-        const colW = CARD + GAP;
+        const GRID_GUTTER = this._cssPx('--bsky-grid-gutter', this._cssPx('--bsky-card-gap', 8));
 
         // Remove exactly one *current* column from Posts, so the remaining columns
         // keep the same computed CARD width and fill correctly.
@@ -340,16 +349,53 @@ class BskyApp extends HTMLElement {
           }
         })();
 
-        // If we can't actually spare a full column (+ the new gap), don't force a shrink.
-        const canShrink = postsW0 > (minPostsW + colW + panelsGap + 8);
+        // Bootstrap-like split: treat the *global* panels layout as the grid.
+        // posts span (eg 6) => comments span defaults to half (eg 3), leaving posts at 3.
+        const readCssNum = (el, prop) => {
+          try {
+            const raw = window.getComputedStyle(el).getPropertyValue(prop);
+            const n = Number.parseFloat(String(raw || ''));
+            return Number.isFinite(n) ? n : 0;
+          } catch {
+            return 0;
+          }
+        };
+
+        const panelsWrap = this.shadowRoot.querySelector('.panels');
+        const unit = panelsWrap ? readCssNum(panelsWrap, '--bsky-grid-unit') : 0;
+        const baseSpan0 = readCssNum(postsPanel, '--bsky-panel-span');
+        const baseSpan = Math.max(0, Math.round(baseSpan0 || 0));
+
+        if (!Number.isFinite(unit) || unit <= 0) return;
+        if (!baseSpan || baseSpan < 4) {
+          // Not enough room for a sane 2+2 split; just open Comments without resizing.
+          return;
+        }
+
+        const clampSpan = (v) => {
+          const n = Number(v);
+          if (!Number.isFinite(n)) return null;
+          return Math.max(2, Math.min(baseSpan - 2, Math.round(n)));
+        };
+
+        // Default: allocate half of the base panel span to Comments.
+        const subSpan = clampSpan(detail?.subSpan) || Math.max(2, Math.min(baseSpan - 2, Math.round(baseSpan / 2)));
+
+        // Target inner scroller width for Comments: span width includes internal gutters.
+        const contentInnerTarget = Math.max(1, Math.round((subSpan * unit) + ((subSpan - 1) * GRID_GUTTER)));
+        // Shrink Posts by the content span + the new inter-panel gutter.
+        const shrinkBy = contentInnerTarget + panelsGap;
+
+        // If we can't actually spare the subpanel (+ the new gap), don't force a shrink.
+        const canShrink = postsW0 > (minPostsW + shrinkBy + 8);
         if (!canShrink) {
-          this.setFixedPx('content', Math.max(minContentW, colW));
+          this.setFixedPx('content', Math.max(minContentW, contentExtra + contentInnerTarget));
           requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
           return;
         }
 
-        const nextPostsW = Math.max(minPostsW, postsW0 - colW - panelsGap);
-        const nextContentW = Math.max(minContentW, (contentExtra + CARD));
+        const nextPostsW = Math.max(minPostsW, postsW0 - shrinkBy);
+        const nextContentW = Math.max(minContentW, contentExtra + contentInnerTarget);
 
         // Apply explicit bases so the split is stable (panel_resize will respect these).
         this.setFixedPx('posts', nextPostsW);
@@ -358,7 +404,7 @@ class BskyApp extends HTMLElement {
         // Nudge panel_resize to reflow with fixed cols.
         requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
 
-        // Keep Posts visually anchored on the left and place Comments into the freed space.
+        // Keep base panel visually anchored on the left and place Comments into the freed space.
         requestAnimationFrame(() => {
           try {
             const wrap = this.shadowRoot.querySelector('.panels');
@@ -383,11 +429,16 @@ class BskyApp extends HTMLElement {
     const cp = this.shadowRoot.querySelector('bsky-content-panel');
     cp?.setSelection?.(null);
 
-    this.clearFixedPx(['posts', 'content']);
+    {
+      const base = String(this._contentSplitBasePanel || '');
+      const toClear = base ? [base, 'content'] : ['posts', 'content'];
+      this.clearFixedPx(toClear);
+    }
     if (Array.isArray(this._contentPinnedPanels) && this._contentPinnedPanels.length) {
       this.clearFixedPx(this._contentPinnedPanels);
       this._contentPinnedPanels = [];
     }
+    this._contentSplitBasePanel = null;
     this.clearFixedCols(['posts', 'content']);
     api?.deactivate?.('content');
     requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
@@ -472,26 +523,38 @@ class BskyApp extends HTMLElement {
 
         /* Card sizing: shared by panel resize logic + MagicGrid components */
         :host{
-          /* Cards are fluid-width, with a minimum that relaxes on tiny screens.
-             Upper bound remains 350px, but on small viewports it can drop (down to 280px). */
-          --bsky-card-min-w: clamp(280px, 92vw, 350px);
+          /* Bootstrap-ish grid primitives */
+          --bsky-grid-cols: 12;
+          /* Flat UI: no gutters/padding unless a component opts in. */
+          --bsky-grid-gutter: 0px;
+
+          /* Flat UI: default radius is 0 everywhere. */
+          --bsky-radius: 0px;
+          --bsky-panel-radius: 0px;
+
+           /* Cards target ~2 grid columns (plus one gutter) on xxl.
+             Clamp keeps things usable on tiny screens. */
+           --bsky-card-min-w: clamp(
+            240px,
+            calc((var(--bsky-grid-unit, 160px) * 2) + var(--bsky-grid-gutter, 24px)),
+            420px
+           );
           /* Components override this per-panel to the computed column width. */
-          --bsky-card-w: 350px;
-          --bsky-card-gap: 8px;
-          --bsky-panels-gap: 6px;
+           --bsky-card-w: var(--bsky-card-min-w);
+          /* Align MagicGrid + panel gutters to the standardized gutter. */
+          --bsky-card-gap: var(--bsky-grid-gutter);
+          --bsky-panels-gap: var(--bsky-grid-gutter);
 
           /* Panel spacing defaults (used by bsky-panel-shell). */
-          --bsky-panel-pad: 10px;
-          --bsky-panel-gap: 10px;
+          --bsky-panel-pad: 0px;
+          --bsky-panel-gap: 0px;
           --bsky-panel-control-gap: 8px;
-          --bsky-panel-pad-dense: 4px;
-          --bsky-panel-gap-dense: 6px;
+          --bsky-panel-pad-dense: 0px;
+          --bsky-panel-gap-dense: 0px;
           --bsky-panel-control-gap-dense: 6px;
         }
         .root{background:#000;color:#fff;width:100%;max-width:100%;margin:0;border:0;border-radius:0;overflow-x:hidden;
-          padding-left: clamp(6px, 1vw, 12px);
-          padding-right: clamp(6px, 1vw, 12px);
-          padding-top: 0;
+          padding:0 0 0 5px;
         }
 
         /* Tabs */
@@ -509,7 +572,7 @@ class BskyApp extends HTMLElement {
           padding:8px;
           background:#0b0b0b;
           border:1px solid #222;
-          border-radius:12px;
+          border-radius:0;
           position:relative;
           z-index:10;
         }
@@ -526,7 +589,7 @@ class BskyApp extends HTMLElement {
           background:#111;
           color:#fff;
           border:1px solid #333;
-          border-radius:999px;
+          border-radius:0;
           padding:8px 12px;
           cursor:grab;
           font-weight:600;
@@ -559,6 +622,7 @@ class BskyApp extends HTMLElement {
           padding: 0px;
           box-sizing: border-box;
           border: 1px solid #111;
+          border-radius:0;
           scroll-snap-align: start;
           scroll-snap-stop: always;
         }
@@ -573,7 +637,7 @@ class BskyApp extends HTMLElement {
           bottom:10px;
           width:10px;
           cursor:col-resize;
-          border-radius:8px;
+          border-radius:0;
           background:linear-gradient(to right, transparent, rgba(255,255,255,0.12));
           opacity:0.25;
         }
@@ -583,8 +647,10 @@ class BskyApp extends HTMLElement {
           .tablist{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:8px;align-items:stretch}
           .tab{width:100%;cursor:pointer}
           .tabhint{grid-column:1/-1;margin-left:0;white-space:normal;display:block}
+        }
 
-          /* Mobile: one panel per screen, swipe between them. */
+        /* Bootstrap-ish: below md, one panel per screen, swipe between them. */
+        @media (max-width: 767px){
           .panels{gap:0; scroll-snap-type:x mandatory;}
           .panel{flex:0 0 100%; min-width:100%; border-left:0; border-right:0;}
           .panel .resize-handle{display:none;}

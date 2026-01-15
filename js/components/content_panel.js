@@ -82,7 +82,7 @@ export class BskyContentPanel extends HTMLElement {
         :host, *, *::before, *::after{box-sizing:border-box}
         :host{display:block}
         .topRight{display:flex; gap:6px; align-items:center}
-        .btn{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius:999px; padding:6px 10px; cursor:pointer}
+        .btn{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius: var(--bsky-radius, 0px); padding:6px 10px; cursor:pointer}
         .btn:hover{border-color:#3b5a8f}
         .btn.link{color:#9cd3ff; text-decoration:none}
         .muted{color:#aaa}

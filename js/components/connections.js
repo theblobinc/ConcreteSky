@@ -2,6 +2,7 @@ import { call } from '../api.js';
 import { getAuthStatusCached, isNotConnectedError } from '../auth_state.js';
 import { identityCss, identityHtml, bindCopyClicks, toProfileUrl } from '../lib/identity.js';
 import { queueProfiles } from '../profile_hydrator.js';
+import { bindInfiniteScroll } from '../panels/panel_api.js';
 // Versioned import to bust aggressive browser module cache when MagicGrid changes.
 import MagicGrid from '../magicgrid/magic-grid.esm.js?v=0.1.28';
 
@@ -43,6 +44,9 @@ class BskyConnections extends HTMLElement {
       showFollowers: true,
       showFollowing: true,
     };
+
+      this._unbindInfiniteScroll = null;
+      this._infiniteScrollEl = null;
     this._magic = null;
     this._magicRO = null;
 
@@ -61,6 +65,8 @@ class BskyConnections extends HTMLElement {
 
   connectedCallback(){
     this.render();
+      if (this._unbindInfiniteScroll) { try { this._unbindInfiniteScroll(); } catch {} this._unbindInfiniteScroll = null; }
+      this._infiniteScrollEl = null;
     this.load(true);
     bindCopyClicks(this.shadowRoot);
     this.shadowRoot.addEventListener('click', (e) => this.onClick(e));
@@ -86,8 +92,16 @@ class BskyConnections extends HTMLElement {
     const shell = this.shadowRoot.querySelector('bsky-panel-shell');
     const scroller = shell?.getScroller?.() || null;
 
-    const MIN = this._cssPx('--bsky-card-min-w', 350);
-    const GAP = this._cssPx('--bsky-card-gap', 8);
+      const UNIT = this._cssPx('--bsky-grid-unit', 0);
+      const panelSpanRaw = this._cssPx('--bsky-panel-span', 0);
+      const panelSpan = Math.max(0, Math.round(panelSpanRaw || 0));
+
+      const GAP = this._cssPx('--bsky-grid-gutter', this._cssPx('--bsky-card-gap', 8));
+      // Cards should be at least 2 grid columns wide (plus the internal gutter between them).
+      const MIN_SPAN = 2;
+      const MIN = (UNIT && UNIT > 0)
+        ? Math.max(1, Math.floor((UNIT * MIN_SPAN) + GAP))
+        : this._cssPx('--bsky-card-min-w', 350);
 
     const updateLayout = () => {
       try {
@@ -95,7 +109,10 @@ class BskyConnections extends HTMLElement {
         const available = scroller?.clientWidth || scroller?.getBoundingClientRect?.().width || fallback || 0;
         if (!available || available < 2) return;
 
-        const cols = Math.max(1, Math.floor((available + GAP) / (MIN + GAP)));
+          // Choose columns based on the panel's grid span if available.
+          const colsBySpan = (panelSpan >= MIN_SPAN) ? Math.max(1, Math.floor(panelSpan / MIN_SPAN)) : 0;
+          const colsByMin = Math.max(1, Math.floor((available + GAP) / (MIN + GAP)));
+          const cols = colsBySpan ? Math.min(colsBySpan, colsByMin) : colsByMin;
         const cardW = Math.max(1, Math.floor((available - ((cols - 1) * GAP)) / cols));
 
         this.style.setProperty('--bsky-card-w', `${cardW}px`);
@@ -314,9 +331,9 @@ class BskyConnections extends HTMLElement {
         .muted{color:#aaa}
         .muted{color:#aaa}
         .controls{display:flex;gap:var(--bsky-panel-control-gap-dense, 6px);flex-wrap:wrap;align-items:center}
-        input,select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:10px;padding:8px 10px}
+        input,select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:8px 10px}
         label{color:#ddd;font-size:.95rem;display:flex;gap:6px;align-items:center}
-        button{background:#111;border:1px solid #555;color:#fff;padding:8px 10px;border-radius:10px;cursor:pointer}
+        button{background:#111;border:1px solid #555;color:#fff;padding:8px 10px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
         button:disabled{opacity:.6;cursor:not-allowed}
 
         .entries{display:block;gap:12px;justify-content:start;align-items:start}
@@ -330,8 +347,8 @@ class BskyConnections extends HTMLElement {
           margin:0;
         }
 
-        .entry{display:flex;gap:8px;border:1px solid #333;border-radius:12px;padding:6px;background:#0f0f0f;width:100%;max-width:100%}
-        .av{width:40px;height:40px;border-radius:50%;background:#222;object-fit:cover;flex:0 0 auto}
+        .entry{display:flex;gap:8px;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:5px;background:#0f0f0f;width:100%;max-width:100%}
+        .av{width:40px;height:40px;border-radius: var(--bsky-radius, 0px);background:#222;object-fit:cover;flex:0 0 auto}
         .main{min-width:0;flex:1}
         .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
         .sub{color:#bbb;font-size:.9rem;margin-top:2px}

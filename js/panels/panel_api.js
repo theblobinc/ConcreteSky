@@ -70,9 +70,98 @@ export function bindNearBottom(scroller, onNearBottom, opts = {}) {
   };
 }
 
+// Standard infinite scroll binding used across panels.
+// - De-dupes triggers so re-renders don't accidentally attach multiple listeners.
+// - Optionally supports a backfill/queue hook when the cache is exhausted.
+//
+// Filter conventions (shared across list panels):
+// - Prefer ISO 8601 timestamps for server queries.
+//   - `since`: inclusive lower bound (e.g. 2026-01-14T00:00:00.000Z)
+//   - `until`: inclusive upper bound
+// - Prefer filtering at the DB query level when possible so `limit`/`offset` represent
+//   the visible list (avoid querying 100 rows and hiding 80 client-side).
+// - Common filter keys used by panels:
+//   - `q`: free-text query
+//   - `types`: array of strings (server-side kind filter)
+//   - `since` / `until`: ISO date range
+export function bindInfiniteScroll(scroller, loadMore, opts = {}) {
+  if (!scroller) return () => {};
+
+  const threshold = Math.max(0, Number(opts.threshold ?? 220));
+  const enabled = (typeof opts.enabled === 'function') ? opts.enabled : () => true;
+  const isLoading = (typeof opts.isLoading === 'function') ? opts.isLoading : () => false;
+  const hasMore = (typeof opts.hasMore === 'function') ? opts.hasMore : () => true;
+  const onExhausted = (typeof opts.onExhausted === 'function') ? opts.onExhausted : null;
+  const cooldownMs = Math.max(0, Number(opts.cooldownMs ?? 250));
+  const exhaustedCooldownMs = Math.max(0, Number(opts.exhaustedCooldownMs ?? 5000));
+  const initialTick = (opts.initialTick !== false);
+
+  let cancelled = false;
+  let running = false;
+  let exhaustedRunning = false;
+  let lastRunAt = 0;
+  let lastExhaustedAt = 0;
+
+  const tick = async () => {
+    if (cancelled) return;
+    try {
+      if (!enabled()) return;
+      if (running || exhaustedRunning) return;
+      if (isLoading()) return;
+
+      const now = Date.now();
+      if (now - lastRunAt < cooldownMs) return;
+
+      if (hasMore()) {
+        running = true;
+        lastRunAt = now;
+        try {
+          await loadMore?.();
+        } finally {
+          running = false;
+        }
+        return;
+      }
+
+      if (onExhausted && (now - lastExhaustedAt >= exhaustedCooldownMs)) {
+        exhaustedRunning = true;
+        lastExhaustedAt = now;
+        try {
+          await onExhausted();
+        } finally {
+          exhaustedRunning = false;
+        }
+
+        // After a backfill attempt, try loading again.
+        if (cancelled) return;
+        if (isLoading()) return;
+        running = true;
+        lastRunAt = Date.now();
+        try {
+          await loadMore?.();
+        } finally {
+          running = false;
+        }
+      }
+    } catch {
+      // Ignore errors; the component should surface them.
+    }
+  };
+
+  const unbind = bindNearBottom(scroller, () => { tick(); }, { threshold, enabled });
+  // If the list doesn't fill the viewport yet, load the next page immediately.
+  if (initialTick) queueMicrotask(() => { tick(); });
+
+  return () => {
+    cancelled = true;
+    try { unbind?.(); } catch {}
+  };
+}
+
 export function isMobilePanelsViewport() {
   try {
-    return window.matchMedia('(max-width: 560px)').matches;
+    // Bootstrap-ish: below md.
+    return window.matchMedia('(max-width: 767px)').matches;
   } catch {
     return false;
   }
@@ -115,6 +204,33 @@ export function deactivatePanel(name, scope) {
 
 export function placePanelAfter(name, afterName, scope) {
   getTabsApi(scope)?.placeAfter?.(name, afterName);
+}
+
+// Convenience helpers for panels/components to drive the aux "content" panel.
+// These dispatch a bubbling, composed event that the app shell listens for.
+export function openContentPanel(detail = {}, scope) {
+  try {
+    const target = (scope instanceof EventTarget) ? scope : window;
+    target.dispatchEvent(new CustomEvent('bsky-open-content', {
+      detail: detail || {},
+      bubbles: true,
+      composed: true,
+    }));
+  } catch {
+    // ignore
+  }
+}
+
+export function closeContentPanel(scope) {
+  try {
+    const target = (scope instanceof EventTarget) ? scope : window;
+    target.dispatchEvent(new CustomEvent('bsky-close-content', {
+      bubbles: true,
+      composed: true,
+    }));
+  } catch {
+    // ignore
+  }
 }
 
 // Auto-register built-in templates.

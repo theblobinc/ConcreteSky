@@ -262,10 +262,10 @@ class BskyFeed extends HTMLElement {
       <style>
         :host{display:block}
         #scroll{max-height:60vh; overflow:auto; background:#000; padding:2px}
-        .post{border:1px solid #333; border-radius:6px; padding:10px; margin:8px 0; color:#fff}
+        .post{border:1px solid #333; border-radius: var(--bsky-radius, 0px); padding:10px; margin:8px 0; color:#fff}
         .meta{font-size:.9rem; color:#ccc; margin-bottom:6px}
         .row{margin-top:8px; display:flex; gap:8px}
-        button{background:#111;border:1px solid #555;color:#fff;padding:4px 8px;border-radius:6px;cursor:pointer}
+        button{background:#111;border:1px solid #555;color:#fff;padding:4px 8px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
         button:hover{background:#1b1b1b}
         .muted{color:#aaa}
         .err{color:#f88}
@@ -276,14 +276,14 @@ class BskyFeed extends HTMLElement {
           display:flex; align-items:center; justify-content:center; z-index:99999;
         }
         .modal{
-          background:#0b0b0b; color:#fff; border:1px solid #444; border-radius:10px;
+          background:#0b0b0b; color:#fff; border:1px solid #444; border-radius: var(--bsky-radius, 0px);
           width:min(720px, 92vw); max-height:80vh; overflow:auto; box-shadow:0 10px 40px rgba(0,0,0,.6);
         }
         .head{display:flex; align-items:center; justify-content:space-between; padding:10px 12px; border-bottom:1px solid #333; position:sticky; top:0; background:#0b0b0b}
         .actions{display:flex; gap:8px}
         .body{padding:10px 12px}
-        .likers-list{display:flex; flex-direction:column; gap:8px}
-        .liker{display:flex; justify-content:space-between; align-items:center; border:1px solid #333; border-radius:8px; padding:8px}
+        .likers-list{display:flex; flex-direction:column; gap:0}
+        .liker{display:flex; justify-content:space-between; align-items:center; border:1px solid #333; border-radius: var(--bsky-radius, 0px); padding:2px}
         .li-name a{color:#fff; text-decoration:underline}
         .li-handle{color:#bbb; font-size:.9rem}
         .already{color:#7bdc86; font-size:.9rem}
@@ -330,11 +330,11 @@ class BskyNotifications extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         :host{display:block;margin:10px 0}
-        .wrap{border:1px solid #333;border-radius:8px;padding:8px;background:#070707;color:#fff}
-        .n{border:1px solid #333;border-radius:6px;padding:6px;margin:6px 0}
+        .wrap{border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:8px;background:#070707;color:#fff}
+        .n{border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:2px;margin:0}
         .who span{color:#bbb;font-size:.9rem}
         .muted{color:#aaa}
-        button{background:#111;border:1px solid #555;color:#fff;padding:4px 8px;border-radius:6px;cursor:pointer}
+        button{background:#111;border:1px solid #555;color:#fff;padding:4px 8px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
       </style>
       <div class="wrap">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">

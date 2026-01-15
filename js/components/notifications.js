@@ -1,5 +1,6 @@
 import { call } from '../api.js';
 import { getAuthStatusCached, isNotConnectedError } from '../auth_state.js';
+import { bindInfiniteScroll } from '../panels/panel_api.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
   ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[m])
@@ -22,6 +23,13 @@ class BskyNotifications extends HTMLElement {
     this.loading = false;
     this.error = null;
     this.view = 'list'; // 'list' | 'masonry'
+    this.limit = 100;
+    this.offset = 0;
+    this.hasMore = false;
+    this._backfillInFlight = false;
+    this._backfillDone = false;
+    this._unbindInfiniteScroll = null;
+    this._infiniteScrollEl = null;
     // followMap[did] = { following:boolean, followedBy:boolean, muted:boolean, blocking:boolean }
     this.followMap = {};
     this.filters = { hours:24, reasons:new Set(REASONS), onlyNotFollowed:false };
@@ -35,7 +43,7 @@ class BskyNotifications extends HTMLElement {
 
   connectedCallback(){
     this.render();
-    this.load();
+    this.load(true);
     this.shadowRoot.addEventListener('change', (e) => this.onChange(e));
     this.shadowRoot.addEventListener('click',  (e) => this.onClick(e));
 
@@ -58,6 +66,34 @@ class BskyNotifications extends HTMLElement {
   disconnectedCallback(){
     window.removeEventListener('bsky-refresh-recent', this._refreshRecentHandler);
     if (this._authChangedHandler) window.removeEventListener('bsky-auth-changed', this._authChangedHandler);
+    if (this._unbindInfiniteScroll) { try { this._unbindInfiniteScroll(); } catch {} this._unbindInfiniteScroll = null; }
+    this._infiniteScrollEl = null;
+  }
+
+  async queueOlderFromServer(){
+    if (this._backfillInFlight) return;
+    if (this._backfillDone) return;
+
+    this._backfillInFlight = true;
+    try {
+      const res = await call('cacheBackfillNotifications', {
+        hours: this.filters.hours,
+        // One page per request keeps UI responsive.
+        pagesMax: 1,
+      });
+
+      // Server doesn't return inserted/updated for notifications; treat an empty cursor as "done".
+      const cursor = String(res?.cursor || '');
+      if (!cursor) {
+        // If the server can't advance any further, stop trying.
+        // (This is conservative; the cache will also be kept warm by periodic syncs.)
+        this._backfillDone = true;
+      }
+    } catch {
+      // Silent; next query will reflect whether anything changed.
+    } finally {
+      this._backfillInFlight = false;
+    }
   }
 
   notifKey(n){
@@ -168,7 +204,13 @@ class BskyNotifications extends HTMLElement {
   async load(reset=false){
     if (this.loading) return;
     this.loading = true;
-    if (reset) this.items = [];
+    this.error = null;
+    if (reset) {
+      this.items = [];
+      this.offset = 0;
+      this.hasMore = false;
+      this._backfillDone = false;
+    }
     this.render();
 
     try {
@@ -184,8 +226,8 @@ class BskyNotifications extends HTMLElement {
       let data = await call('cacheQueryNotifications', {
         hours: this.filters.hours,
         reasons,
-        limit: 500,
-        offset: 0,
+        limit: this.limit,
+        offset: this.offset,
         newestFirst: true,
       });
 
@@ -196,13 +238,27 @@ class BskyNotifications extends HTMLElement {
         data = await call('cacheQueryNotifications', {
           hours: this.filters.hours,
           reasons,
-          limit: 500,
-          offset: 0,
+          limit: this.limit,
+          offset: this.offset,
           newestFirst: true,
         });
       }
 
-      this.items = data.items || data.notifications || [];
+      const batch = data.items || data.notifications || [];
+      const have = new Set(this.items.map(n => this.notifKey(n)));
+      const fresh = [];
+      for (const n of batch) {
+        const k = this.notifKey(n);
+        if (have.has(k)) continue;
+        have.add(k);
+        fresh.push(n);
+      }
+
+      if (reset) this.items = fresh;
+      else this.items = [...this.items, ...fresh];
+
+      this.offset = this.items.length;
+      this.hasMore = !!data.hasMore;
 
       // collect unique DIDs we need relationship info for
       const dids = Array.from(new Set(this.items.map(n => n?.author?.did).filter(Boolean)));
@@ -397,7 +453,7 @@ class BskyNotifications extends HTMLElement {
       <style>
         :host, *, *::before, *::after{box-sizing:border-box}
         :host{display:block;margin:${embedded ? '0' : '12px 0'}}
-        .wrap{border:1px solid #333;border-radius:12px;padding:10px;background:#070707;color:#fff}
+        .wrap{border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:10px;background:#070707;color:#fff}
         .wrap.embedded{border:0;border-radius:0;padding:0;background:transparent}
         .head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
         .head.embedded{display:none}
@@ -409,20 +465,20 @@ class BskyNotifications extends HTMLElement {
         .bulk-progress{color:#bbb;font-size:.9rem}
 
         .list{width:100%}
-        .list.masonry{column-width:350px; column-gap:12px}
+        .list.masonry{column-width:var(--bsky-card-min-w, 350px); column-gap:var(--bsky-grid-gutter, 24px)}
         .list.masonry .n{break-inside:avoid; display:inline-flex; width:100%}
 
-        .n{display:flex;align-items:center;gap:10px;border:1px solid #333;border-radius:10px;padding:8px;margin:8px 0;background:#0f0f0f}
-        .av{width:32px;height:32px;border-radius:50%;background:#222;object-fit:cover}
+        .n{display:flex;align-items:center;gap:10px;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:2px;margin:0;background:#0f0f0f}
+        .av{width:32px;height:32px;border-radius: var(--bsky-radius, 0px);background:#222;object-fit:cover}
         .sub{color:#bbb;font-size:.9rem}
-        .chip{background:#1e2e1e;color:#89f0a2;border:1px solid #2e5a3a;border-radius:999px;padding:1px 6px;font-size:.75rem;margin-left:6px}
+        .chip{background:#1e2e1e;color:#89f0a2;border:1px solid #2e5a3a;border-radius: var(--bsky-radius, 0px);padding:1px 6px;font-size:.75rem;margin-left:6px}
         .following-badge{color:#7bdc86;font-size:.9rem}
         .open{color:#9cd3ff}
         .muted{color:#aaa}
-        button{background:#111;border:1px solid #555;color:#fff;padding:6px 10px;border-radius:8px;cursor:pointer}
+        button{background:#111;border:1px solid #555;color:#fff;padding:6px 10px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
         button:disabled{opacity:.6;cursor:not-allowed}
         .view-btn{margin-right:8px}
-        select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:10px;padding:6px 10px}
+        select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:6px 10px}
       </style>
       <div class="wrap ${embedded ? 'embedded' : ''}">
         <div class="head ${embedded ? 'embedded' : ''}"><div><strong>Notifications</strong></div></div>

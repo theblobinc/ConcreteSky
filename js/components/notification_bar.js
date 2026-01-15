@@ -754,7 +754,7 @@ class BskyNotificationBar extends HTMLElement {
         }
         .wrap{
           border:1px solid #2b2b2b;
-          border-radius:14px;
+          border-radius: var(--bsky-radius, 0px);
           background:rgba(10,10,10,.92);
           color:#fff;
           box-shadow: 0 18px 60px rgba(0,0,0,.6);
@@ -778,7 +778,7 @@ class BskyNotificationBar extends HTMLElement {
           background:#1d2a41;
           border:1px solid #2f4b7a;
           padding:2px 8px;
-          border-radius:999px;
+          border-radius: var(--bsky-radius, 0px);
           font-weight:700;
           font-size:.85rem;
         }
@@ -792,7 +792,7 @@ class BskyNotificationBar extends HTMLElement {
           align-items:center;
           gap:6px;
           border:1px solid #2b2b2b;
-          border-radius:999px;
+          border-radius: var(--bsky-radius, 0px);
           padding:2px 8px;
           color:#ddd;
           font-size:.85rem;
@@ -805,7 +805,7 @@ class BskyNotificationBar extends HTMLElement {
           border:1px solid #3a3a3a;
           background:#111;
           color:#fff;
-          border-radius:10px;
+          border-radius: var(--bsky-radius, 0px);
           padding:6px 10px;
           cursor:pointer;
           font-weight:700;
@@ -815,7 +815,7 @@ class BskyNotificationBar extends HTMLElement {
           border:1px solid #3a3a3a;
           background:transparent;
           color:#fff;
-          border-radius:10px;
+          border-radius: var(--bsky-radius, 0px);
           padding:6px 10px;
           cursor:pointer;
           font-weight:700;
@@ -829,19 +829,19 @@ class BskyNotificationBar extends HTMLElement {
           align-items:center;
           margin-bottom:10px;
         }
-        select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:10px;padding:6px 10px}
+        select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:6px 10px}
         .only{color:#ddd}
-        .btn{background:#111;border:1px solid #555;color:#fff;padding:6px 10px;border-radius:10px;cursor:pointer}
+        .btn{background:#111;border:1px solid #555;color:#fff;padding:6px 10px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
         .btn:disabled{opacity:.6;cursor:not-allowed}
 
-        details.reasons{border:1px solid #2b2b2b;border-radius:10px;padding:6px 8px;max-width:100%}
+        details.reasons{border:1px solid #2b2b2b;border-radius: var(--bsky-radius, 0px);padding:6px 8px;max-width:100%}
         details.reasons summary{cursor:pointer;color:#ddd}
         .reasons-grid{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:6px 10px;margin-top:6px;color:#ddd}
 
-        .list{display:flex;flex-direction:column;gap:8px;max-height:${this.expanded ? '52vh' : '160px'};overflow:auto;padding-right:4px;}
-        .row{display:flex;gap:10px;align-items:flex-start;padding:8px;border:1px solid #2b2b2b;border-radius:12px;background:#0f0f0f;cursor:pointer}
+        .list{display:flex;flex-direction:column;gap:0;max-height:${this.expanded ? '52vh' : '160px'};overflow:auto;padding-right:4px;}
+        .row{display:flex;gap:10px;align-items:flex-start;padding:2px;border:1px solid #2b2b2b;border-radius: var(--bsky-radius, 0px);background:#0f0f0f;cursor:pointer}
         .row:hover{border-color:#3a3a3a;background:#121212}
-        .av{width:28px;height:28px;border-radius:50%;background:#222;object-fit:cover;flex:0 0 auto}
+        .av{width:28px;height:28px;border-radius: var(--bsky-radius, 0px);background:#222;object-fit:cover;flex:0 0 auto}
         .txt{min-width:0;flex:1 1 auto}
         .line{font-weight:800;line-height:1.2;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
         .id{min-width:0;max-width:100%}
@@ -850,14 +850,14 @@ class BskyNotificationBar extends HTMLElement {
         .links{display:flex;gap:10px;margin-top:4px}
         .lnk{color:#9cd3ff;text-decoration:none;font-size:.85rem}
         .lnk:hover{text-decoration:underline}
-        .chip{background:#1d2a41;color:#cfe5ff;border:1px solid #2f4b7a;border-radius:999px;padding:1px 6px;font-size:.72rem;font-weight:800}
+        .chip{background:#1d2a41;color:#cfe5ff;border:1px solid #2f4b7a;border-radius: var(--bsky-radius, 0px);padding:1px 6px;font-size:.72rem;font-weight:800}
         .chip.ok{background:#1e2e1e;color:#89f0a2;border-color:#2e5a3a}
 
         .follow-ind{
           appearance:none;
           border:1px solid transparent;
           background:transparent;
-          border-radius:999px;
+          border-radius: var(--bsky-radius, 0px);
           width:22px;
           height:22px;
           padding:0;
@@ -866,7 +866,7 @@ class BskyNotificationBar extends HTMLElement {
           align-items:center;
           justify-content:center;
         }
-        .follow-dot{width:12px;height:12px;border-radius:50%;display:block;}
+        .follow-dot{width:12px;height:12px;border-radius: var(--bsky-radius, 0px);display:block;}
         .follow-ind.not-following{border-color:#5a1f1f}
         .follow-ind.not-following .follow-dot{background:transparent;border:2px solid #ff9a9a}
         .follow-ind.not-following:hover{background:#1a0f0f}
@@ -877,7 +877,7 @@ class BskyNotificationBar extends HTMLElement {
         .error{color:#f88;margin-top:8px}
 
         .settings .tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
-        .settings .tab{appearance:none;background:#111;color:#fff;border:1px solid #333;border-radius:999px;padding:8px 12px;cursor:pointer;font-weight:700}
+        .settings .tab{appearance:none;background:#111;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:8px 12px;cursor:pointer;font-weight:700}
         .settings .tab[aria-pressed="true"]{background:#1d2a41;border-color:#2f4b7a}
         .settings-body{max-height:52vh;overflow:auto;padding-right:4px}
 
