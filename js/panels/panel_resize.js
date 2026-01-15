@@ -140,16 +140,17 @@ export function enablePanelResize(root) {
   };
 
   const snapForPanel = (panelEl, name, px, snapCtx = null) => {
-    const { unit, cols, gutter } = snapCtx || {};
+    const { unit, cols, gutter, minSpan } = snapCtx || {};
     if (Number.isFinite(unit) && unit > 0 && Number.isFinite(cols) && cols > 0) {
-      return snapToGrid(px, unit, cols, gutter || 0, { minSpan: 2, maxSpan: cols });
+      return snapToGrid(px, unit, cols, gutter || 0, { minSpan: (minSpan ?? 2), maxSpan: cols });
     }
     return snapGeneric(px);
   };
 
   const minForPanel = (snapCtx = null) => {
-    const { unit, gutter } = snapCtx || {};
-    if (Number.isFinite(unit) && unit > 0) return Math.max(1, spanWidthPx(2, unit, gutter || 0));
+    const { unit, gutter, minSpan } = snapCtx || {};
+    const ms = Math.max(1, Number(minSpan ?? 2));
+    if (Number.isFinite(unit) && unit > 0) return Math.max(1, spanWidthPx(ms, unit, gutter || 0));
     return 350;
   };
 
@@ -169,15 +170,26 @@ export function enablePanelResize(root) {
   };
 
   const autoFitVisiblePanels = () => {
+    const notifyPanelsResized = () => {
+      try {
+        window.dispatchEvent(new CustomEvent('bsky-panels-resized'));
+      } catch {
+        // ignore
+      }
+    };
+
     const visible = getVisiblePanels();
-    if (!visible.length) return;
+    if (!visible.length) { notifyPanelsResized(); return; }
     const wrapW = panelsWrap?.getBoundingClientRect()?.width || 0;
-    if (!wrapW || wrapW < 50) return;
+    if (!wrapW || wrapW < 50) { notifyPanelsResized(); return; }
 
     const gutter = getGridGutter();
     const cols = getGridCols(wrapW);
     const unit = getGridUnit(wrapW, cols, gutter);
-    const snapCtx = { unit, cols, gutter };
+    // When many panels are visible at once, allow panels to go down to 1 grid unit
+    // so we can still fit without horizontal overflow.
+    const minSpan = (visible.length * 2 > cols) ? 1 : 2;
+    const snapCtx = { unit, cols, gutter, minSpan };
 
     // Expose grid diagnostics to CSS consumers.
     try {
@@ -199,6 +211,7 @@ export function enablePanelResize(root) {
           p.style.setProperty('--bsky-grid-unit', `${Math.max(0, unit)}px`);
         } catch {}
       }
+      notifyPanelsResized();
       return;
     }
 
@@ -246,25 +259,39 @@ export function enablePanelResize(root) {
     // If everything is manual, still enforce a fixed basis.
     // We allow flex-grow so panels can consume leftover space when there is slack,
     // but we keep flex-shrink at 0 so panels don't get squeezed (we want horizontal scroll instead).
-    for (const [p, { width }] of manual.entries()) {
+    for (const [p, { name, width }] of manual.entries()) {
       const pinned = p.getAttribute('data-bsky-fixed-pin') === '1';
-      const grow = pinned ? 0 : 1;
-      p.style.flex = `${grow} 0 ${width}px`;
-      p.style.flexBasis = `${width}px`;
+      const grow = (pinned || name === 'notifications') ? 0 : 1;
+
+      // Clamp notifications to max span=2 on desktop.
+      let basis = width;
+      if (name === 'notifications') {
+        const maxW = spanWidthPx(Math.min(cols, 2), unit, gutter);
+        basis = Math.min(basis, maxW);
+        try { p.style.maxWidth = `${Math.max(1, maxW)}px`; } catch {}
+      } else {
+        try { p.style.maxWidth = ''; } catch {}
+      }
+
+      // Allow shrinking to fit when new panels are opened.
+      p.style.flex = `${grow} 1 ${basis}px`;
+      p.style.flexBasis = `${basis}px`;
 
       // Expose an approximate span for components that want to compute columns.
       try {
         const stride = (unit + gutter) || 1;
-        const span = (Number.isFinite(unit) && unit > 0) ? Math.max(2, Math.round((width + gutter) / stride)) : cols;
-        p.style.setProperty('--bsky-panel-span', String(span));
+        const span = (Number.isFinite(unit) && unit > 0)
+          ? Math.max(minSpan, Math.round((basis + gutter) / stride))
+          : cols;
+        const clampedSpan = (name === 'notifications') ? Math.min(span, 2) : span;
+        p.style.setProperty('--bsky-panel-span', String(clampedSpan));
         p.style.setProperty('--bsky-grid-unit', `${Math.max(0, unit)}px`);
       } catch {}
     }
 
-    if (!auto.length) return;
+    if (!auto.length) { notifyPanelsResized(); return; }
 
     // Bootstrap-ish: distribute grid spans across auto panels.
-    const minSpan = 2;
     const n = auto.length;
     const base = Math.floor(cols / n);
     const rem = cols % n;
@@ -274,17 +301,30 @@ export function enablePanelResize(root) {
     // horizontal scrolling will kick in, which is acceptable.
     for (let i = 0; i < auto.length; i++) {
       const s = auto[i];
-      const span = spans[i] || minSpan;
+      let span = spans[i] || minSpan;
+      if (s.name === 'notifications') span = Math.min(span, 2);
       const w0 = spanWidthPx(span, unit, gutter);
       const w = snapForPanel(s.el, s.name, w0, snapCtx);
-      s.el.style.flex = `1 0 ${w}px`;
+      // Allow shrinking so panels fit without horizontal overflow.
+      // Notifications should not expand beyond its clamped span.
+      const grow = (s.name === 'notifications') ? 0 : 1;
+      s.el.style.flex = `${grow} 1 ${w}px`;
       s.el.style.flexBasis = `${w}px`;
       s.el.style.minWidth = `${Math.max(1, spanWidthPx(minSpan, unit, gutter))}px`;
       try {
         s.el.style.setProperty('--bsky-panel-span', String(span));
         s.el.style.setProperty('--bsky-grid-unit', `${Math.max(0, unit)}px`);
+        if (s.name === 'notifications') {
+          const maxW = spanWidthPx(Math.min(cols, 2), unit, gutter);
+          s.el.style.maxWidth = `${Math.max(1, maxW)}px`;
+        } else {
+          s.el.style.maxWidth = '';
+        }
       } catch {}
     }
+
+    // Notify listeners (masonry/magic-grid panels) that panel widths/spans may have changed.
+    notifyPanelsResized();
   };
 
   // Keep panels packed to content on load and when visible set changes.
@@ -309,7 +349,7 @@ export function enablePanelResize(root) {
       const unit = getGridUnit(wrapW, cols, gutter);
       const next = snapForPanel(p, name, saved, { unit, cols, gutter });
       // Saved widths act as a basis. Allow grow, but do not shrink (we scroll instead).
-      p.style.flex = `1 0 ${next}px`;
+      p.style.flex = `1 1 ${next}px`;
       p.style.flexBasis = `${next}px`;
     }
 
@@ -340,7 +380,7 @@ export function enablePanelResize(root) {
       const w = Math.max(0, Math.round(basisPx));
       // During drag we pin widths (0 0) so the boundary tracks the pointer.
       // On release, we switch to (1 0) so panels can still grow into slack space.
-      const flex = mode === 'drag' ? `0 0 ${w}px` : `1 0 ${w}px`;
+      const flex = mode === 'drag' ? `0 0 ${w}px` : `1 1 ${w}px`;
       el.style.flex = flex;
       el.style.flexBasis = `${w}px`;
       return w;

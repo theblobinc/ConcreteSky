@@ -85,7 +85,7 @@ try {
   /* 1) Remove the default horizontal padding of this one container-fluid,
         so our inner #blueskyfeed can truly span the viewport. */
   .bsky-fluid {
-    padding-left: 0;
+    padding-left: 15px;
     padding-right: 0;
     margin: 0;
     max-width: 98vw;

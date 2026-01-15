@@ -1,5 +1,14 @@
 # Panels TODO
 
+## Planned features
+
+- Panel API docs: keep `API.md` current as new hooks are added.
+- Standardize stable keys: all list-like components should use `data-k` for scroll anchoring.
+- Virtualization for long lists (connections/notifications/posts) to reduce DOM size.
+- Better “exhausted” UX for infinite scroll (explicit end-of-feed states per panel).
+- Centralized error/toast reporting for load failures (common hook).
+- Persist per-panel scroll position across tab switches (opt-in).
+
 This is the roadmap for improving the ConcreteSky panel system and adding upcoming UI features (notifications, commenting, threaded rendering, and a content/details panel).
 
 ## Goals

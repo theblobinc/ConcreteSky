@@ -35,7 +35,15 @@ async function flush() {
       if (!batch.length) break;
 
       try {
-        await call('profilesHydrate', { dids: batch, staleHours: 24, max: 200 });
+        const res = await call('profilesHydrate', { dids: batch, staleHours: 24, max: 200 });
+        try {
+          const updated = Number(res?.updated ?? 0);
+          if (updated > 0) {
+            window.dispatchEvent(new CustomEvent('bsky-profiles-hydrated', {
+              detail: { dids: batch, updated, requested: res?.requested ?? batch.length },
+            }));
+          }
+        } catch {}
       } catch (e) {
         console.warn('[BSKY hydrate] batch failed', e);
       }

@@ -44,7 +44,9 @@ class BskyProfile extends HTMLElement {
     }
   }
 }
-customElements.define('bsky-profile', BskyProfile);
+if (!customElements.get('bsky-profile')) {
+  customElements.define('bsky-profile', BskyProfile);
+}
 
 /* ---------- Feed + Lightbox for "Who Liked" ---------- */
 class BskyFeed extends HTMLElement {
@@ -299,7 +301,9 @@ class BskyFeed extends HTMLElement {
       </div>`;
   }
 }
-customElements.define('bsky-feed', BskyFeed);
+if (!customElements.get('bsky-feed')) {
+  customElements.define('bsky-feed', BskyFeed);
+}
 
 /* ---------- Optional: Notifications (unchanged from your last version) ---------- */
 class BskyNotifications extends HTMLElement {
@@ -347,4 +351,6 @@ class BskyNotifications extends HTMLElement {
     this.shadowRoot.getElementById('more')?.addEventListener('click', () => this.load());
   }
 }
-customElements.define('bsky-notifications', BskyNotifications);
+if (!customElements.get('bsky-notifications')) {
+  customElements.define('bsky-notifications', BskyNotifications);
+}

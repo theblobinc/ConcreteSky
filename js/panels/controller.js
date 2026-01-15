@@ -11,9 +11,7 @@ function initTabs(root) {
   const tabNames = new Set(buttons.map((b) => b.getAttribute('data-tab')).filter(Boolean));
 
   // One-click escape hatch if a saved panel width locks you into 1-column layouts.
-  root.addEventListener('click', (e) => {
-    const btn = e.target?.closest?.('#bsky-reset-layout');
-    if (!btn) return;
+  const resetLayout = () => {
     try {
       localStorage.removeItem('bsky_panel_widths');
     } catch {
@@ -25,8 +23,20 @@ function initTabs(root) {
     }
     // Nudge layouts (MagicGrid uses ResizeObserver and will reflow).
     requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+  };
+
+  // Back-compat: if a button with this id exists in the DOM, allow clicking it.
+  root.addEventListener('click', (e) => {
+    const btn = e.target?.closest?.('#bsky-reset-layout');
+    if (!btn) return;
+    resetLayout();
     e.preventDefault();
     e.stopPropagation();
+  });
+
+  // Preferred: trigger from anywhere (e.g. notification settings) via a global event.
+  window.addEventListener('bsky-reset-layout', () => {
+    resetLayout();
   });
 
   // Apply saved ordering before we wire events.

@@ -3,6 +3,8 @@
 
 const _registry = [];
 
+export * from './lazy_media.js';
+
 /**
  * @typedef {Object} PanelTemplate
  * @property {string} name              Unique id. Also used for [data-tab] and [data-panel].
@@ -158,6 +160,120 @@ export function bindInfiniteScroll(scroller, loadMore, opts = {}) {
   };
 }
 
+// --- Scroll stability helpers (shared across panels, cards, and bars) ---
+
+// Find the nearest panel scroller for a component, even when the component is nested
+// inside other shadow roots (e.g. <bsky-notifications> inside <bsky-notifications-panel>). 
+export function resolvePanelScroller(scope) {
+  try {
+    let node = scope;
+    for (let i = 0; i < 10; i++) {
+      if (!node) break;
+      const root = (typeof node.getRootNode === 'function') ? node.getRootNode() : null;
+      if (root && typeof root.querySelector === 'function') {
+        const shell = root.querySelector('bsky-panel-shell');
+        const scroller = shell?.getScroller?.();
+        if (scroller) return scroller;
+      }
+      node = root?.host || null;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+export function captureScrollAnchor({ scroller, root, itemSelector, keyAttr } = {}) {
+  try {
+    if (!scroller || !root) return null;
+    const selector = String(itemSelector || '');
+    const attr = String(keyAttr || 'data-uri');
+
+    const scRect = scroller.getBoundingClientRect();
+    const items = selector ? Array.from(root.querySelectorAll(selector)) : [];
+
+    let best = null;
+    let bestRect = null;
+    let bestTop = Infinity;
+
+    for (const el of items) {
+      const r = el.getBoundingClientRect();
+      const visible = (r.bottom > scRect.top + 8) && (r.top < scRect.bottom - 8);
+      if (!visible) continue;
+      if (r.top < bestTop) {
+        best = el;
+        bestRect = r;
+        bestTop = r.top;
+      }
+    }
+
+    const key = best?.getAttribute?.(attr) || '';
+    const offsetY = bestRect ? (bestRect.top - scRect.top) : 0;
+
+    return {
+      key,
+      offsetY,
+      scrollTop: scroller.scrollTop || 0,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function applyScrollAnchor({ scroller, root, anchor, keyAttr } = {}) {
+  try {
+    if (!scroller || !root || !anchor) return false;
+    const attr = String(keyAttr || 'data-uri');
+    const key = String(anchor.key || '');
+
+    if (key) {
+      const safe = (typeof CSS !== 'undefined' && typeof CSS.escape === 'function')
+        ? CSS.escape(key)
+        : key.replace(/[^a-zA-Z0-9_\-]/g, (m) => `\\${m}`);
+
+      const el = root.querySelector?.(`[${attr}="${safe}"]`) || null;
+      if (el) {
+        const scRect = scroller.getBoundingClientRect();
+        const r = el.getBoundingClientRect();
+        const newOffsetY = r.top - scRect.top;
+        const delta = newOffsetY - (Number(anchor.offsetY) || 0);
+        if (Number.isFinite(delta) && delta !== 0) {
+          scroller.scrollTop = Math.max(0, (scroller.scrollTop || 0) + delta);
+        }
+        return true;
+      }
+    }
+
+    if (Number.isFinite(anchor.scrollTop)) {
+      scroller.scrollTop = Math.max(0, Number(anchor.scrollTop) || 0);
+      return true;
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+// Coalesces repeated layout work into one rAF tick and preserves scroll position
+// by anchoring the top-most visible item.
+export function createStableWorkQueue({ getScroller, getRoot, itemSelector, keyAttr } = {}) {
+  let queued = false;
+  return function queueStable(work) {
+    if (queued) return;
+    queued = true;
+    requestAnimationFrame(() => {
+      queued = false;
+      const scroller = (typeof getScroller === 'function') ? getScroller() : null;
+      const root = (typeof getRoot === 'function') ? getRoot() : null;
+      const anchor = captureScrollAnchor({ scroller, root, itemSelector, keyAttr });
+      try { work?.(); } catch { /* ignore */ }
+      requestAnimationFrame(() => applyScrollAnchor({ scroller, root, anchor, keyAttr }));
+      setTimeout(() => applyScrollAnchor({ scroller, root, anchor, keyAttr }), 160);
+    });
+  };
+}
+
+
 export function isMobilePanelsViewport() {
   try {
     // Bootstrap-ish: below md.
@@ -236,8 +352,7 @@ export function closeContentPanel(scope) {
 // Auto-register built-in templates.
 import posts from './templates/posts.js';
 import connections from './templates/connections.js';
-import search from './templates/search.js';
 import notifications from './templates/notifications.js';
 import content from './templates/content.js';
 
-[posts, connections, search, notifications, content].forEach(registerPanelTemplate);
+[posts, connections, notifications, content].forEach(registerPanelTemplate);

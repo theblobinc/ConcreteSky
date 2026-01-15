@@ -477,6 +477,13 @@ class Api extends ParentController
             $where[] = 'kind IN (' . implode(',', $in) . ')';
         }
 
+        // Total count (for UI counters). Must reuse the exact same filters as the item query.
+        $sqlTotal = 'SELECT COUNT(1) FROM posts WHERE ' . implode(' AND ', $where);
+        $stmtTotal = $pdo->prepare($sqlTotal);
+        foreach ($bind as $k => $v) $stmtTotal->bindValue($k, $v);
+        $stmtTotal->execute();
+        $total = (int)$stmtTotal->fetchColumn();
+
         $order = $newestFirst ? 'DESC' : 'ASC';
         $sql = 'SELECT uri, cid, created_at, indexed_at, kind, raw_json '
             . 'FROM posts '
@@ -510,6 +517,7 @@ class Api extends ParentController
             'since' => $sinceIso,
             'until' => $untilIso,
             'cutoffIso' => $sinceIso ?: $cutoffIso,
+            'total' => $total,
             'limit' => $limit,
             'offset' => $offset,
             'newestFirst' => $newestFirst,
@@ -1115,6 +1123,27 @@ class Api extends ParentController
                         'staleHours' => $staleHours,
                         'needed' => count($need),
                         'updated' => $updated,
+                    ]);
+                }
+
+                case 'cacheGetProfiles': {
+                    // Fetch cached profile rows by DID. Useful for UI refresh after profilesHydrate.
+                    // Params:
+                    // - dids: string[]
+                    // - max: cap input size (default 200, max 500)
+                    $dids = $params['dids'] ?? [];
+                    if (!is_array($dids) || !$dids) return $this->json(['error' => 'Missing dids[]'], 400);
+                    $max = min(500, max(1, (int)($params['max'] ?? 200)));
+
+                    $dids = array_values(array_unique(array_filter(array_map('strval', $dids))));
+                    if (count($dids) > $max) $dids = array_slice($dids, 0, $max);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    return $this->json([
+                        'ok' => true,
+                        'profiles' => $this->cacheLoadProfiles($pdo, $dids),
                     ]);
                 }
 
@@ -1916,6 +1945,292 @@ class Api extends ParentController
                     $this->cacheMigrate($pdo);
 
                     $out = $this->cacheQueryMyPosts($pdo, $meDid, $since, $until, $hours, $types, $limit, $offset, $newestFirst);
+                    return $this->json($out);
+                }
+
+                case 'search': {
+                    // Unified multi-target search endpoint.
+                    // Intended for:
+                    // - HUD/router (optional)
+                    // - automation/MCP (JWT can bypass CSRF)
+                    //
+                    // Params:
+                    // - q: query string
+                    // - mode: 'cache' | 'network'
+                    // - targets: ['people','posts','notifications']
+                    // - limit: per-target max results
+                    // - hours: cache window for posts/notifications
+                    // - postTypes: ['post','reply','repost'] (optional)
+                    // - reasons: notification reasons (optional)
+
+                    $q = trim((string)($params['q'] ?? ''));
+                    $mode = (string)($params['mode'] ?? 'cache');
+                    if ($mode !== 'network') $mode = 'cache';
+
+                    $targets = (isset($params['targets']) && is_array($params['targets']))
+                        ? array_values(array_unique(array_map('strval', $params['targets'])))
+                        : ['people', 'posts', 'notifications'];
+                    $targets = array_values(array_filter($targets));
+                    if (!$targets) $targets = ['people', 'posts', 'notifications'];
+
+                    $limit = min(200, max(1, (int)($params['limit'] ?? 50)));
+                    $hours = min(24 * 365 * 50, max(1, (int)($params['hours'] ?? (24 * 30))));
+
+                    $postTypes = (isset($params['postTypes']) && is_array($params['postTypes']))
+                        ? array_values(array_unique(array_map('strval', $params['postTypes'])))
+                        : [];
+                    $reasons = (isset($params['reasons']) && is_array($params['reasons']))
+                        ? array_values(array_unique(array_map('strval', $params['reasons'])))
+                        : [];
+
+                    $meDid = $session['did'] ?? null;
+                    if (!$meDid) return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    // Lightweight matcher: supports OR/|, negation (-term), and field:value.
+                    $buildMatcher = static function (string $rawQ): array {
+                        $rawQ = trim($rawQ);
+                        if ($rawQ === '') {
+                            return ['ok' => true, 'type' => 'empty'];
+                        }
+
+                        // Regex mode: /pattern/i
+                        if (strlen($rawQ) >= 2 && $rawQ[0] === '/') {
+                            $last = strrpos($rawQ, '/');
+                            if ($last !== false && $last > 0) {
+                                $pat = substr($rawQ, 1, $last - 1);
+                                $flags = substr($rawQ, $last + 1);
+                                $flags = $flags !== '' ? $flags : 'i';
+                                $re = '/' . str_replace('/', '\\/', $pat) . '/' . $flags;
+                                return ['ok' => true, 'type' => 'regex', 're' => $re];
+                            }
+                        }
+
+                        $norm = preg_replace('/\s+OR\s+/i', ' | ', $rawQ);
+                        $orParts = preg_split('/\s*\|\s*/', (string)$norm);
+                        $clauses = [];
+                        foreach ($orParts as $part) {
+                            $part = trim((string)$part);
+                            if ($part === '') continue;
+                            $bits = preg_split('/\s+/', $part);
+                            $terms = [];
+                            foreach ($bits as $b) {
+                                $b = trim((string)$b);
+                                if ($b === '') continue;
+
+                                $neg = false;
+                                if ($b[0] === '-' && strlen($b) > 1) {
+                                    $neg = true;
+                                    $b = substr($b, 1);
+                                }
+
+                                $field = null;
+                                $val = $b;
+                                $idx = strpos($b, ':');
+                                if ($idx !== false && $idx > 0) {
+                                    $field = strtolower(substr($b, 0, $idx));
+                                    $val = substr($b, $idx + 1);
+                                }
+                                $val = strtolower(trim((string)$val));
+                                if ($val === '') continue;
+
+                                $terms[] = ['neg' => $neg, 'field' => $field, 'val' => $val];
+                            }
+                            if ($terms) $clauses[] = $terms;
+                        }
+                        return ['ok' => true, 'type' => 'text', 'clauses' => $clauses];
+                    };
+
+                    $matcher = $buildMatcher($q);
+
+                    $matches = static function (array $m, string $text, array $fields = []) : bool {
+                        if (($m['type'] ?? '') === 'empty') return true;
+                        $hay = strtolower($text);
+
+                        if (($m['type'] ?? '') === 'regex') {
+                            $blob = $hay . ' ' . strtolower(json_encode($fields, JSON_UNESCAPED_SLASHES));
+                            return @preg_match((string)($m['re'] ?? ''), $blob) === 1;
+                        }
+
+                        $clauses = $m['clauses'] ?? [];
+                        if (!$clauses) {
+                            // Fallback: simple substring.
+                            return $hay !== '';
+                        }
+
+                        // OR over clauses, AND within a clause.
+                        foreach ($clauses as $terms) {
+                            $ok = true;
+                            foreach ($terms as $t) {
+                                $val = (string)($t['val'] ?? '');
+                                if ($val === '') continue;
+
+                                $field = $t['field'] ?? null;
+                                $neg = !empty($t['neg']);
+
+                                $target = $hay;
+                                if ($field) {
+                                    $fv = $fields[$field] ?? '';
+                                    if (is_array($fv)) $fv = implode(' ', array_map('strval', $fv));
+                                    $target = strtolower((string)$fv);
+                                }
+
+                                $hit = (strpos($target, $val) !== false);
+                                if ($neg ? $hit : !$hit) {
+                                    $ok = false;
+                                    break;
+                                }
+                            }
+                            if ($ok) return true;
+                        }
+
+                        return false;
+                    };
+
+                    $out = [
+                        'ok' => true,
+                        'mode' => $mode,
+                        'q' => $q,
+                        'targets' => $targets,
+                        'actorDid' => $meDid,
+                        'results' => [],
+                    ];
+
+                    $networkPeopleTerm = static function (string $raw): string {
+                        $raw = trim($raw);
+                        if ($raw === '') return '';
+
+                        // Regex queries are not supported for network search.
+                        if (strlen($raw) >= 2 && $raw[0] === '/' && strrpos($raw, '/') > 0) {
+                            return '';
+                        }
+
+                        $raw = trim($raw, "\"'");
+                        $tokens = preg_split('/\s+/', $raw);
+                        $picked = [];
+                        $allowFields = ['name', 'handle', 'did', 'user', 'displayname', 'display'];
+
+                        foreach ($tokens as $tok) {
+                            $tok = trim((string)$tok);
+                            if ($tok === '') continue;
+
+                            $upper = strtoupper($tok);
+                            if ($upper === 'AND' || $upper === 'OR' || $upper === 'NOT' || $tok === '|' || $tok === '||') continue;
+                            if ($tok[0] === '-') continue;
+
+                            if ($tok[0] === '~' && strlen($tok) > 1) $tok = substr($tok, 1);
+                            $tok = trim($tok);
+                            if ($tok === '') continue;
+
+                            $idx = strpos($tok, ':');
+                            if ($idx !== false && $idx > 0) {
+                                $field = strtolower(substr($tok, 0, $idx));
+                                $val = trim(substr($tok, $idx + 1));
+                                $val = ltrim($val, '@');
+                                if ($val !== '' && in_array($field, $allowFields, true)) {
+                                    $picked[] = $val;
+                                }
+                                continue;
+                            }
+
+                            $tok = ltrim($tok, '@');
+                            if ($tok !== '') $picked[] = $tok;
+                        }
+
+                        $term = trim(implode(' ', $picked));
+                        if ($term === '') $term = $raw;
+                        if (strlen($term) > 256) $term = substr($term, 0, 256);
+                        return $term;
+                    };
+
+                    if ($mode === 'network') {
+                        // Network mode: only people search is supported here.
+                        if (in_array('people', $targets, true)) {
+                            $term = $networkPeopleTerm($q);
+                            if ($term === '' || strlen($term) < 2) {
+                                $out['results']['people'] = [];
+                            } else {
+                                $res = $this->xrpcSession('GET', 'app.bsky.actor.searchActors', $session, ['term' => $term, 'limit' => $limit]);
+                                $out['results']['people'] = $res['actors'] ?? [];
+                            }
+                        }
+                        return $this->json($out);
+                    }
+
+                    // Cache mode: query cache tables.
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (in_array('people', $targets, true)) {
+                        // cacheQueryPeople already supports q substring; advanced tokens can be matched client-side.
+                        $list = isset($params['list']) ? (string)$params['list'] : 'all';
+                        if (!in_array($list, ['all', 'followers', 'following'], true)) $list = 'all';
+                        $sort = isset($params['sort']) ? (string)$params['sort'] : 'followers';
+                        if (!in_array($sort, ['followers', 'following', 'posts', 'age', 'name', 'handle'], true)) $sort = 'followers';
+                        $mutual = !empty($params['mutual']);
+                        $people = $this->cacheQueryPeople($pdo, $meDid, $list, $q, $sort, $mutual, $limit, 0);
+                        $out['results']['people'] = $people['items'] ?? [];
+                    }
+
+                    if (in_array('posts', $targets, true)) {
+                        $types = $postTypes ?: ['post', 'reply', 'repost'];
+                        $res = $this->cacheQueryMyPosts($pdo, $meDid, null, null, $hours, $types, $limit, 0, true);
+                        $items = $res['items'] ?? [];
+                        if ($q !== '') {
+                            $items = array_values(array_filter($items, static function ($it) use ($matcher, $matches) {
+                                $text = (string)($it['post']['record']['text'] ?? '');
+                                $uri = (string)($it['post']['uri'] ?? '');
+                                $kind = '';
+                                try {
+                                    // Roughly align with front-end kind: post/reply/repost.
+                                    if (!empty($it['reason']['$type']) && stripos((string)$it['reason']['$type'], 'Repost') !== false) $kind = 'repost';
+                                    elseif (!empty($it['post']['record']['reply'])) $kind = 'reply';
+                                    else $kind = 'post';
+                                } catch (\Throwable $e) {
+                                    $kind = '';
+                                }
+                                $fields = [
+                                    'type' => $kind,
+                                    'uri' => $uri,
+                                ];
+                                return $matches($matcher, $text . ' ' . $uri . ' ' . $kind, $fields);
+                            }));
+                        }
+                        $out['results']['posts'] = $items;
+                    }
+
+                    if (in_array('notifications', $targets, true)) {
+                        $useReasons = $reasons;
+                        if (!$useReasons) {
+                            $useReasons = ['follow','like','reply','repost','mention','quote','subscribed-post','subscribed'];
+                        }
+                        $res = $this->cacheQueryNotifications($pdo, $meDid, $hours, $useReasons, $limit, 0, true);
+                        $items = $res['items'] ?? [];
+                        if ($q !== '') {
+                            $items = array_values(array_filter($items, static function ($n) use ($matcher, $matches) {
+                                $a = $n['author'] ?? [];
+                                $who = (string)($a['displayName'] ?? $a['handle'] ?? $a['did'] ?? '');
+                                $reason = (string)($n['reason'] ?? '');
+                                $subject = (string)($n['reasonSubject'] ?? '');
+                                $text = trim($who . ' ' . $reason . ' ' . $subject);
+                                $fields = [
+                                    'reason' => $reason,
+                                    'subject' => $subject,
+                                    'handle' => (string)($a['handle'] ?? ''),
+                                    'did' => (string)($a['did'] ?? ''),
+                                ];
+                                return $matches($matcher, $text, $fields);
+                            }));
+                        }
+                        $out['results']['notifications'] = $items;
+                    }
+
+                    // Convenience counts.
+                    $out['counts'] = [
+                        'people' => isset($out['results']['people']) ? count((array)$out['results']['people']) : 0,
+                        'posts' => isset($out['results']['posts']) ? count((array)$out['results']['posts']) : 0,
+                        'notifications' => isset($out['results']['notifications']) ? count((array)$out['results']['notifications']) : 0,
+                    ];
+
                     return $this->json($out);
                 }
 
@@ -2803,8 +3118,10 @@ class Api extends ParentController
         $useFts = ($q !== '' && preg_match('/[A-Za-z0-9_]/', $q));
         if ($q !== '') {
             if ($useFts) {
-                $join .= ' JOIN profiles_fts fts ON fts.did = p.did';
-                $where[] = 'fts MATCH :q';
+                // IMPORTANT: SQLite FTS MATCH expects the real virtual table name.
+                // Using an alias here can trigger "unable to use function MATCH" / SQL errors on some builds.
+                $join .= ' JOIN profiles_fts ON profiles_fts.did = p.did';
+                $where[] = 'profiles_fts MATCH :q';
                 $params[':q'] = $this->cacheFtsQuery($q);
             } else {
                 $where[] = '(lower(p.handle) LIKE :like OR lower(p.display_name) LIKE :like OR lower(p.description) LIKE :like)';

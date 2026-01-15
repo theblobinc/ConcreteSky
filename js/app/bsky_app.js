@@ -3,16 +3,7 @@ import { bootTabs } from '../tabs.js';
 import { getPanelTemplates, getDefaultActiveTabs } from '../panels/panel_api.js';
 
 // Side-effect imports: define custom elements used in the shell.
-import '../components/profile.js';
-import '../components/notification_bar.js';
-import '../components/panel_shell.js';
-import '../components/my_posts.js';
-import '../components/connections.js';
-import '../components/people_search.js';
-import '../components/thread_tree.js';
-import '../components/comment_composer.js';
-import '../components/content_panel.js';
-import '../components/notifications_panel.js';
+import '../panels/components/index.js';
 import '../components/interactions/interactions-modal.js';
 
 class BskyApp extends HTMLElement {
@@ -102,6 +93,17 @@ class BskyApp extends HTMLElement {
       .map((b) => b.getAttribute('data-tab'))
       .filter(Boolean);
     return active.length ? active : ['posts'];
+  }
+
+  getVisiblePanelsFromDom() {
+    try {
+      return Array.from(this.shadowRoot.querySelectorAll('.panel[data-panel]'))
+        .filter((p) => !p.hasAttribute('hidden'))
+        .map((p) => p.getAttribute('data-panel'))
+        .filter(Boolean);
+    } catch {
+      return this.getActiveTabsFromDom();
+    }
   }
 
   mountPanels(activeTabs = []) {
@@ -605,12 +607,11 @@ class BskyApp extends HTMLElement {
           flex-wrap:nowrap;
           gap: var(--bsky-panels-gap);
           align-items:stretch;
-          overflow-x:auto;
+          overflow-x:hidden;
           overflow-y:hidden;
-          scroll-snap-type: x mandatory;
-          scroll-behavior: smooth;
-          overscroll-behavior-x: contain;
-          -webkit-overflow-scrolling: touch;
+          scroll-snap-type: none;
+          scroll-behavior: auto;
+          overscroll-behavior-x: none;
           width:100%;
           max-width:100%;
         }
@@ -651,19 +652,26 @@ class BskyApp extends HTMLElement {
 
         /* Bootstrap-ish: below md, one panel per screen, swipe between them. */
         @media (max-width: 767px){
-          .panels{gap:0; scroll-snap-type:x mandatory;}
+          .panels{
+            gap:0;
+            overflow-x:auto;
+            scroll-snap-type:x mandatory;
+            scroll-behavior: smooth;
+            overscroll-behavior-x: contain;
+            -webkit-overflow-scrolling: touch;
+          }
           .panel{flex:0 0 100%; min-width:100%; border-left:0; border-right:0;}
           .panel .resize-handle{display:none;}
         }
 
         /* Avoid wrapping panels into multiple rows; prefer swipe/scroll instead. */
         @media (max-width: 900px){
-          .panels{flex-wrap:nowrap; overflow-x:auto;}
+          .panels{flex-wrap:nowrap; overflow-x:hidden;}
         }
 
         /* Ensure media inside components scale */
         .root img, .root video{ max-width:100%; height:auto; display:block }
-        bsky-my-posts, bsky-connections, bsky-people-search { display:block; width:100% }
+        bsky-my-posts, bsky-connections { display:block; width:100% }
       </style>
 
       <div class="root">
@@ -672,7 +680,6 @@ class BskyApp extends HTMLElement {
             <div slot="taskbar" class="tabsbar" role="toolbar" aria-label="Bluesky Feed Views">
               <div class="tablist">
                 ${tabsHtml}
-                <button class="tab" id="bsky-reset-layout" type="button" aria-pressed="false" style="cursor:pointer">Reset layout</button>
                 <span class="tabhint">Tip: click multiple tabs to compare in columns.</span>
               </div>
             </div>

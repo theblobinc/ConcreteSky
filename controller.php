@@ -9,7 +9,7 @@ class Controller extends Package
 {
     protected $pkgHandle = 'concretesky';
     protected $appVersionRequired = '9.0.0';
-    protected $pkgVersion = '0.1.79';
+    protected $pkgVersion = '0.1.100';
 
     public function getPackageName()
     {
