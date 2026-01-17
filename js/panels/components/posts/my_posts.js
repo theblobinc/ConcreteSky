@@ -170,6 +170,12 @@ class BskyMyPosts extends HTMLElement {
     this._restoreScrollNext = false;
     this._scrollAnchor = null; // { key, offsetY, scrollTop }
     this._scrollAnchorApplyTries = 0;
+    // Used to ignore stale delayed restore attempts (e.g. multiple rapid load-more renders).
+    this._scrollRestoreToken = 0;
+
+    // Incremental batch rendering + per-batch magic grid.
+    this._renderedBatchOrder = [];
+    this._magicGrid = null;
     this._autoFillPending = true;
     this._autoFillTries = 0;
 
@@ -191,6 +197,11 @@ class BskyMyPosts extends HTMLElement {
       const mins = Number(e?.detail?.minutes ?? 2);
       this.refreshRecent(mins);
     };
+  }
+
+  _nextScrollRestoreToken(){
+    this._scrollRestoreToken = (Number(this._scrollRestoreToken || 0) + 1);
+    return this._scrollRestoreToken;
   }
 
   _isRateLimitError(e) {
@@ -480,8 +491,9 @@ class BskyMyPosts extends HTMLElement {
     }
   }
 
-  _applyScrollAnchor(){
+  _applyScrollAnchor(token){
     if (!this._restoreScrollNext) return;
+    if (Number.isFinite(token) && token !== this._scrollRestoreToken) return;
 
     try {
       const scroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.()
@@ -546,155 +558,225 @@ class BskyMyPosts extends HTMLElement {
   ensureMagicGrid(){
     if (this.view !== 'magic') {
       if (this._layoutRO) { try { this._layoutRO.disconnect(); } catch {} this._layoutRO = null; }
+      if (this._magicGrid) {
+        try { this._magicGrid.teardown?.(); } catch {}
+        this._magicGrid = null;
+      }
       return;
     }
 
-    const hosts = Array.from(this.shadowRoot.querySelectorAll('.entries.magic[data-batch]'));
-    if (!hosts.length) return;
+    const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+    const scroller = shell?.getScroller?.() || null;
+    if (!scroller) return;
 
-    let _rebalanceQueued = false;
-    let _rebalanceTimer = null;
-    let _lastRebalanceAt = 0;
-    const queueRebalance = () => {
-      // Coalesce bursts (ResizeObserver + many image loads) into a single rebalance.
-      if (_rebalanceTimer) return;
-      _rebalanceTimer = setTimeout(() => {
-        _rebalanceTimer = null;
-        if (_rebalanceQueued) return;
-        _rebalanceQueued = true;
-        requestAnimationFrame(() => {
-          _rebalanceQueued = false;
-          _lastRebalanceAt = Date.now();
-          // Keep the current top-most visible entry pinned while we reshuffle.
-          this._captureScrollAnchor();
-          this._restoreScrollNext = true;
-          rebalance();
-          requestAnimationFrame(() => this._applyScrollAnchor());
-        });
-      }, 60);
-    };
+    const getHosts = () => Array.from(this.shadowRoot.querySelectorAll('.entries.magic[data-batch]'));
+    const anyHosts = getHosts();
+    if (!anyHosts.length) return;
 
-    const rebalance = () => {
-      const { cols, cardW, gap } = this._computeColumns();
-      this.style.setProperty('--bsky-card-w', `${cardW}px`);
-      this.style.setProperty('--bsky-grid-gutter', `${gap}px`);
+    // Initialize the magic-grid manager once and keep it alive across renders.
+    if (!this._magicGrid || this._magicGrid.scroller !== scroller) {
+      try { this._magicGrid?.teardown?.(); } catch {}
 
-      for (const host of hosts) {
-        try {
-          const entries = Array.from(host.querySelectorAll(':scope > .entry, :scope > .cols > .col > .entry'));
-          if (!entries.length) continue;
-
-          if (cols <= 1) {
-            host.innerHTML = '';
-            for (const el of entries) host.appendChild(el);
-            continue;
+      const state = {
+        scroller,
+        queued: false,
+        timer: null,
+        applyToken: 0,
+        ro: null,
+        teardown: () => {
+          try { if (state.timer) clearTimeout(state.timer); } catch {}
+          state.timer = null;
+          try { state.ro?.disconnect?.(); } catch {}
+          state.ro = null;
+        },
+        markAllDirty: () => {
+          for (const host of getHosts()) {
+            try { host.dataset.bskyDirty = '1'; } catch {}
           }
+        },
+      };
 
-          // Keep a stable order within the batch so repeated rebalances don't reshuffle.
-          const ordFor = (el, fallback) => {
-            const raw = el?.getAttribute?.('data-ord');
-            const n = Number.parseInt(String(raw || ''), 10);
-            return Number.isFinite(n) ? n : fallback;
-          };
-          const ordered = entries.slice().sort((a, b) => ordFor(a, 0) - ordFor(b, 0));
+      const rebalanceDirtyHosts = () => {
+        const hosts = getHosts();
+        if (!hosts.length) return false;
 
-          // Create/reuse the columns wrapper to avoid heavy DOM teardown.
-          let colsWrap = host.querySelector(':scope > .cols');
-          if (!colsWrap) {
-            colsWrap = document.createElement('div');
-            colsWrap.className = 'cols';
-            host.innerHTML = '';
-            host.appendChild(colsWrap);
-          }
+        const { cols, cardW, gap } = this._computeColumns();
+        this.style.setProperty('--bsky-card-w', `${cardW}px`);
+        this.style.setProperty('--bsky-grid-gutter', `${gap}px`);
 
-          // Ensure column count.
-          const colEls = Array.from(colsWrap.querySelectorAll(':scope > .col'));
-          while (colEls.length < cols) {
-            const c = document.createElement('div');
-            c.className = 'col';
-            colsWrap.appendChild(c);
-            colEls.push(c);
-          }
-          while (colEls.length > cols) {
-            const last = colEls.pop();
-            if (last) {
-              // Move anything remaining into the first column before dropping.
-              const first = colEls[0];
-              if (first) {
-                while (last.firstChild) first.appendChild(last.firstChild);
+        let didWork = false;
+        for (const host of hosts) {
+          try {
+            if (String(host?.dataset?.bskyDirty || '') !== '1') continue;
+
+            const entries = Array.from(host.querySelectorAll(':scope > .entry, :scope > .cols > .col > .entry'));
+            if (!entries.length) {
+              host.dataset.bskyDirty = '0';
+              continue;
+            }
+            didWork = true;
+
+            if (cols <= 1) {
+              host.innerHTML = '';
+              for (const el of entries) host.appendChild(el);
+              host.dataset.bskyDirty = '0';
+              continue;
+            }
+
+            const ordFor = (el, fallback) => {
+              const raw = el?.getAttribute?.('data-ord');
+              const n = Number.parseInt(String(raw || ''), 10);
+              return Number.isFinite(n) ? n : fallback;
+            };
+            const ordered = entries.slice().sort((a, b) => ordFor(a, 0) - ordFor(b, 0));
+
+            let colsWrap = host.querySelector(':scope > .cols');
+            if (!colsWrap) {
+              colsWrap = document.createElement('div');
+              colsWrap.className = 'cols';
+              host.innerHTML = '';
+              host.appendChild(colsWrap);
+            }
+
+            const colEls = Array.from(colsWrap.querySelectorAll(':scope > .col'));
+            while (colEls.length < cols) {
+              const c = document.createElement('div');
+              c.className = 'col';
+              colsWrap.appendChild(c);
+              colEls.push(c);
+            }
+            while (colEls.length > cols) {
+              const last = colEls.pop();
+              if (last) {
+                const first = colEls[0];
+                if (first) {
+                  while (last.firstChild) first.appendChild(last.firstChild);
+                }
+                try { last.remove(); } catch { try { colsWrap.removeChild(last); } catch {} }
               }
-              try { last.remove(); } catch { try { colsWrap.removeChild(last); } catch {} }
-            }
-          }
-
-          // Measure entry heights in-place (avoids offscreen reparenting).
-          const entryHeights = ordered.map((el) => {
-            try { return Math.max(0, el.getBoundingClientRect().height || 0); } catch { return 0; }
-          });
-
-          // Greedy packing by current shortest column.
-          const colHeights = new Array(colEls.length).fill(0);
-          for (const c of colEls) c.textContent = '';
-
-          for (let i = 0; i < ordered.length; i++) {
-            const el = ordered[i];
-            const h = entryHeights[i] || 0;
-
-            let bestIdx = 0;
-            let bestH = colHeights[0] ?? 0;
-            for (let c = 1; c < colHeights.length; c++) {
-              const ch = colHeights[c] ?? 0;
-              if (ch < bestH) { bestH = ch; bestIdx = c; }
             }
 
-            colEls[bestIdx].appendChild(el);
-            colHeights[bestIdx] = (colHeights[bestIdx] ?? 0) + h;
-          }
+            const entryHeights = ordered.map((el) => {
+              try { return Math.max(0, el.getBoundingClientRect().height || 0); } catch { return 0; }
+            });
 
-          // Late-loading media can change entry heights after initial packing.
-          const imgs = Array.from(host.querySelectorAll('img'));
-          for (const img of imgs) {
-            try {
-              if (img.dataset?.bskyRebalanceBound === '1') continue;
-              if (img.complete) continue;
-              img.dataset.bskyRebalanceBound = '1';
-              img.addEventListener('load', queueRebalance, { once: true });
-              img.addEventListener('error', queueRebalance, { once: true });
-            } catch {
-              // ignore
+            const colHeights = new Array(colEls.length).fill(0);
+            for (const c of colEls) c.textContent = '';
+
+            for (let i = 0; i < ordered.length; i++) {
+              const el = ordered[i];
+              const h = entryHeights[i] || 0;
+
+              let bestIdx = 0;
+              let bestH = colHeights[0] ?? 0;
+              for (let c = 1; c < colHeights.length; c++) {
+                const ch = colHeights[c] ?? 0;
+                if (ch < bestH) { bestH = ch; bestIdx = c; }
+              }
+
+              colEls[bestIdx].appendChild(el);
+              colHeights[bestIdx] = (colHeights[bestIdx] ?? 0) + h;
             }
+
+            const imgs = Array.from(host.querySelectorAll('img'));
+            for (const img of imgs) {
+              try {
+                if (img.dataset?.bskyRebalanceBound === '1') continue;
+                if (img.complete) continue;
+                img.dataset.bskyRebalanceBound = '1';
+                img.addEventListener('load', () => state.queueRebalance(), { once: true });
+                img.addEventListener('error', () => state.queueRebalance(), { once: true });
+              } catch {
+                // ignore
+              }
+            }
+
+            host.dataset.bskyDirty = '0';
+          } catch {
+            // ignore
           }
+        }
+
+        return didWork;
+      };
+
+      state.queueRebalance = () => {
+        try {
+          if (state.timer) return;
+          state.timer = setTimeout(() => {
+            state.timer = null;
+            if (state.queued) return;
+            state.queued = true;
+            const token = ++state.applyToken;
+            requestAnimationFrame(() => {
+              state.queued = false;
+              // Only do work if there are dirty hosts.
+              const anyDirty = getHosts().some((h) => String(h?.dataset?.bskyDirty || '') === '1');
+              if (!anyDirty) return;
+
+              const anchor = captureScrollAnchor({
+                scroller: state.scroller,
+                root: this.shadowRoot,
+                itemSelector: '.entry[data-k]',
+                keyAttr: 'data-k',
+              });
+
+              const didWork = rebalanceDirtyHosts();
+              if (!didWork) return;
+
+              requestAnimationFrame(() => {
+                if (token !== state.applyToken) return;
+                const r = this.shadowRoot;
+                applyScrollAnchor({ scroller: state.scroller, root: r, anchor, keyAttr: 'data-k' });
+              });
+              setTimeout(() => {
+                try {
+                  if (token !== state.applyToken) return;
+                  const r = this.shadowRoot;
+                  applyScrollAnchor({ scroller: state.scroller, root: r, anchor, keyAttr: 'data-k' });
+                } catch {
+                  // ignore
+                }
+              }, 160);
+            });
+          }, 60);
         } catch {
           // ignore
         }
+      };
+
+      // Observe width changes: mark all batches dirty and rebalance.
+      try {
+        let t = null;
+        state.ro = new ResizeObserver(() => {
+          if (t) clearTimeout(t);
+          t = setTimeout(() => {
+            t = null;
+            state.markAllDirty();
+            state.queueRebalance();
+          }, 60);
+        });
+        state.ro.observe(scroller);
+        state.ro.observe(this);
+      } catch {
+        state.ro = null;
       }
-    };
 
-    // Run once, then once more after layout settles.
-    // IMPORTANT: always go through queueRebalance so we preserve the user's
-    // scroll position while DOM is re-parented into columns.
-    queueRebalance();
-    requestAnimationFrame(() => queueRebalance());
-
-    // The posts DOM is re-created on every render(), so always re-bind observer.
-    if (this._layoutRO) { try { this._layoutRO.disconnect(); } catch {} this._layoutRO = null; }
-    try {
-      let t = null;
-      this._layoutRO = new ResizeObserver(() => {
-        if (t) clearTimeout(t);
-        t = setTimeout(() => {
-          t = null;
-          queueRebalance();
-        }, 60);
-      });
-      // Observe the panel scroller width via the shell.
-      const shell = this.shadowRoot.querySelector('bsky-panel-shell');
-      const scroller = shell?.getScroller?.() || null;
-      if (scroller) this._layoutRO.observe(scroller);
-      this._layoutRO.observe(this);
-    } catch {
-      this._layoutRO = null;
+      this._magicGrid = state;
     }
+
+    // Ensure we lay out columns on initial mount, even if the scroller width
+    // hasn't fully settled yet (some browsers only emit ResizeObserver after a resize).
+    try { this._magicGrid?.markAllDirty?.(); } catch {}
+
+    // If any new/updated batches were marked dirty, rebalance them.
+    this._magicGrid?.queueRebalance?.();
+    requestAnimationFrame(() => this._magicGrid?.queueRebalance?.());
+    // One more delayed pass to catch late layout/font loading.
+    setTimeout(() => {
+      try { this._magicGrid?.markAllDirty?.(); } catch {}
+      try { this._magicGrid?.queueRebalance?.(); } catch {}
+    }, 240);
   }
 
   async refreshRecent(minutes=2){
@@ -953,9 +1035,9 @@ class BskyMyPosts extends HTMLElement {
       this._autoFillPending = true;
       this._autoFillTries = 0;
     } else {
-      // For paging (append older entries), preserving scrollTop is the most reliable
-      // behavior: new content is added below the viewport, so the user's position
-      // shouldn't change. Masonry/relayout uses its own anchoring in ensureMagicGrid().
+      // For paging (append older entries), new content is added below the viewport.
+      // With per-batch rendering, scrollTop should remain stable without forcing
+      // anchor restoration on every append.
       this._restoreScrollNext = false;
       this._forceScrollTopOnRender = false;
     }
@@ -1153,9 +1235,10 @@ class BskyMyPosts extends HTMLElement {
 
   render(){
     // Preserve scroll position.
-    // - For prepend flows (refreshRecent), capture a visible-entry anchor before mutating the list.
+    // - For restore flows (prepend / append / relayout), capture a visible-entry anchor before mutating the DOM.
     // - For reset/reload, we explicitly scroll to this._scrollTop once.
-    if (this._restoreScrollNext && !this._scrollAnchor) this._captureScrollAnchor();
+    const restoreToken = this._restoreScrollNext ? this._nextScrollRestoreToken() : 0;
+    if (this._restoreScrollNext) this._captureScrollAnchor();
 
     const fromVal = this._toInputValue(this.filters.from);
     const toVal = this._toInputValue(this.filters.to);
@@ -1386,7 +1469,7 @@ class BskyMyPosts extends HTMLElement {
       return `<div class="search-status">Search: <b>${esc(searchQ)}</b> · Source: ${esc(src)}${loading}${err}</div>`;
     })();
 
-    const batchesHtml = batchViews.map((b, idx) => {
+    const batchRenders = batchViews.map((b) => {
       const groupsAll = groupIntoThreads(b.items || []);
       const groups = searchActive
         ? groupsAll.filter((g) => {
@@ -1398,20 +1481,11 @@ class BskyMyPosts extends HTMLElement {
             }
           })
         : groupsAll;
+
       const cards = groups.map((g) => renderThreadEntry(g, b.id));
       const entriesHtml = cards.map((c) => c.html).join('');
-      const divider = idx > 0 ? `<hr class="batch-hr" aria-hidden="true">` : '';
-      return `
-        ${divider}
-        <section class="batch" data-batch="${esc(b.id)}">
-          <div class="entries magic" data-batch="${esc(b.id)}" role="region" aria-label="Posts batch">
-            ${entriesHtml}
-          </div>
-        </section>
-      `;
-    }).join('');
-
-    const listHtml = (searchStatus ? `${searchStatus}${batchesHtml}` : batchesHtml) || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No posts.</div>');
+      return { id: String(b.id || ''), entriesHtml };
+    });
 
     const ensureStaticDom = () => {
       const existing = this.shadowRoot.querySelector('bsky-panel-shell');
@@ -1520,7 +1594,11 @@ class BskyMyPosts extends HTMLElement {
       <bsky-panel-shell title="Posts" dense style="--bsky-panel-ui-offset: var(--bsky-posts-ui-offset)">
         <div id="head-right" slot="head-right" class="muted"></div>
         <div id="toolbar" slot="toolbar"></div>
-        <div id="list"></div>
+        <div id="list">
+          <div id="search-status"></div>
+          <div id="batches"></div>
+          <div id="empty" class="muted"></div>
+        </div>
         <div id="err" class="muted" style="color:#f88" hidden></div>
         <div slot="footer" class="footer"><button id="more"></button></div>
       </bsky-panel-shell>
@@ -1560,7 +1638,135 @@ class BskyMyPosts extends HTMLElement {
       if (toolbarEl) toolbarEl.innerHTML = filters;
 
       const listEl = this.shadowRoot.getElementById('list');
-      if (listEl) listEl.innerHTML = listHtml;
+      if (listEl) {
+        // Ensure incremental sub-structure exists (for older cached DOM).
+        let statusEl = this.shadowRoot.getElementById('search-status');
+        let batchesEl = this.shadowRoot.getElementById('batches');
+        let emptyEl = this.shadowRoot.getElementById('empty');
+        if (!statusEl || !batchesEl || !emptyEl) {
+          listEl.innerHTML = '<div id="search-status"></div><div id="batches"></div><div id="empty" class="muted"></div>';
+          statusEl = this.shadowRoot.getElementById('search-status');
+          batchesEl = this.shadowRoot.getElementById('batches');
+          emptyEl = this.shadowRoot.getElementById('empty');
+        }
+
+        if (statusEl) statusEl.innerHTML = searchStatus || '';
+
+        // Decide whether we can append-only (no teardown) or we must rebuild.
+        const desiredIds = batchRenders.map((b) => b.id);
+        const allowReuse = !searchActive; // search filters may change visible cards in every batch
+        const prev = Array.isArray(this._renderedBatchOrder) ? this._renderedBatchOrder : [];
+
+        const isAppendOnly = (() => {
+          if (!allowReuse) return false;
+          if (!prev.length) return true;
+          if (desiredIds.length < prev.length) return false;
+          for (let i = 0; i < prev.length; i++) {
+            if (prev[i] !== desiredIds[i]) return false;
+          }
+          return true;
+        })();
+
+        const rebuildAll = !isAppendOnly;
+        if (batchesEl) {
+          if (rebuildAll) {
+            batchesEl.textContent = '';
+          }
+
+          // Map existing sections for quick reuse.
+          const byId = new Map();
+          if (!rebuildAll) {
+            for (const sec of Array.from(batchesEl.querySelectorAll(':scope > section.batch[data-batch]'))) {
+              const bid = String(sec.getAttribute('data-batch') || '');
+              if (bid) byId.set(bid, sec);
+            }
+          }
+
+          for (let i = 0; i < batchRenders.length; i++) {
+            const b = batchRenders[i];
+            const bid = b.id;
+            const wantDivider = (i > 0);
+
+            // Divider element (one per batch except the first).
+            if (wantDivider) {
+              const hr = document.createElement('hr');
+              hr.className = 'batch-hr';
+              hr.setAttribute('aria-hidden', 'true');
+              hr.setAttribute('data-hr-for', bid);
+              if (rebuildAll) batchesEl.appendChild(hr);
+              else {
+                // On append-only, the hr only needs to exist for new batches.
+                if (!batchesEl.querySelector(`:scope > hr.batch-hr[data-hr-for="${this._cssEscape(bid)}"]`)) {
+                  batchesEl.appendChild(hr);
+                }
+              }
+            }
+
+            let sec = byId.get(bid) || null;
+            if (!sec) {
+              sec = document.createElement('section');
+              sec.className = 'batch';
+              sec.setAttribute('data-batch', bid);
+              sec.innerHTML = `
+                <div class="entries magic" data-batch="${esc(bid)}" role="region" aria-label="Posts batch"></div>
+              `;
+              batchesEl.appendChild(sec);
+              byId.set(bid, sec);
+            }
+
+            const entriesHost = sec.querySelector(':scope > .entries.magic[data-batch]') || null;
+            if (entriesHost) {
+              // Only update existing batch HTML when we can't safely reuse (e.g. search active).
+              if (rebuildAll || !allowReuse) {
+                entriesHost.innerHTML = b.entriesHtml;
+                entriesHost.dataset.bskyDirty = '1';
+              } else if (!sec.dataset.bskyRendered) {
+                // First time created.
+                entriesHost.innerHTML = b.entriesHtml;
+                entriesHost.dataset.bskyDirty = '1';
+              }
+            }
+            sec.dataset.bskyRendered = '1';
+          }
+
+          // Remove any stale sections when rebuilding.
+          if (rebuildAll) {
+            // (Already cleared)
+          } else {
+            const desired = new Set(desiredIds);
+            for (const sec of Array.from(batchesEl.querySelectorAll(':scope > section.batch[data-batch]'))) {
+              const bid = String(sec.getAttribute('data-batch') || '');
+              if (bid && !desired.has(bid)) {
+                try {
+                  const hr = batchesEl.querySelector(`:scope > hr.batch-hr[data-hr-for="${this._cssEscape(bid)}"]`);
+                  if (hr) hr.remove();
+                } catch {}
+                try { sec.remove(); } catch { try { batchesEl.removeChild(sec); } catch {} }
+              }
+            }
+          }
+        }
+
+        this._renderedBatchOrder = desiredIds;
+
+        const visibleCount = (() => {
+          try {
+            let n = 0;
+            for (const b of batchRenders) n += (b.entriesHtml ? 1 : 0);
+            return n;
+          } catch { return 0; }
+        })();
+
+        if (emptyEl) {
+          if (batchRenders.length === 0) {
+            emptyEl.textContent = this.loading ? 'Loading…' : 'No posts.';
+          } else if (visibleCount === 0) {
+            emptyEl.textContent = this.loading ? 'Loading…' : 'No posts.';
+          } else {
+            emptyEl.textContent = '';
+          }
+        }
+      }
 
       const errEl = this.shadowRoot.getElementById('err');
       if (errEl) {
@@ -1595,8 +1801,8 @@ class BskyMyPosts extends HTMLElement {
         if (!scroller) return;
 
         if (this._restoreScrollNext) {
-          this._applyScrollAnchor();
-          setTimeout(() => this._applyScrollAnchor(), 160);
+          this._applyScrollAnchor(restoreToken);
+          setTimeout(() => this._applyScrollAnchor(restoreToken), 160);
           return;
         }
 

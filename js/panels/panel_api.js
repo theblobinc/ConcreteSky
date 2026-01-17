@@ -103,6 +103,8 @@ export function bindInfiniteScroll(scroller, loadMore, opts = {}) {
   let exhaustedRunning = false;
   let lastRunAt = 0;
   let lastExhaustedAt = 0;
+  // Used to ignore stale delayed anchor-apply attempts across multiple ticks.
+  let anchorApplyToken = 0;
 
   const anchorOpts = (opts && typeof opts === 'object') ? opts.anchor : null;
   const anchorEnabled = !!(anchorOpts && anchorOpts.itemSelector && (anchorOpts.root || anchorOpts.getRoot));
@@ -123,13 +125,25 @@ export function bindInfiniteScroll(scroller, loadMore, opts = {}) {
 
   const applyAnchorSoon = (anchor) => {
     if (!anchorEnabled || !anchor || typeof anchorGetRoot !== 'function') return;
+
+    const token = ++anchorApplyToken;
     queueMicrotask(() => {
       requestAnimationFrame(() => {
         try {
+          if (cancelled) return;
+          if (token !== anchorApplyToken) return;
           const r = anchorGetRoot();
           if (!r) return;
           applyScrollAnchor({ scroller, root: r, anchor, keyAttr: anchorKeyAttr });
-          setTimeout(() => applyScrollAnchor({ scroller, root: r, anchor, keyAttr: anchorKeyAttr }), 160);
+          setTimeout(() => {
+            try {
+              if (cancelled) return;
+              if (token !== anchorApplyToken) return;
+              applyScrollAnchor({ scroller, root: r, anchor, keyAttr: anchorKeyAttr });
+            } catch {
+              // ignore
+            }
+          }, 160);
         } catch {
           // ignore
         }

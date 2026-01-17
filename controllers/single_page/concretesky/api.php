@@ -3108,6 +3108,11 @@ class Api extends ParentController
         try {
             $cur = $this->cacheMetaGet($pdo, null, 'schema_version');
             if ($cur === self::CACHE_SCHEMA_VERSION) {
+                // Even when schema_version claims "current", older DBs might still be missing
+                // newly-added columns (or schema_version may have been set manually).
+                // These checks are cheap and prevent runtime 500s.
+                $this->cacheEnsureColumn($pdo, 'profiles', 'avatar', 'TEXT');
+                $this->cacheEnsureColumn($pdo, 'posts', 'text', 'TEXT');
                 return;
             }
         } catch (\Throwable $e) {

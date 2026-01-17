@@ -1,6 +1,6 @@
 import { call } from '../../../api.js';
 import { identityCss, identityHtml, bindCopyClicks } from '../../../lib/identity.js';
-import { captureScrollAnchor, applyScrollAnchor } from '../../panel_api.js';
+import { bindInfiniteScroll } from '../../panel_api.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
   ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[m])
@@ -15,9 +15,11 @@ class BskyFeed extends HTMLElement {
     this.followMap = {}; // did -> {following:boolean}
     this.modal = { open:false, uri:null, loading:false, error:null, likers:[], followingMap:{}, statsMap:null };
 
-    this._restoreScrollNext = false;
-    this._scrollAnchor = null;
     this._scrollTop = 0;
+    this._renderedCount = 0;
+    this._hasStaticDom = false;
+    this._infiniteScrollEl = null;
+    this._unbindInfiniteScroll = null;
   }
 
   _isRateLimitError(e) {
@@ -85,7 +87,6 @@ class BskyFeed extends HTMLElement {
 
   async loadMore(){
     if (this.loading) return;
-    if (this.items.length) this._restoreScrollNext = true;
     this.loading = true; this.render();
     try{
       let data;
@@ -196,25 +197,9 @@ class BskyFeed extends HTMLElement {
   }
 
   render(){
-    // Preserve scroll position inside the feed scroller.
-    try {
-      const scroller = this.shadowRoot.querySelector('#scroll');
-      if (scroller) {
-        this._scrollTop = scroller.scrollTop || 0;
-        if (this._restoreScrollNext) {
-          this._scrollAnchor = captureScrollAnchor({
-            scroller,
-            root: this.shadowRoot,
-            itemSelector: 'article.post[data-uri]',
-            keyAttr: 'data-uri',
-          });
-        }
-      }
-    } catch {}
-
     const meDid = window.BSKY?.meDid;
 
-    const posts = this.items.map(it => {
+    const renderPosts = (items) => items.map(it => {
       const p = it.post || {};
       const rec = p.record || {};
       const author = p.author || {};
@@ -228,7 +213,7 @@ class BskyFeed extends HTMLElement {
 
       return `<article class="post" data-uri="${esc(uri)}">
         <header class="meta">
-          <img class="avatar" src="${esc(author.avatar || '')}" alt="" onerror="this.style.display='none'">
+          <bsky-lazy-img class="avatar" src="${esc(author.avatar || '')}" alt="" aspect="1/1"></bsky-lazy-img>
           <div class="who">
             <div class="name">${identityHtml({ did: author.did, handle: author.handle, displayName: author.displayName }, { showHandle: true, showCopyDid: true })}</div>
           </div>
@@ -255,7 +240,7 @@ class BskyFeed extends HTMLElement {
         const avatar = f.avatar || a.avatar || '';
         return `<div class="liker">
           <div class="li-meta">
-            <img class="li-avatar" src="${esc(avatar)}" alt="" onerror="this.style.display='none'">
+            <bsky-lazy-img class="li-avatar" src="${esc(avatar)}" alt="" aspect="1/1"></bsky-lazy-img>
             <div class="li-names">
               <div class="li-name">
                 ${identityHtml({ did: a.did, handle: a.handle, displayName: a.displayName }, { showHandle: true, showCopyDid: true })}
@@ -288,73 +273,131 @@ class BskyFeed extends HTMLElement {
       </div>`;
     })() : '';
 
-    this.shadowRoot.innerHTML = `
-      <style>
-        :host{display:block}
-        .wrap{background:#000;border:1px solid #222;border-radius:12px;padding:6px}
-        #scroll{max-height:60vh; overflow:auto; padding:2px}
-        .post{border:1px solid #333; border-radius:10px; padding:12px; margin:10px 0; color:#fff; background:#0b0b0b}
-        .meta{display:flex; align-items:center; gap:10px; margin-bottom:8px}
-        .avatar{width:36px;height:36px;border-radius:50%;background:#222;object-fit:cover}
-        .who{display:flex;flex-direction:column;min-width:0}
-        .name{font-weight:700;line-height:1}
-        .handle{color:#bbb;font-size:.9rem;line-height:1}
-        .time{margin-left:auto;color:#888;font-size:.85rem}
-        .actions{margin-left:12px}
-        .following-badge{color:#7bdc86;font-size:.9rem}
-        .text{white-space:pre-wrap;line-height:1.35;margin:6px 0 2px}
-        .row{margin-top:8px; display:flex; gap:8px; align-items:center}
-        button, .open{background:#121212;border:1px solid #555;color:#fff;padding:6px 10px;border-radius:8px;cursor:pointer;text-decoration:none}
-        button:hover, .open:hover{background:#1b1b1b}
-        .muted{color:#aaa}
-        .err{color:#f88}
+    const ensureStaticDom = () => {
+      if (this._hasStaticDom) return false;
+      this.shadowRoot.innerHTML = `
+        <style>
+          :host{display:block}
+          .wrap{background:#000;border:1px solid #222;border-radius:12px;padding:6px}
+          #scroll{max-height:60vh; overflow:auto; padding:2px}
+          .post{border:1px solid #333; border-radius:10px; padding:12px; margin:10px 0; color:#fff; background:#0b0b0b}
+          .meta{display:flex; align-items:center; gap:10px; margin-bottom:8px}
+          .avatar{width:36px;height:36px;border-radius:50%;background:#222;object-fit:cover}
+          .who{display:flex;flex-direction:column;min-width:0}
+          .name{font-weight:700;line-height:1}
+          .handle{color:#bbb;font-size:.9rem;line-height:1}
+          .time{margin-left:auto;color:#888;font-size:.85rem}
+          .actions{margin-left:12px}
+          .following-badge{color:#7bdc86;font-size:.9rem}
+          .text{white-space:pre-wrap;line-height:1.35;margin:6px 0 2px}
+          .row{margin-top:8px; display:flex; gap:8px; align-items:center}
+          button, .open{background:#121212;border:1px solid #555;color:#fff;padding:6px 10px;border-radius:8px;cursor:pointer;text-decoration:none}
+          button:hover, .open:hover{background:#1b1b1b}
+          .muted{color:#aaa}
+          .err{color:#f88}
 
-        .overlay{position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; z-index:99999;}
-        .modal{background:#0b0b0b; color:#fff; border:1px solid #444; border-radius:12px; width:min(760px, 94vw); max-height:80vh; overflow:auto; box-shadow:0 10px 40px rgba(0,0,0,.6);}
-        .head{display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid #333; position:sticky; top:0; background:#0b0b0b}
-        .actions{display:flex; gap:8px}
-        .body{padding:12px 14px}
-        .likers-list{display:flex; flex-direction:column; gap:10px}
-        .liker{display:flex; justify-content:space-between; align-items:center; border:1px solid #333; border-radius:10px; padding:10px; background:#0f0f0f}
-        .li-meta{display:flex; align-items:center; gap:10px}
-        .li-avatar{width:36px;height:36px;border-radius:50%;object-fit:cover;background:#222}
-        .li-name a{color:#fff; text-decoration:underline}
-        .li-handle{color:#bbb; font-size:.9rem}
-        .already{color:#7bdc86; font-size:.9rem}
-        .close{border-color:#666}
-        #load-more{width:100%}
-      </style>
+          .overlay{position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; z-index:99999;}
+          .modal{background:#0b0b0b; color:#fff; border:1px solid #444; border-radius:12px; width:min(760px, 94vw); max-height:80vh; overflow:auto; box-shadow:0 10px 40px rgba(0,0,0,.6);}
+          .head{display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid #333; position:sticky; top:0; background:#0b0b0b}
+          .actions{display:flex; gap:8px}
+          .body{padding:12px 14px}
+          .likers-list{display:flex; flex-direction:column; gap:10px}
+          .liker{display:flex; justify-content:space-between; align-items:center; border:1px solid #333; border-radius:10px; padding:10px; background:#0f0f0f}
+          .li-meta{display:flex; align-items:center; gap:10px}
+          .li-avatar{width:36px;height:36px;border-radius:50%;object-fit:cover;background:#222}
+          .li-name a{color:#fff; text-decoration:underline}
+          .li-handle{color:#bbb; font-size:.9rem}
+          .already{color:#7bdc86; font-size:.9rem}
+          .close{border-color:#666}
+          #load-more{width:100%}
+          .footer{margin-top:8px;display:flex;justify-content:center}
+        </style>
 
-      ${modal}
+        <div id="modal-root"></div>
 
-      <div class="wrap">
-        <div id="scroll" tabindex="0">
-          ${posts || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No posts.</div>')}
-          ${this.error ? `<div class="err">Error: ${esc(this.error)}</div>` : ''}
+        <div class="wrap">
+          <div id="scroll" tabindex="0">
+            <div id="list"></div>
+            <div id="empty" class="muted"></div>
+            <div id="err" class="err" hidden></div>
+          </div>
+          <div class="footer">
+            <button id="load-more"></button>
+          </div>
         </div>
-        <div style="margin-top:8px;display:flex;justify-content:center">
-          <button id="load-more" ${this.loading || !this.cursor ? 'disabled':''}>${this.cursor ? 'Load more' : 'No more'}</button>
-        </div>
-      </div>
-    `;
+      `;
+      this._hasStaticDom = true;
+      return true;
+    };
 
-    // Restore anchor after DOM rebuild.
-    if (this._restoreScrollNext) {
-      queueMicrotask(() => {
-        requestAnimationFrame(() => {
-          const scroller = this.shadowRoot.querySelector('#scroll');
-          if (!scroller) return;
-          if (this._scrollAnchor) {
-            applyScrollAnchor({ scroller, root: this.shadowRoot, anchor: this._scrollAnchor, keyAttr: 'data-uri' });
-            setTimeout(() => applyScrollAnchor({ scroller, root: this.shadowRoot, anchor: this._scrollAnchor, keyAttr: 'data-uri' }), 160);
-          } else {
-            scroller.scrollTop = Math.max(0, this._scrollTop || 0);
-          }
-          this._restoreScrollNext = false;
-          this._scrollAnchor = null;
+    const created = ensureStaticDom();
+
+    try {
+      const scroller = this.shadowRoot.getElementById('scroll');
+      if (scroller) this._scrollTop = scroller.scrollTop || 0;
+
+      const modalRoot = this.shadowRoot.getElementById('modal-root');
+      if (modalRoot) modalRoot.innerHTML = modal;
+
+      const listEl = this.shadowRoot.getElementById('list');
+      if (listEl) {
+        if (this._renderedCount > this.items.length) {
+          listEl.innerHTML = '';
+          this._renderedCount = 0;
+        }
+
+        if (this._renderedCount === 0) {
+          listEl.innerHTML = renderPosts(this.items);
+          this._renderedCount = this.items.length;
+        } else if (this.items.length > this._renderedCount) {
+          listEl.insertAdjacentHTML('beforeend', renderPosts(this.items.slice(this._renderedCount)));
+          this._renderedCount = this.items.length;
+        }
+      }
+
+      const emptyEl = this.shadowRoot.getElementById('empty');
+      if (emptyEl) {
+        if (!this.items.length) emptyEl.textContent = this.loading ? 'Loading…' : 'No posts.';
+        else emptyEl.textContent = '';
+      }
+
+      const errEl = this.shadowRoot.getElementById('err');
+      if (errEl) {
+        if (this.error) {
+          errEl.hidden = false;
+          errEl.textContent = `Error: ${esc(this.error)}`;
+        } else {
+          errEl.hidden = true;
+          errEl.textContent = '';
+        }
+      }
+
+      const moreBtn = this.shadowRoot.getElementById('load-more');
+      if (moreBtn) {
+        moreBtn.disabled = !!(this.loading || !this.cursor);
+        moreBtn.textContent = this.cursor ? 'Load more' : 'No more';
+      }
+
+      if (scroller && scroller !== this._infiniteScrollEl) {
+        try { this._unbindInfiniteScroll?.(); } catch {}
+        this._infiniteScrollEl = scroller;
+        this._unbindInfiniteScroll = bindInfiniteScroll(scroller, () => this.loadMore(), {
+          threshold: 280,
+          enabled: () => true,
+          isLoading: () => !!this.loading,
+          hasMore: () => !!this.cursor,
+          initialTick: false,
         });
+      }
+    } catch {}
+
+    queueMicrotask(() => {
+      requestAnimationFrame(() => {
+        const scroller = this.shadowRoot.getElementById('scroll');
+        if (!scroller) return;
+        if (created) scroller.scrollTop = Math.max(0, this._scrollTop || 0);
       });
-    }
+    });
   }
 }
 customElements.define('bsky-feed', BskyFeed);
