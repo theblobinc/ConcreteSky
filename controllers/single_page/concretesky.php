@@ -971,6 +971,62 @@ class Concretesky extends PageController
         return $r['json'] ?? ['raw' => $r['text']];
     }
 
+    /**
+     * OAuth/DPoP XRPC for non-JSON bodies (e.g. com.atproto.repo.uploadBlob).
+     *
+     * @return array Decoded JSON response (preferred) or ['raw' => string]
+     */
+    protected function oauthXrpcRaw(string $verb, string $url, array &$session, string $body, string $contentType, array $extraHeaders = [])
+    {
+        $accessToken = (string)($session['accessJwt'] ?? '');
+        $privPem = (string)($session['dpopPrivatePem'] ?? '');
+        $pubJwk = $session['dpopPublicJwk'] ?? null;
+        if ($accessToken === '' || $privPem === '' || !is_array($pubJwk)) {
+            throw new \RuntimeException('Missing OAuth session material');
+        }
+
+        $nonce = $session['resourceDpopNonce'] ?? null;
+        $dpop = $this->dpopProof($privPem, $pubJwk, $verb, $url, $nonce ?: null, $accessToken);
+
+        $headers = array_merge([
+            'Authorization: DPoP ' . $accessToken,
+            'DPoP: ' . $dpop,
+            'Accept: application/json',
+        ], $extraHeaders);
+
+        // Attempt request; retry once if nonce required.
+        $r = $this->httpRaw($verb, $url, $body, $headers, $contentType);
+        $nonceHdr = $r['headers']['dpop-nonce'] ?? null;
+        if ($nonceHdr) {
+            $session['resourceDpopNonce'] = $nonceHdr;
+        }
+
+        if ($r['status'] === 401) {
+            $www = $r['headers']['www-authenticate'] ?? '';
+            if (stripos($www, 'use_dpop_nonce') !== false && $nonceHdr) {
+                $dpop = $this->dpopProof($privPem, $pubJwk, $verb, $url, $nonceHdr, $accessToken);
+                $headers = array_merge([
+                    'Authorization: DPoP ' . $accessToken,
+                    'DPoP: ' . $dpop,
+                    'Accept: application/json',
+                ], $extraHeaders);
+                $r = $this->httpRaw($verb, $url, $body, $headers, $contentType);
+            }
+        }
+
+        if ($r['status'] >= 400) {
+            $msg = is_array($r['json']) ? ($r['json']['message'] ?? ($r['json']['error'] ?? json_encode($r['json']))) : $r['text'];
+            $hint = '';
+            if ($r['status'] === 429) {
+                $ra = $r['headers']['retry-after'] ?? null;
+                if ($ra) $hint = ' (retry-after: ' . $ra . ')';
+            }
+            throw new \RuntimeException('HTTP ' . $r['status'] . ': ' . $msg . $hint);
+        }
+
+        return $r['json'] ?? ['raw' => $r['text']];
+    }
+
     protected function http($verb, $url, $json = null, array $headers = [])
     {
         // Legacy HTTP helper used by non-OAuth flows.

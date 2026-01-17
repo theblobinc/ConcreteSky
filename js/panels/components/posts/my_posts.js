@@ -6,6 +6,9 @@ import { BSKY_SEARCH_EVENT } from '../../../search/search_bus.js';
 import { SEARCH_TARGETS } from '../../../search/constants.js';
 import { compileSearchMatcher } from '../../../search/query.js';
 
+import '../../../components/thread_tree.js';
+import '../../../comment/comment_composer.js';
+
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
   ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[m])
 );
@@ -124,21 +127,38 @@ function renderImagesGrid(images) {
   return `<div class="images-grid">${items}</div>`;
 }
 
-// Render video poster card (we’ll open the post to play if it’s HLS)
+// Render video inline when possible.
+// NOTE: Many Bluesky videos are HLS (.m3u8). Some browsers can't play HLS without additional support.
 function renderVideoPoster(video, openUrl) {
-  const poster = video.thumb ? `<bsky-lazy-img class="lazy-media" src="${esc(video.thumb)}" alt="${esc(video.alt||'Video')}" aspect="16/9"></bsky-lazy-img>` : '';
-  return `
+  const src = String(video?.playlist || '');
+  const poster = String(video?.thumb || '');
+  const type = src.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp4';
+
+  if (src) {
+    return `
+      <div class="video-wrap">
+        <video controls playsinline preload="metadata" ${poster ? `poster="${esc(poster)}"` : ''}>
+          <source src="${esc(src)}" type="${esc(type)}" />
+        </video>
+        ${openUrl ? `<a class="open" href="${esc(openUrl)}" target="_blank" rel="noopener" style="display:inline-block;margin-top:6px">Open on Bluesky</a>` : ''}
+      </div>
+    `;
+  }
+
+  // Fallback: just show the poster with an external link.
+  const posterHtml = poster ? `<bsky-lazy-img class="lazy-media" src="${esc(poster)}" alt="${esc(video.alt||'Video')}" aspect="16/9"></bsky-lazy-img>` : '';
+  return openUrl ? `
     <a class="ext-card video" href="${esc(openUrl)}" target="_blank" rel="noopener" title="Open to play">
       <div class="thumb">
-        ${poster}
+        ${posterHtml}
         <div class="play">▶</div>
       </div>
       <div class="meta">
         <div class="title">Video</div>
-        <div class="desc">Open in Bluesky to play</div>
+        <div class="desc">Open on Bluesky to play</div>
       </div>
     </a>
-  `;
+  ` : '';
 }
 
 class BskyMyPosts extends HTMLElement {
@@ -194,6 +214,13 @@ class BskyMyPosts extends HTMLElement {
     this._searchApiInFlight = false;
     this._searchApiError = null;
     this._searchApiItems = null;
+
+    // Inline thread expansion + caching (avoid incorrect nesting by fetching real threads).
+    this._expandedThreads = new Set(); // rootUri
+    this._expandedThreadMode = new Map(); // rootUri -> 'preview' | 'full'
+    this._threadCache = new Map(); // rootUri -> { preview: out|null, full: out|null }
+    this._postingRoots = new Set(); // rootUri (prevent double posts)
+
     this._refreshRecentHandler = (e) => {
       const mins = Number(e?.detail?.minutes ?? 2);
       this.refreshRecent(mins);
@@ -336,6 +363,28 @@ class BskyMyPosts extends HTMLElement {
     this.shadowRoot.addEventListener('change', (e) => this.onChange(e));
     this.shadowRoot.addEventListener('click',  (e) => this.onClick(e));
     this.shadowRoot.addEventListener('keydown', (e) => this.onKeydown(e));
+
+    // Inline thread interaction events (from bsky-thread-tree / bsky-comment-composer).
+    this.shadowRoot.addEventListener('bsky-reply-to', (e) => {
+      const d = e?.detail || null;
+      const uri = String(d?.uri || '');
+      const cid = String(d?.cid || '');
+      const author = String(d?.author || '');
+      if (!uri || !cid) return;
+
+      const entry = this._entryFromComposedPath(e);
+      if (!entry) return;
+
+      const composer = entry.querySelector('bsky-comment-composer');
+      composer?.setReplyTo?.({ uri, cid, author });
+    });
+
+    this.shadowRoot.addEventListener('bsky-submit-comment', (e) => {
+      const detail = e?.detail || null;
+      const entry = this._entryFromComposedPath(e);
+      if (!entry) return;
+      this._submitInlineComment(entry, detail);
+    });
 
     window.addEventListener('bsky-refresh-recent', this._refreshRecentHandler);
 
@@ -594,7 +643,7 @@ class BskyMyPosts extends HTMLElement {
     }
   }
 
-  onClick(e){
+  async onClick(e){
     if (e.target.id === 'reload') { this.load(true); return; }
     if (e.target.id === 'more') {
       if (this.loading) return;
@@ -663,19 +712,120 @@ class BskyMyPosts extends HTMLElement {
       if (id) { this.mountYouTubeIframe(yt, id); return; }
     }
 
+    // Expand/collapse inline thread (fetch real thread; don't guess/nest unrelated posts).
+    const tog = e.target.closest?.('[data-toggle-thread]');
+    if (tog) {
+      const entry = e.target.closest?.('.entry[data-uri]');
+      if (!entry) return;
+      const uri = entry.getAttribute('data-uri') || '';
+      const cid = entry.getAttribute('data-cid') || '';
+      if (!uri) return;
+      const curMode = this._expandedThreadMode.get(uri) || null;
+      // Toggle button is the "full" view.
+      if (curMode === 'full') {
+        await this._toggleInlineThread(entry, { uri, cid }, { ensureOpen: false, mode: 'full' });
+      } else {
+        await this._toggleInlineThread(entry, { uri, cid }, { ensureOpen: true, mode: 'full' });
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    // Preview thread (root + N replies) without leaving the Posts panel.
+    const previewBtn = e.target.closest?.('[data-preview-thread]');
+    if (previewBtn) {
+      const entry = e.target.closest?.('.entry[data-uri]');
+      if (!entry) return;
+      const uri = entry.getAttribute('data-uri') || '';
+      const cid = entry.getAttribute('data-cid') || '';
+      if (!uri) return;
+      await this._toggleInlineThread(entry, { uri, cid }, { ensureOpen: true, mode: 'preview' });
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    // Escalate preview -> full thread.
+    const showFullBtn = e.target.closest?.('[data-show-full-thread]');
+    if (showFullBtn) {
+      const entry = e.target.closest?.('.entry[data-uri]');
+      if (!entry) return;
+      const uri = entry.getAttribute('data-uri') || '';
+      const cid = entry.getAttribute('data-cid') || '';
+      if (!uri) return;
+      await this._toggleInlineThread(entry, { uri, cid }, { ensureOpen: true, mode: 'full', focus: true });
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    // Reply button (opens inline thread + focuses composer)
+    const replyBtn = e.target.closest?.('[data-reply]');
+    if (replyBtn) {
+      const entry = e.target.closest?.('.entry[data-uri]');
+      if (!entry) return;
+      const rootUri = entry.getAttribute('data-uri') || '';
+      const rootCid = entry.getAttribute('data-cid') || '';
+      const uri = replyBtn.getAttribute('data-uri') || rootUri;
+      const cid = replyBtn.getAttribute('data-cid') || rootCid;
+      const author = replyBtn.getAttribute('data-author') || '';
+      if (!rootUri) return;
+      await this._toggleInlineThread(entry, { uri: rootUri, cid: rootCid }, { ensureOpen: true, focus: true, replyTo: { uri, cid, author } });
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    // Repost/unrepost
+    const repostBtn = e.target.closest?.('[data-repost]');
+    if (repostBtn) {
+      const uri = repostBtn.getAttribute('data-uri') || '';
+      const cid = repostBtn.getAttribute('data-cid') || '';
+      if (!uri || !cid) return;
+      const reposted = repostBtn.getAttribute('data-reposted') === '1';
+      repostBtn.setAttribute('disabled', '');
+      try {
+        await call(reposted ? 'unrepost' : 'repost', { uri, cid });
+        repostBtn.setAttribute('data-reposted', reposted ? '0' : '1');
+        repostBtn.textContent = reposted ? 'Repost' : 'Undo repost';
+      } catch (err) {
+        console.warn('repost toggle failed', err);
+      } finally {
+        try { repostBtn.removeAttribute('disabled'); } catch {}
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
     // NEW: open interactions lightbox on counts click
     const cnt = e.target.closest?.('[data-open-interactions]');
     if (cnt) {
       const kind = cnt.getAttribute('data-kind'); // likes|reposts|replies
       const uri  = cnt.getAttribute('data-uri');
       const cid  = cnt.getAttribute('data-cid') || '';
-      // Clicking replies should open the thread/content panel.
+
+      // Replies: default to inline preview. Hold Ctrl/Cmd to open Content panel.
       if (kind === 'replies' && uri) {
-        this.dispatchEvent(new CustomEvent('bsky-open-content', {
-          detail: { uri, cid, spawnAfter: 'posts' },
-          bubbles: true,
-          composed: true,
-        }));
+        if (e?.metaKey || e?.ctrlKey) {
+          this.dispatchEvent(new CustomEvent('bsky-open-content', {
+            detail: { uri, cid, spawnAfter: 'posts' },
+            bubbles: true,
+            composed: true,
+          }));
+        } else {
+          const entry = cnt.closest?.('.entry[data-uri]');
+          if (entry) {
+            const rootUri = String(entry.getAttribute('data-uri') || uri || '');
+            const curMode = this._expandedThreadMode.get(rootUri) || null;
+            if (rootUri && this._expandedThreads.has(rootUri) && curMode === 'preview') {
+              await this._toggleInlineThread(entry, { uri: rootUri, cid }, { ensureOpen: false, mode: 'preview' });
+            } else if (rootUri && curMode !== 'full') {
+              await this._toggleInlineThread(entry, { uri: rootUri, cid }, { ensureOpen: true, mode: 'preview' });
+            }
+          }
+        }
         e.preventDefault();
         e.stopPropagation();
         return;
@@ -712,6 +862,227 @@ class BskyMyPosts extends HTMLElement {
         bubbles: true,
         composed: true,
       }));
+    }
+  }
+
+  _entryFromComposedPath(e) {
+    try {
+      const path = (typeof e?.composedPath === 'function') ? e.composedPath() : [];
+      for (const n of path) {
+        if (n && n.classList && n.classList.contains('entry')) return n;
+      }
+    } catch {}
+    return null;
+  }
+
+  async _toggleInlineThread(entryEl, root, opts = null) {
+    const rootUri = String(root?.uri || '');
+    const rootCid = String(root?.cid || '');
+    if (!rootUri) return;
+
+    const options = opts || {};
+    const ensureOpen = !!options.ensureOpen;
+    const mode = (options.mode === 'preview' || options.mode === 'full') ? options.mode : (this._expandedThreadMode.get(rootUri) || 'full');
+    const shouldOpen = ensureOpen || !this._expandedThreads.has(rootUri);
+    const shouldClose = !ensureOpen && this._expandedThreads.has(rootUri) && (this._expandedThreadMode.get(rootUri) === mode);
+
+    const toggleBtn = entryEl.querySelector('[data-toggle-thread]');
+
+    let host = entryEl.querySelector('[data-inline-thread]');
+    if (!host) {
+      host = document.createElement('div');
+      host.className = 'inline-thread';
+      host.setAttribute('data-inline-thread', '');
+      host.hidden = true;
+      entryEl.appendChild(host);
+    }
+
+    if (shouldClose) {
+      this._expandedThreads.delete(rootUri);
+      this._expandedThreadMode.delete(rootUri);
+      host.hidden = true;
+      host.textContent = '';
+      if (toggleBtn) toggleBtn.textContent = '+';
+      return;
+    }
+
+    if (!shouldOpen) return;
+    this._expandedThreads.add(rootUri);
+    this._expandedThreadMode.set(rootUri, mode);
+    host.hidden = false;
+    if (toggleBtn) toggleBtn.textContent = '−';
+
+    const cache = this._threadCache.get(rootUri) || { preview: null, full: null };
+    // Canonicalize: always try to fetch/store a full thread so preview can show the true newest replies.
+    const cachedOut = cache.full || cache.preview || null;
+    if (!cachedOut) {
+      host.textContent = (mode === 'preview') ? 'Loading thread preview…' : 'Loading thread…';
+      try {
+        const out = await call('getPostThread', {
+          uri: rootUri,
+          depth: 10,
+          parentHeight: 6,
+        });
+        const next = this._threadCache.get(rootUri) || { preview: null, full: null };
+        next.full = out || null;
+        next.preview = out || null;
+        this._threadCache.set(rootUri, next);
+      } catch (err) {
+        host.textContent = `Error loading thread: ${String(err?.message || err || '')}`;
+        return;
+      }
+    }
+
+    const outNow = this._threadCache.get(rootUri) || { preview: null, full: null };
+    const threadOut = outNow.full || outNow.preview || null;
+    const fullThread = threadOut?.thread || null;
+
+    const collectReplyNodes = (node, out) => {
+      const replies = Array.isArray(node?.replies) ? node.replies : [];
+      for (const r of replies) {
+        if (r && r.post) out.push(r);
+        collectReplyNodes(r, out);
+      }
+    };
+
+    const countReplies = (node) => {
+      try {
+        const tmp = [];
+        collectReplyNodes(node, tmp);
+        return tmp.length;
+      } catch {
+        return 0;
+      }
+    };
+
+    const pickIso = (post) => {
+      try {
+        const rec = post?.record || {};
+        return String(rec?.createdAt || post?.indexedAt || '');
+      } catch {
+        return '';
+      }
+    };
+
+    const makeRecentRepliesPreview = (thread, maxReplies = 5) => {
+      if (!thread || !thread.post) return thread;
+      const nodes = [];
+      collectReplyNodes(thread, nodes);
+      const sorted = nodes
+        .map((n) => ({
+          node: n,
+          iso: pickIso(n?.post),
+          uri: String(n?.post?.uri || ''),
+        }))
+        .filter((x) => x.uri)
+        .sort((a, b) => {
+          if (a.iso !== b.iso) return (a.iso < b.iso) ? 1 : -1; // desc
+          return (a.uri < b.uri) ? -1 : (a.uri > b.uri ? 1 : 0);
+        });
+
+      const picked = sorted.slice(0, Math.max(0, Number(maxReplies || 0) || 0));
+      const replies = picked.map((x) => ({ post: x.node.post, replies: [] }));
+      return {
+        post: thread.post,
+        replies,
+        // preserve ancestors if the selected post is itself a reply
+        ...(thread.parent ? { parent: thread.parent } : {}),
+      };
+    };
+
+    const totalReplies = fullThread ? countReplies(fullThread) : 0;
+    const PREVIEW_N = 5;
+    const thread = (mode === 'preview') ? makeRecentRepliesPreview(fullThread, PREVIEW_N) : fullThread;
+    const showing = (mode === 'preview') ? Math.min(PREVIEW_N, totalReplies) : totalReplies;
+
+    const showFull = (mode === 'preview');
+    host.innerHTML = `
+      <div class="inline-actions">
+        <span class="muted">${showFull ? `Thread preview · newest ${showing}${totalReplies ? ` of ${totalReplies}` : ''} replies` : 'Thread'}</span>
+        ${showFull ? `<button class="act" type="button" data-show-full-thread>Show full thread</button>` : ''}
+      </div>
+      <bsky-thread-tree></bsky-thread-tree>
+      <bsky-comment-composer></bsky-comment-composer>
+    `;
+
+    const tree = host.querySelector('bsky-thread-tree');
+    tree?.setThread?.(thread);
+
+    const composer = host.querySelector('bsky-comment-composer');
+    if (options.replyTo) composer?.setReplyTo?.(options.replyTo);
+    if (options.focus) {
+      try { composer?.focus?.(); } catch {}
+      try { composer?.shadowRoot?.querySelector?.('textarea')?.focus?.(); } catch {}
+    }
+
+    // Default reply target: root post.
+    if (!options.replyTo && composer?.setReplyTo) {
+      const rootPost = thread?.post || null;
+      const uri = String(rootPost?.uri || rootUri);
+      const cid = String(rootPost?.cid || rootCid);
+      const author = String(rootPost?.author?.handle || '');
+      if (uri && cid) composer.setReplyTo({ uri, cid, author });
+    }
+  }
+
+  async _submitInlineComment(entryEl, detail) {
+    const rootUri = String(entryEl?.getAttribute?.('data-uri') || '');
+    const rootCid = String(entryEl?.getAttribute?.('data-cid') || '');
+    if (!rootUri) return;
+
+    if (this._postingRoots.has(rootUri)) return;
+    const text = String(detail?.text || '').trim();
+    if (!text) return;
+
+    const replyTo = detail?.replyTo || null;
+    const parentUri = String(replyTo?.uri || '');
+    const parentCid = String(replyTo?.cid || '');
+    if (!parentUri || !parentCid) return;
+
+    const outNow = this._threadCache.get(rootUri) || { preview: null, full: null };
+    const threadOut = outNow.full || outNow.preview || null;
+    const thread = threadOut?.thread || null;
+    const rootPost = thread?.post || null;
+    const rootRef = {
+      uri: String(rootPost?.uri || rootUri),
+      cid: String(rootPost?.cid || rootCid || parentCid),
+    };
+
+    const images = Array.isArray(detail?.media?.images) ? detail.media.images : [];
+    const uploaded = [];
+
+    this._postingRoots.add(rootUri);
+    try {
+      for (const img of images) {
+        const mime = String(img?.mime || '');
+        const dataBase64 = String(img?.dataBase64 || '');
+        if (!mime || !dataBase64) continue;
+        const res = await call('uploadBlob', { mime, dataBase64 });
+        const blob = res?.blob || res?.data?.blob || res?.data || null;
+        if (blob) uploaded.push({ alt: String(img?.alt || ''), image: blob });
+      }
+
+      const embed = uploaded.length ? { $type: 'app.bsky.embed.images', images: uploaded } : null;
+
+      await call('createPost', {
+        text,
+        reply: {
+          root: { uri: rootRef.uri, cid: rootRef.cid },
+          parent: { uri: parentUri, cid: parentCid },
+        },
+        ...(embed ? { embed } : {}),
+      });
+
+      // Refresh thread cache and rerender expanded thread.
+      try {
+        const outFull = await call('getPostThread', { uri: rootUri, depth: 10, parentHeight: 6 });
+        const next = this._threadCache.get(rootUri) || { preview: null, full: null };
+        next.full = outFull || null;
+        this._threadCache.set(rootUri, next);
+      } catch {}
+      await this._toggleInlineThread(entryEl, { uri: rootUri, cid: rootCid }, { ensureOpen: true, mode: this._expandedThreadMode.get(rootUri) || 'full' });
+    } finally {
+      this._postingRoots.delete(rootUri);
     }
   }
 
@@ -1108,107 +1479,72 @@ class BskyMyPosts extends HTMLElement {
       const uri = p.uri || '';
       const cid = p.cid || '';
 
+      const a = p.author || {};
+      const handle = String(a?.handle || '');
+      const display = String(a?.displayName || '');
+      const who = display && handle ? `${display} (@${handle})` : (display || (handle ? `@${handle}` : ''));
+
+      const expanded = this._expandedThreads.has(String(uri || ''));
+      const icon = expanded ? '−' : '+';
+
+      const reposted = !!(p?.viewer && p.viewer.repost);
+      const repostLabel = reposted ? 'Undo repost' : 'Repost';
+
       return `
         <div class="post" style="--depth:${esc(depth)}" data-ord="${esc(ord)}" data-uri="${esc(uri)}" data-cid="${esc(cid)}">
           <header class="meta">
+            <button class="icon" type="button" data-toggle-thread aria-label="Toggle thread" title="Toggle thread">${esc(icon)}</button>
             ${chron ? `<span class="chron">#${esc(chron)}</span>` : ''}
             <span class="kind">${esc(kind)}</span>
+            ${who ? `<span class="author">${esc(who)}</span>` : ''}
             <span class="time">${esc(when)}</span>
             ${open ? `<a class="open" target="_blank" rel="noopener" href="${esc(open)}">Open</a>` : ''}
           </header>
           ${text ? `<div class="text">${text}</div>` : ''}
           ${embeds ? `<div class="embeds">${embeds}</div>` : ''}
           <footer class="counts">
-            <span title="Replies" class="count" data-open-interactions data-kind="replies" data-uri="${esc(uri)}" data-cid="${esc(cid)}">💬 ${replyCount}</span>
+            <span title="Replies (click to preview thread; Ctrl/Cmd-click to open Content)" class="count" data-open-interactions data-kind="replies" data-uri="${esc(uri)}" data-cid="${esc(cid)}">💬 ${replyCount}</span>
             <span title="Reposts" class="count" data-open-interactions data-kind="reposts" data-uri="${esc(uri)}" data-cid="${esc(cid)}">🔁 ${repostCount}</span>
             <span title="Likes"   class="count" data-open-interactions data-kind="likes"   data-uri="${esc(uri)}" data-cid="${esc(cid)}">♥ ${likeCount}</span>
+          </footer>
+          <footer class="actions">
+            <button class="act" type="button" data-reply data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-author="${esc(handle ? `@${handle}` : '')}">Reply</button>
+            <button class="act" type="button" data-repost data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-reposted="${reposted ? '1' : '0'}">${esc(repostLabel)}</button>
           </footer>
         </div>
       `;
     };
 
     const groupIntoThreads = (items = []) => {
+      // Thread grouping from partial feed batches is prone to incorrectly nesting
+      // unrelated posts. Render each entry as a summary card and fetch the full
+      // thread on demand when the user expands it.
       const groups = [];
-      const byKey = new Map();
-
       for (let ord = 0; ord < items.length; ord++) {
         const it = items[ord];
         const uri = String(it?.post?.uri || '');
-        const { rootUri } = pickReplyInfo(it);
-        const key = (rootUri || uri || String(ord));
-        if (!byKey.has(key)) {
-          const g = { key, rootUri: rootUri || uri, items: [] };
-          byKey.set(key, g);
-          groups.push(g);
-        }
-        byKey.get(key).items.push({ it, ord });
+        const key = uri || String(ord);
+        groups.push({ key, rootUri: uri, items: [{ it, ord }] });
       }
-
       return groups;
     };
 
     const renderThreadEntry = (group, batchId, chron = null) => {
       const key = String(group?.key || '');
-      // Anchor key must be unique across the entire rendered DOM.
-      // A thread root URI can legitimately appear across multiple pages/batches (replies
-      // spread out over time), so include the batch id to avoid duplicate [data-k] values.
       const anchorKey = `${key}::${String(batchId || '')}`;
-      const rootUri = String(group?.rootUri || '');
       const items = Array.isArray(group?.items) ? group.items : [];
-
-      // Prefer rendering a real root post if it's present in this batch.
-      const rootObj = items.find(({ it }) => String(it?.post?.uri || '') === rootUri) || items[0] || null;
+      const rootObj = items[0] || null;
       const rootIt = rootObj?.it || null;
       const rootOrd = rootObj?.ord || 0;
+      const rootUri = String(rootIt?.post?.uri || group?.rootUri || '');
       const rootCid = String(rootIt?.post?.cid || '');
-
-      // Build a reply tree (by parent URI) for items that are replies.
-      const nodes = new Map();
-      const roots = [];
-
-      for (const o of items) {
-        const it = o?.it;
-        if (!it) continue;
-        const uri = String(it?.post?.uri || '');
-        if (!uri) continue;
-        if (uri === rootUri) continue;
-        if (this.itemType(it) !== 'reply') continue;
-
-        const { parentUri } = pickReplyInfo(it);
-        nodes.set(uri, { uri, parentUri: parentUri || rootUri, it, ord: o.ord, children: [] });
-      }
-
-      // Attach children.
-      for (const node of nodes.values()) {
-        const parent = nodes.get(node.parentUri);
-        if (parent && parent.uri !== node.uri) parent.children.push(node);
-        else roots.push(node);
-      }
-
-      const sortTree = (arr) => {
-        arr.sort((a, b) => (a.ord - b.ord));
-        for (const n of arr) sortTree(n.children);
-      };
-      sortTree(roots);
-
-      const renderNode = (n, depth) => {
-        const childHtml = n.children?.length ? n.children.map((c) => renderNode(c, depth + 1)).join('') : '';
-        return `
-          <div class="thread-node" style="--depth:${esc(depth)}">
-            ${renderPostBlock(n.it, n.ord, depth)}
-            ${childHtml ? `<div class="thread-children">${childHtml}</div>` : ''}
-          </div>
-        `;
-      };
-
-      const childrenHtml = roots.length ? `<div class="thread-children">${roots.map((n) => renderNode(n, 1)).join('')}</div>` : '';
 
       return {
         key,
         html: `
-          <article class="entry thread" data-k="${esc(anchorKey)}" data-uri="${esc(rootUri)}" data-cid="${esc(rootCid)}">
+          <article class="entry" data-k="${esc(anchorKey)}" data-uri="${esc(rootUri)}" data-cid="${esc(rootCid)}">
             ${rootIt ? renderPostBlock(rootIt, rootOrd, 0, chron) : ''}
-            ${childrenHtml}
+            <div class="inline-thread" data-inline-thread hidden></div>
           </article>
         `
       };
@@ -1369,21 +1705,21 @@ class BskyMyPosts extends HTMLElement {
 
         .entry{border:2px solid #333; border-radius:0; padding:5px; margin:0; background:#0b0b0b; width:100%; max-width:100%}
 
-        /* Thread grouping: render replies/comments nested under the root post */
-        .entry.thread{padding:6px}
-        .entry.thread .post{border:0; padding:0; margin:0; background:transparent}
-        .entry.thread .post + .thread-children{margin-top:8px}
-        .thread-node{margin-top:6px; padding-left: calc(var(--depth, 0) * 12px); border-left: 2px solid rgba(255,255,255,0.06)}
-        .thread-node .post{border:1px solid #222; background:#0a0a0a; padding:6px}
-        .thread-node .thread-children{margin-top:6px}
+        /* Inline thread expansion */
+        .inline-thread{margin-top:10px; padding:10px; border-top:1px solid #222}
+        .inline-actions{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
         .meta{display:flex; align-items:center; gap:10px; color:#bbb; font-size:.9rem; margin-bottom:6px}
+        .meta .icon{appearance:none;background:#111;border:1px solid #444;color:#fff;padding:0 8px;height:26px;line-height:24px}
         .meta .chron{background:#111;border:1px solid #444;border-radius:0;padding:1px 8px;color:#ddd}
         .meta .kind{background:#111;border:1px solid #444;border-radius:0;padding:1px 8px}
+        .meta .author{color:#ddd;max-width:40ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         .meta .time{margin-left:auto}
         .open{color:#9cd3ff}
         .text{white-space:pre-wrap;line-height:1.35}
         .counts{display:flex;gap:12px;color:#bbb;margin-top:6px}
         .counts .count{cursor:pointer}
+        .actions{display:flex;gap:8px;margin-top:8px}
+        .act{background:#111;border:1px solid #555;color:#fff;padding:6px 10px;border-radius:0;cursor:pointer}
 
         /* External cards (generic) */
         .embeds{margin-top:8px}
@@ -1415,6 +1751,8 @@ class BskyMyPosts extends HTMLElement {
         .ext-card.video .thumb{position:relative;flex:0 0 160px;max-width:100%;background:#111;display:flex;align-items:center;justify-content:center}
         .ext-card.video .thumb img{width:100%;height:100%;object-fit:cover;display:block}
         .ext-card.video .play{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);background:rgba(0,0,0,.55);border:2px solid #fff;border-radius:0;padding:8px 14px;font-weight:700}
+
+        .video-wrap video{width:100%;max-width:100%;display:block;background:#000}
 
         @media (max-width: 520px){
           .ext-card .thumb{flex:0 0 100%;min-width:0}
@@ -1524,6 +1862,7 @@ class BskyMyPosts extends HTMLElement {
         })();
 
         const rebuildAll = !isAppendOnly;
+        this._lastRenderRebuiltAll = rebuildAll;
         if (batchesEl) {
           if (rebuildAll) {
             batchesEl.textContent = '';
@@ -1696,6 +2035,26 @@ class BskyMyPosts extends HTMLElement {
     // After initial/reset load, auto-fetch until the viewport is scrollable.
     if (this._autoFillPending) {
       queueMicrotask(() => this._kickAutoFillViewport());
+    }
+
+    // If the DOM was rebuilt, restore expanded inline threads.
+    if (created || this._lastRenderRebuiltAll) {
+      queueMicrotask(() => {
+        try {
+          const entries = Array.from(this.shadowRoot.querySelectorAll('.entry[data-uri]'));
+          for (const entry of entries) {
+            const uri = String(entry.getAttribute('data-uri') || '');
+            if (!uri || !this._expandedThreads.has(uri)) continue;
+            const cid = String(entry.getAttribute('data-cid') || '');
+            const mode = this._expandedThreadMode.get(uri) || 'full';
+            const host = entry.querySelector('[data-inline-thread]');
+            const hasTree = !!host?.querySelector?.('bsky-thread-tree');
+            if (host && !hasTree) {
+              this._toggleInlineThread(entry, { uri, cid }, { ensureOpen: true, mode });
+            }
+          }
+        } catch {}
+      });
     }
 
   }

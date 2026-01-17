@@ -21,6 +21,62 @@ function pickTime(post) {
   }
 }
 
+function extractImagesFromEmbed(embed) {
+  if (!embed) return null;
+  const t = String(embed.$type || '');
+  if (t.includes('embed.images') && Array.isArray(embed.images) && embed.images.length) {
+    return embed.images.map((img) => ({
+      src: img.fullsize || img.thumb || '',
+      alt: img.alt || '',
+      arW: Number(img?.aspectRatio?.width || 0),
+      arH: Number(img?.aspectRatio?.height || 0),
+    })).filter((i) => i.src);
+  }
+  return null;
+}
+
+function extractVideoFromEmbed(embed) {
+  if (!embed) return null;
+  const t = String(embed.$type || '');
+  if (t.includes('embed.video')) {
+    return {
+      playlist: String(embed.playlist || ''),
+      thumb: String(embed.thumbnail || embed.thumb || ''),
+      alt: String(embed.alt || ''),
+    };
+  }
+  return null;
+}
+
+function renderImagesGrid(images) {
+  if (!images || !images.length) return '';
+  return `
+    <div class="images-grid">
+      ${images.map((i) => `
+        <figure class="img-wrap">
+          <img src="${esc(i.src)}" alt="${esc(i.alt || '')}" loading="lazy" />
+        </figure>
+      `).join('')}
+    </div>
+  `;
+}
+
+function renderVideo(video) {
+  if (!video) return '';
+  const src = String(video.playlist || '');
+  if (!src) return '';
+  const poster = video.thumb ? ` poster="${esc(video.thumb)}"` : '';
+  // NOTE: Many Bluesky videos are HLS (m3u8). Some browsers can’t play HLS without hls.js.
+  const type = src.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp4';
+  return `
+    <div class="video-wrap">
+      <video controls playsinline preload="metadata"${poster}>
+        <source src="${esc(src)}" type="${esc(type)}" />
+      </video>
+    </div>
+  `;
+}
+
 export class BskyThreadTree extends HTMLElement {
   constructor() {
     super();
@@ -61,8 +117,9 @@ export class BskyThreadTree extends HTMLElement {
     if (btn) {
       const uri = btn.getAttribute('data-reply-uri') || '';
       const author = btn.getAttribute('data-reply-author') || '';
+      const cid = btn.getAttribute('data-reply-cid') || '';
       this.dispatchEvent(new CustomEvent('bsky-reply-to', {
-        detail: { uri, author },
+        detail: { uri, cid, author },
         bubbles: true,
         composed: true,
       }));
@@ -73,9 +130,15 @@ export class BskyThreadTree extends HTMLElement {
   renderNode(node, depth, opts = {}) {
     const post = node?.post || null;
     const uri = post?.uri || '';
+    const cid = post?.cid || '';
     const who = pickAuthor(post);
     const when = pickTime(post);
     const text = pickText(post);
+
+    const embed = post?.embed || null;
+    const images = extractImagesFromEmbed(embed);
+    const video = extractVideoFromEmbed(embed);
+    const embedsHtml = (images?.length ? renderImagesGrid(images) : '') + (video ? renderVideo(video) : '');
 
     const variant = String(opts?.variant || '');
 
@@ -88,9 +151,10 @@ export class BskyThreadTree extends HTMLElement {
           <div class="meta">
             <div class="who">${esc(who)}</div>
             <div class="when">${esc(when)}</div>
-            ${(variant !== 'ancestor' && uri) ? `<button class="reply" type="button" data-reply-uri="${esc(uri)}" data-reply-author="${esc(who)}">Reply</button>` : ''}
+            ${(variant !== 'ancestor' && uri) ? `<button class="reply" type="button" data-reply-uri="${esc(uri)}" data-reply-cid="${esc(cid)}" data-reply-author="${esc(who)}">Reply</button>` : ''}
           </div>
           ${text ? `<div class="text">${esc(text)}</div>` : '<div class="text muted">(no text)</div>'}
+          ${embedsHtml ? `<div class="embeds">${embedsHtml}</div>` : ''}
         </div>
         ${hasReplies ? `<div class="replies">${replies.map((r) => this.renderNode(r, depth + 1)).join('')}</div>` : ''}
       </div>
@@ -116,6 +180,12 @@ export class BskyThreadTree extends HTMLElement {
         .who{font-weight:700; color:#eaeaea; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
         .when{margin-left:auto; white-space:nowrap}
         .text{white-space:pre-wrap; line-height:1.25}
+
+        .embeds{margin-top:8px}
+        .images-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:6px}
+        .img-wrap{margin:0;background:#111;overflow:hidden}
+        .img-wrap img{width:100%;height:auto;display:block}
+        .video-wrap video{width:100%;height:auto;display:block;background:#111}
 
         .ancestors{margin:0 0 10px 0}
         .node.ancestor{border-left: 2px solid rgba(255,255,255,0.12)}

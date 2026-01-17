@@ -57,6 +57,25 @@ This is the top-level TODO for the package (GitHub-facing). A more detailed/lega
 - Optional FTS search for cached profiles/posts (SQLite FTS5), with a clean fallback to LIKE when unavailable. (Posts FTS implemented; falls back to LIKE if FTS5 isn't available.)
 - Export tools (CSV/JSON) for cached datasets (followers/following/notifications/posts) for AI workflows. (Posts/notifications/followers/following export implemented via `cacheExport`.)
 
+### 7) Posts / Threads UI (feed + content)
+
+- Posts feed should be thread-centric:
+	- Default: compact “summary cards” for posts/replies/reposts.
+	- Expand/collapse (+/−) per entry to show the full thread inline (no accidental cross-thread nesting).
+	- Clicking any entry opens the Content panel in “conversation/thread view”.
+- Fix incorrect nesting in Posts feed where unrelated items appear under the same thread (treat feed items as independent unless explicitly expanded to a fetched thread).
+- Inline media in-client (no forced redirect to bsky.app):
+	- Images: render grids/preview in cards and in thread view.
+	- Bluesky video: render/play inline where possible; add fallback behavior for HLS if the browser can’t play it.
+- Commenting / replying:
+	- Dedicated comment UI web components under `packages/concretesky/js/comment/*`.
+	- Reply composer usable in both the Posts panel (inline in the card) and the Content panel (thread view).
+	- Support full Bluesky media options for replies (at minimum: multi-image upload + alt text; extend to video as supported).
+	- After posting, refresh the thread/feed to reflect the new reply.
+- Reposting:
+	- Repost/unrepost actions in cards and thread view.
+	- Keep UI state in sync (optimistic update + refresh).
+
 ## Maintenance
 
 - Consider deprecating or clearly labeling the legacy app-password login path (`authLogin`) now that OAuth is the default.

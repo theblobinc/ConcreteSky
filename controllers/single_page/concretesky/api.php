@@ -1295,6 +1295,45 @@ class Api extends ParentController
 
                 /* ---- post/like/repost CRUD (your repo) ---- */
 
+                case 'uploadBlob': {
+                    // Upload a blob (images first). Client sends base64 payload to avoid multipart handling.
+                    $mime = trim((string)($params['mime'] ?? ''));
+                    $b64  = (string)($params['dataBase64'] ?? '');
+                    if ($mime === '' || $b64 === '') return $this->json(['error' => 'Missing mime/dataBase64'], 400);
+
+                    // Safety: limit to images for now.
+                    if (stripos($mime, 'image/') !== 0) {
+                        return $this->json(['error' => 'Unsupported mime (images only for now)'], 400);
+                    }
+
+                    $bin = base64_decode($b64, true);
+                    if ($bin === false) return $this->json(['error' => 'Invalid base64'], 400);
+
+                    // Size guard (keep conservative; PDS may enforce smaller limits).
+                    $max = (int)($params['maxBytes'] ?? 0);
+                    if ($max <= 0) $max = 2 * 1024 * 1024;
+                    if (strlen($bin) > $max) return $this->json(['error' => 'File too large'], 413);
+
+                    $url = rtrim((string)$this->pds, '/') . '/xrpc/com.atproto.repo.uploadBlob';
+                    $authType = (string)($session['authType'] ?? 'password');
+
+                    if ($authType === 'oauth') {
+                        $out = $this->oauthXrpcRaw('POST', $url, $session, $bin, $mime);
+                        return $this->json($out);
+                    }
+
+                    $headers = [
+                        'Authorization: Bearer ' . (string)($session['accessJwt'] ?? ''),
+                        'Accept: application/json',
+                    ];
+                    $r = $this->httpRaw('POST', $url, $bin, $headers, $mime);
+                    if (($r['status'] ?? 500) >= 400) {
+                        $msg = is_array($r['json']) ? ($r['json']['message'] ?? ($r['json']['error'] ?? json_encode($r['json']))) : (string)($r['text'] ?? '');
+                        throw new \RuntimeException('HTTP ' . (int)($r['status'] ?? 500) . ': ' . $msg);
+                    }
+                    return $this->json($r['json'] ?? ['raw' => (string)($r['text'] ?? '')]);
+                }
+
                 case 'createPost': {
                     // Used for inline reply from the modal; also supports a plain new post
                     $text = (string)($params['text'] ?? '');
@@ -1307,6 +1346,7 @@ class Api extends ParentController
                     if (!empty($params['langs']) && is_array($params['langs'])) $record['langs'] = array_values($params['langs']);
                     if (!empty($params['facets']) && is_array($params['facets'])) $record['facets'] = $params['facets'];
                     if (!empty($params['reply']) && is_array($params['reply']))   $record['reply']  = $params['reply']; // { root:{uri,cid}, parent:{uri,cid} }
+                    if (!empty($params['embed']) && is_array($params['embed']))   $record['embed']  = $params['embed'];
                     return $this->json($this->createRecord($session, 'app.bsky.feed.post', $record));
                 }
 

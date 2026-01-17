@@ -17,7 +17,21 @@ export class BskyContentPanel extends HTMLElement {
     this._loading = false;
     this._error = null;
     this._thread = null; // getPostThread().thread
-    this._replyTo = null; // { uri, author }
+    this._replyTo = null; // { uri, cid, author }
+    this._posting = false;
+  }
+
+  pickThreadRootRef(thread) {
+    try {
+      let cur = thread;
+      while (cur?.parent?.post) cur = cur.parent;
+      const p = cur?.post || null;
+      const uri = String(p?.uri || '');
+      const cid = String(p?.cid || '');
+      return (uri && cid) ? { uri, cid } : null;
+    } catch {
+      return null;
+    }
   }
 
   setSelection(sel) {
@@ -36,16 +50,77 @@ export class BskyContentPanel extends HTMLElement {
     this.shadowRoot.addEventListener('click', (e) => this.onClick(e));
     this.shadowRoot.addEventListener('bsky-reply-to', (e) => {
       const d = e?.detail || null;
-      this._replyTo = d?.uri ? { uri: String(d.uri), author: String(d.author || '') } : null;
+      this._replyTo = d?.uri ? { uri: String(d.uri), cid: String(d.cid || ''), author: String(d.author || '') } : null;
       const composer = this.shadowRoot.querySelector('bsky-comment-composer');
       composer?.setReplyTo?.(this._replyTo);
     });
     this.shadowRoot.addEventListener('bsky-submit-comment', (e) => {
-      // Scaffold only; we don't have a write endpoint yet.
-      const text = String(e?.detail?.text || '').trim();
-      if (!text) return;
-      alert('Reply posting is not wired yet.');
+      this.submitComment(e?.detail || null);
     });
+  }
+
+  async submitComment(detail) {
+    if (this._posting) return;
+    const text = String(detail?.text || '').trim();
+    if (!text) return;
+
+    const replyTo = detail?.replyTo || null;
+    const parentUri = String(replyTo?.uri || '');
+    const parentCid = String(replyTo?.cid || '');
+    if (!parentUri || !parentCid) {
+      this._error = 'Missing reply target (uri/cid). Click Reply on a post first.';
+      this.render();
+      return;
+    }
+
+    const rootRef = this.pickThreadRootRef(this._thread) || { uri: parentUri, cid: parentCid };
+
+    const images = Array.isArray(detail?.media?.images) ? detail.media.images : [];
+    const uploaded = [];
+
+    this._posting = true;
+    this._error = null;
+    this.render();
+
+    try {
+      for (const img of images) {
+        const mime = String(img?.mime || '');
+        const dataBase64 = String(img?.dataBase64 || '');
+        if (!mime || !dataBase64) continue;
+        const res = await call('uploadBlob', { mime, dataBase64 });
+        const blob = res?.blob || res?.data?.blob || res?.data || null;
+        if (blob) {
+          uploaded.push({
+            alt: String(img?.alt || ''),
+            image: blob,
+          });
+        }
+      }
+
+      const embed = uploaded.length ? {
+        $type: 'app.bsky.embed.images',
+        images: uploaded,
+      } : null;
+
+      await call('createPost', {
+        text,
+        reply: {
+          root: { uri: rootRef.uri, cid: rootRef.cid },
+          parent: { uri: parentUri, cid: parentCid },
+        },
+        ...(embed ? { embed } : {}),
+      });
+
+      // Clear reply target and refresh thread.
+      this._replyTo = null;
+      await this.load();
+    } catch (e) {
+      this._error = e?.message || String(e || 'Failed to post reply');
+      this.render();
+    } finally {
+      this._posting = false;
+      this.render();
+    }
   }
 
   onClick(e) {
@@ -98,6 +173,7 @@ export class BskyContentPanel extends HTMLElement {
 
         <div class="section">
           ${this._loading ? '<div class="muted">Loading thread…</div>' : ''}
+          ${this._posting ? '<div class="muted">Posting…</div>' : ''}
           ${this._error ? `<div class="err">Error: ${esc(this._error)}</div>` : ''}
         </div>
 
