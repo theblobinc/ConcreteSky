@@ -2,6 +2,7 @@ import { call } from '../../../api.js';
 import { getAuthStatusCached, isNotConnectedError } from '../../../auth_state.js';
 import { identityCss, identityHtml, bindCopyClicks, toProfileUrl } from '../../../lib/identity.js';
 import { queueProfiles } from '../../../profile_hydrator.js';
+import { resolvePanelScroller, captureScrollAnchor, applyScrollAnchor } from '../../panel_api.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
   ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[m])
@@ -57,6 +58,38 @@ class BskyFollowing extends HTMLElement {
     this._onProfilesHydrated = null;
     this._hydratedDidSet = new Set();
     this._hydratedTimer = null;
+
+    this._restoreScrollNext = false;
+    this._scrollAnchor = null;
+    this._scrollTop = 0;
+  }
+
+  _isRateLimitError(e) {
+    return (e && (e.status === 429 || e.code === 'RATE_LIMITED' || e.name === 'RateLimitError'))
+      || /\bHTTP\s*429\b/i.test(String(e?.message || ''));
+  }
+
+  _retryAfterSeconds(e) {
+    const v = e?.retryAfterSeconds;
+    if (Number.isFinite(v) && v >= 0) return v;
+    const msg = String(e?.message || '');
+    const m = msg.match(/retry-after:\s*([^\)\s]+)/i);
+    if (!m) return null;
+    const raw = String(m[1] || '').trim();
+    if (/^\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10));
+    const t = Date.parse(raw);
+    if (!Number.isFinite(t)) return null;
+    return Math.max(0, Math.ceil((t - Date.now()) / 1000));
+  }
+
+  async _backoffIfRateLimited(e) {
+    if (!this._isRateLimitError(e)) return false;
+    const sec = this._retryAfterSeconds(e);
+    const waitSec = Number.isFinite(sec) ? Math.min(3600, Math.max(1, sec)) : 10;
+    this.error = `Rate limited. Waiting ${waitSec}s…`;
+    this.render();
+    await new Promise((r) => setTimeout(r, waitSec * 1000));
+    return true;
   }
 
   _scheduleMergeHydrated(dids) {
@@ -189,7 +222,9 @@ class BskyFollowing extends HTMLElement {
     if (reset) {
       this.items = [];
       this.offset = 0;
+      this._restoreScrollNext = false;
     }
+    if (!reset) this._restoreScrollNext = true;
     this.render();
 
     try {
@@ -208,14 +243,24 @@ class BskyFollowing extends HTMLElement {
           this.diff = await call('cacheFriendDiff', { kind: 'following', limit: 0 });
         } catch (_) { /* ignore */ }
       }
-      const data = await call('cacheQueryPeople', {
-        list: 'following',
-        q: this.filters.q,
-        sort: this.filters.sort,
-        mutual: this.filters.onlyMutuals,
-        limit: this.limit,
-        offset: this.offset,
-      });
+      let data;
+      for (;;) {
+        try {
+          data = await call('cacheQueryPeople', {
+            list: 'following',
+            q: this.filters.q,
+            sort: this.filters.sort,
+            mutual: this.filters.onlyMutuals,
+            limit: this.limit,
+            offset: this.offset,
+          });
+          break;
+        } catch (e) {
+          const waited = await this._backoffIfRateLimited(e);
+          if (waited) continue;
+          throw e;
+        }
+      }
       const batch = Array.isArray(data.items) ? data.items : [];
       if (reset) this.items = batch;
       else this.items.push(...batch);
@@ -235,12 +280,28 @@ class BskyFollowing extends HTMLElement {
   }
 
   render(){
+    // Preserve scroll position across re-renders.
+    try {
+      const scroller = resolvePanelScroller(this) || document.scrollingElement;
+      if (scroller) {
+        this._scrollTop = scroller.scrollTop || 0;
+        if (this._restoreScrollNext) {
+          this._scrollAnchor = captureScrollAnchor({
+            scroller,
+            root: this.shadowRoot,
+            itemSelector: '.row[data-did]',
+            keyAttr: 'data-did',
+          });
+        }
+      }
+    } catch {}
+
     const rows = (this.items || []).map(p => {
       const mutual = this.filters.onlyMutuals;
       const ageDays = daysSince(p.createdAt);
 
       return `
-        <div class="row">
+        <div class="row" data-did="${esc(p.did || '')}">
           <img class="av" src="${esc(p.avatar || '')}" alt="" onerror="this.style.display='none'">
           <div class="main">
             <div class="top">
@@ -320,6 +381,24 @@ class BskyFollowing extends HTMLElement {
         </div>
       </div>
     `;
+
+    // Restore scroll anchor after DOM rebuild.
+    if (this._restoreScrollNext) {
+      queueMicrotask(() => {
+        requestAnimationFrame(() => {
+          const scroller = resolvePanelScroller(this) || document.scrollingElement;
+          if (!scroller) return;
+          if (this._scrollAnchor) {
+            applyScrollAnchor({ scroller, root: this.shadowRoot, anchor: this._scrollAnchor, keyAttr: 'data-did' });
+            setTimeout(() => applyScrollAnchor({ scroller, root: this.shadowRoot, anchor: this._scrollAnchor, keyAttr: 'data-did' }), 160);
+          } else {
+            scroller.scrollTop = Math.max(0, this._scrollTop || 0);
+          }
+          this._restoreScrollNext = false;
+          this._scrollAnchor = null;
+        });
+      });
+    }
   }
 }
 

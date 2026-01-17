@@ -1010,6 +1010,11 @@ class BskyNotificationBar extends HTMLElement {
         isLoading: () => !!this.loading || !!this._page.loadingMore,
         hasMore: () => !this._page.done,
         cooldownMs: 250,
+        anchor: {
+          getRoot: () => this.shadowRoot,
+          itemSelector: '.row[data-k]',
+          keyAttr: 'data-k',
+        },
         initialTick: false,
       });
     }

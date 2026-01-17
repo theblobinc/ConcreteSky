@@ -508,7 +508,21 @@ class BskyConnections extends HTMLElement {
         this.error = 'Not connected. Use the Connect button.';
         return;
       }
-      await call('cacheSync', { kind: 'both', mode: 'force', pagesMax: 80 });
+      for (;;) {
+        try {
+          await call('cacheSync', { kind: 'both', mode: 'force', pagesMax: 80 });
+          break;
+        } catch (e) {
+          const isRate = (e && (e.status === 429 || e.code === 'RATE_LIMITED' || e.name === 'RateLimitError'))
+            || /\bHTTP\s*429\b/i.test(String(e?.message || ''));
+          if (!isRate) throw e;
+          const sec = Number.isFinite(e?.retryAfterSeconds) ? e.retryAfterSeconds : null;
+          const waitSec = Number.isFinite(sec) ? Math.min(3600, Math.max(1, sec)) : 10;
+          this.error = `Rate limited. Waiting ${waitSec}s…`;
+          this.render();
+          await new Promise((r) => setTimeout(r, waitSec * 1000));
+        }
+      }
       await this.load(true);
     } catch (e) {
       this.error = isNotConnectedError(e) ? 'Not connected. Use the Connect button.' : e.message;
@@ -553,14 +567,29 @@ class BskyConnections extends HTMLElement {
         return;
       }
 
-      const data = await call('cacheQueryPeople', {
-        list: this.listMode(),
-        q: this.filters.q,
-        sort: this.filters.sort,
-        mutual: this.filters.onlyMutuals,
-        limit: this.limit,
-        offset: this.offset,
-      });
+      let data;
+      for (;;) {
+        try {
+          data = await call('cacheQueryPeople', {
+            list: this.listMode(),
+            q: this.filters.q,
+            sort: this.filters.sort,
+            mutual: this.filters.onlyMutuals,
+            limit: this.limit,
+            offset: this.offset,
+          });
+          break;
+        } catch (e) {
+          const isRate = (e && (e.status === 429 || e.code === 'RATE_LIMITED' || e.name === 'RateLimitError'))
+            || /\bHTTP\s*429\b/i.test(String(e?.message || ''));
+          if (!isRate) throw e;
+          const sec = Number.isFinite(e?.retryAfterSeconds) ? e.retryAfterSeconds : null;
+          const waitSec = Number.isFinite(sec) ? Math.min(3600, Math.max(1, sec)) : 10;
+          this.error = `Rate limited. Waiting ${waitSec}s…`;
+          this.render();
+          await new Promise((r) => setTimeout(r, waitSec * 1000));
+        }
+      }
 
       const batch = Array.isArray(data.items) ? data.items : [];
       if (reset) this.items = batch;
@@ -746,6 +775,11 @@ class BskyConnections extends HTMLElement {
         isLoading: () => !!this.loading,
         hasMore: () => !!this.hasMore,
         cooldownMs: 250,
+        anchor: {
+          getRoot: () => this.shadowRoot,
+          itemSelector: '.entry[data-did]',
+          keyAttr: 'data-did',
+        },
         // Avoid auto-fetching every page on open ("fill the viewport" loop).
         initialTick: false,
       });

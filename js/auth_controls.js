@@ -130,9 +130,11 @@ export function bindAuthControls(root) {
           </div>
 
           <details>
-            <summary>Use app password (fallback)</summary>
+            <summary>Use app password (deprecated fallback)</summary>
             <form data-app-form autocomplete="on">
               <div style="height:10px"></div>
+              <div class="muted">Deprecated: app passwords are less secure and tend to be more fragile. Prefer OAuth above.</div>
+              <div style="height:8px"></div>
               <label>Identifier (handle/email)</label>
               <input data-identifier name="username" autocomplete="username" placeholder="handle or email" />
               <div style="height:8px"></div>

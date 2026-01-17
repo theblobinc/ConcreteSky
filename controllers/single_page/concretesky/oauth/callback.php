@@ -3,6 +3,7 @@ namespace Concrete\Package\Concretesky\Controller\SinglePage\Concretesky\Oauth;
 
 use Concrete\Package\Concretesky\Controller\SinglePage\Concretesky\Api as ApiController;
 use Concrete\Core\Support\Facade\Log;
+use Concrete\Core\User\UserInfo;
 use Symfony\Component\HttpFoundation\Response;
 
 defined('C5_EXECUTE') or die('Access Denied.');
@@ -28,6 +29,10 @@ class Callback extends ApiController
             }
 
             $c5UserId = $this->requireConcreteUserId();
+
+            // If the SPA is restricted, do not allow completing OAuth for disallowed users.
+            $ui = UserInfo::getByID((int)$c5UserId);
+            $this->requireUiAccess($ui);
 
             $pdo = $this->cacheDb();
             $this->cacheMigrate($pdo);

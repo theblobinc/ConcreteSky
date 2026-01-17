@@ -4,7 +4,10 @@ namespace Concrete\Package\Concretesky\Controller\SinglePage;
 use Concrete\Core\Page\Controller\PageController;
 use Concrete\Core\Support\Facade\Log;
 use Concrete\Core\User\User;
+use Concrete\Core\User\UserInfo;
+use Concrete\Core\User\Group\Group;
 use Concrete\Core\Routing\Redirect;
+use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
 
 defined('C5_EXECUTE') or die('Access Denied.');
 
@@ -33,7 +36,132 @@ class Concretesky extends PageController
         if (!$u->isRegistered()) {
             return Redirect::to('/login');
         }
+
+        $this->requireUiAccess($u->getUserInfoObject());
+
         $this->requireAsset('jquery');
+    }
+
+    /**
+     * Optional access control for the ConcreteSky SPA + related API routes.
+     * Defaults to allowing any logged-in Concrete user.
+     */
+    protected function requireUiAccess(?UserInfo $ui): void
+    {
+        if (!$this->uiAccessAllowed($ui)) {
+            throw new AccessDeniedHttpException('Forbidden');
+        }
+    }
+
+    protected function uiAccessAllowed(?UserInfo $ui): bool
+    {
+        if (!$ui) return false;
+
+        $requireSuper = $this->boolFromEnvOrConfig('CONCRETESKY_UI_REQUIRE_SUPERUSER', 'concretesky.ui.require_superuser', false);
+
+        $allowUsersRaw = $this->strFromEnvOrConfig('CONCRETESKY_UI_ALLOW_USERS', 'concretesky.ui.allow_users', '');
+        if ($allowUsersRaw === '') {
+            // Back-compat env names.
+            $allowUsersRaw = trim((string)(getenv('CONCRETESKY_UI_ALLOW_USERNAMES') ?: ''));
+        }
+
+        $allowGroupsRaw = $this->strFromEnvOrConfig('CONCRETESKY_UI_ALLOW_GROUPS', 'concretesky.ui.allow_groups', '');
+        if ($allowGroupsRaw === '') {
+            // Back-compat env name.
+            $allowGroupsRaw = trim((string)(getenv('CONCRETESKY_UI_ALLOW_GROUP') ?: ''));
+        }
+
+        // If nothing is configured, allow any logged-in user.
+        if (!$requireSuper && trim($allowUsersRaw) === '' && trim($allowGroupsRaw) === '') {
+            return true;
+        }
+
+        $isSuper = method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+        if ($requireSuper && !$isSuper) {
+            return false;
+        }
+
+        if (trim($allowUsersRaw) !== '') {
+            $allow = array_values(array_filter(array_map('trim', explode(',', $allowUsersRaw))));
+            $meName = method_exists($ui, 'getUserName') ? (string)$ui->getUserName() : '';
+            $meId = method_exists($ui, 'getUserID') ? (int)$ui->getUserID() : 0;
+
+            $ok = false;
+            foreach ($allow as $a) {
+                if ($a === '') continue;
+                if ($meName !== '' && $a === $meName) { $ok = true; break; }
+                if ($meId > 0 && ctype_digit($a) && (int)$a === $meId) { $ok = true; break; }
+            }
+            if (!$ok) return false;
+        }
+
+        if (trim($allowGroupsRaw) !== '') {
+            $groups = array_values(array_filter(array_map('trim', explode(',', $allowGroupsRaw))));
+
+            $ids = method_exists($ui, 'getUserGroups') ? (array)$ui->getUserGroups() : [];
+            $ids = array_map('intval', $ids);
+
+            $ok = false;
+            foreach ($groups as $gName) {
+                if ($gName === '') continue;
+                try {
+                    $group = Group::getByName($gName);
+                    if ($group) {
+                        $gID = (int)$group->getGroupID();
+                        if (in_array($gID, $ids, true)) { $ok = true; break; }
+                    }
+                } catch (\Throwable $e) {
+                    // ignore
+                }
+            }
+            if (!$ok) return false;
+        }
+
+        return true;
+    }
+
+    protected function strFromEnvOrConfig(string $envKey, string $configKey, string $default): string
+    {
+        $v = getenv($envKey);
+        if ($v !== false && trim((string)$v) !== '') {
+            return trim((string)$v);
+        }
+
+        try {
+            $cfg = app('config');
+            $cv = $cfg ? $cfg->get($configKey, null) : null;
+            if (is_string($cv) && trim($cv) !== '') return trim($cv);
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
+        return $default;
+    }
+
+    protected function boolFromEnvOrConfig(string $envKey, string $configKey, bool $default): bool
+    {
+        $v = getenv($envKey);
+        if ($v !== false) {
+            $s = strtolower(trim((string)$v));
+            if ($s === '1' || $s === 'true' || $s === 'yes' || $s === 'on') return true;
+            if ($s === '0' || $s === 'false' || $s === 'no' || $s === 'off' || $s === '') return false;
+        }
+
+        try {
+            $cfg = app('config');
+            $cv = $cfg ? $cfg->get($configKey, null) : null;
+            if (is_bool($cv)) return $cv;
+            if (is_int($cv)) return $cv !== 0;
+            if (is_string($cv)) {
+                $s = strtolower(trim($cv));
+                if ($s === '1' || $s === 'true' || $s === 'yes' || $s === 'on') return true;
+                if ($s === '0' || $s === 'false' || $s === 'no' || $s === 'off' || $s === '') return false;
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
+        return $default;
     }
 
     /** ---------- helpers ---------- */
@@ -832,7 +960,12 @@ class Concretesky extends PageController
 
         if ($r['status'] >= 400) {
             $msg = is_array($r['json']) ? ($r['json']['message'] ?? ($r['json']['error'] ?? json_encode($r['json']))) : $r['text'];
-            throw new \RuntimeException('HTTP ' . $r['status'] . ': ' . $msg);
+            $hint = '';
+            if ($r['status'] === 429) {
+                $ra = $r['headers']['retry-after'] ?? null;
+                if ($ra) $hint = ' (retry-after: ' . $ra . ')';
+            }
+            throw new \RuntimeException('HTTP ' . $r['status'] . ': ' . $msg . $hint);
         }
 
         return $r['json'] ?? ['raw' => $r['text']];
@@ -840,31 +973,21 @@ class Concretesky extends PageController
 
     protected function http($verb, $url, $json = null, array $headers = [])
     {
-        $ch = curl_init($url);
-        curl_setopt_array($ch, [
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_CUSTOMREQUEST  => $verb,
-            CURLOPT_HTTPHEADER     => $headers,
-            CURLOPT_TIMEOUT        => 20,
-        ]);
-        if ($json !== null) {
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($json));
-            $hasCT = false; foreach ($headers as $h) if (stripos($h, 'content-type:') === 0) $hasCT = true;
-            if (!$hasCT) curl_setopt($ch, CURLOPT_HTTPHEADER, array_merge($headers, ['Content-Type: application/json']));
-        }
-        $raw = curl_exec($ch);
-        if ($raw === false) throw new \RuntimeException('cURL error: ' . curl_error($ch));
-        $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        $data = json_decode($raw, true);
-        if ($code >= 400) {
+        // Legacy HTTP helper used by non-OAuth flows.
+        // Use httpRaw so we can capture headers (notably Retry-After for 429s).
+        $r = $this->httpRaw($verb, $url, $json, $headers, 'application/json');
+        if ($r['status'] >= 400) {
             if ($this->debug) {
-                Log::debug('[BSKY http error] ' . $code . ' url=' . $url . ' body=' . $raw);
+                Log::debug('[BSKY http error] ' . $r['status'] . ' url=' . $url . ' body=' . (string)($r['text'] ?? ''));
             }
-            $msg = is_array($data) && isset($data['message']) ? $data['message'] : $raw;
-            throw new \RuntimeException("HTTP {$code}: {$msg}");
+            $msg = is_array($r['json']) ? ($r['json']['message'] ?? ($r['json']['error'] ?? json_encode($r['json']))) : (string)($r['text'] ?? '');
+            $hint = '';
+            if ($r['status'] === 429) {
+                $ra = $r['headers']['retry-after'] ?? null;
+                if ($ra) $hint = ' (retry-after: ' . $ra . ')';
+            }
+            throw new \RuntimeException('HTTP ' . $r['status'] . ': ' . $msg . $hint);
         }
-        return $data ?? ['raw' => $raw];
+        return $r['json'] ?? ['raw' => $r['text']];
     }
 }

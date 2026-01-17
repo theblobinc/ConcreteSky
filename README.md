@@ -101,6 +101,21 @@ Key options:
 
 JWT / automation options are documented in `.env.example`.
 
+## UI access control (optional)
+
+By default, any logged-in Concrete user can open the SPA and call the API.
+
+To restrict access (recommended for production), set one or more of:
+
+- `CONCRETESKY_UI_REQUIRE_SUPERUSER=1` (only super users)
+- `CONCRETESKY_UI_ALLOW_USERS=user1,user2` (Concrete usernames, comma-separated; numeric user IDs also accepted)
+- `CONCRETESKY_UI_ALLOW_GROUPS=Administrators,SomeGroup` (Concrete group names, comma-separated)
+
+Notes:
+
+- The guard is applied consistently to the SPA (`/concretesky`) and the JSON API (`/concretesky/api`).
+- The OAuth callback (`/concretesky/oauth/callback`) remains reachable, but will refuse to complete for users who do not pass the UI guard.
+
 ## Automation / JWT mode
 
 If you enable JWT support (`CONCRETESKY_JWT_ENABLED=1`), callers can send:
@@ -118,6 +133,12 @@ php packages/concretesky/tools/jwt.php --user <concrete_username>
 Optional hardening:
 
 - `CONCRETESKY_JWT_ENFORCE=1` to require JWT for all API calls.
+
+Recommended defaults:
+
+- Keep `CONCRETESKY_JWT_REQUIRE_SUPERUSER=1` (default).
+- Keep `CONCRETESKY_JWT_USERS` small and explicit.
+- Keep `CONCRETESKY_MCP_LOGIN_ENABLED=0` unless you explicitly need it.
 
 Optional (off by default): `mcpLogin` can convert a valid JWT into a Concrete session cookie for browser automation when `CONCRETESKY_MCP_LOGIN_ENABLED=1`.
 

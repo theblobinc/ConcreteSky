@@ -38,6 +38,11 @@ export class BskyNotificationsPanel extends HTMLElement {
         hasMore: () => !!notif.hasMore,
         onExhausted: () => notif.queueOlderFromServer?.(),
         exhaustedCooldownMs: 5000,
+        anchor: {
+          getRoot: () => notif.shadowRoot,
+          itemSelector: '.n[data-k]',
+          keyAttr: 'data-k',
+        },
       });
     } catch {
       // ignore

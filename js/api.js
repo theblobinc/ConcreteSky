@@ -29,6 +29,28 @@ async function fetchJson(url, opts) {
   return { ok: res.ok, status: res.status, body, text, headers: res.headers };
 }
 
+function parseRetryAfterSeconds(retryAfterRaw) {
+  const raw = String(retryAfterRaw || '').trim();
+  if (!raw) return null;
+  // Retry-After can be either delta-seconds or an HTTP date.
+  if (/^\d+$/.test(raw)) {
+    const sec = parseInt(raw, 10);
+    return Number.isFinite(sec) ? Math.max(0, sec) : null;
+  }
+  const t = Date.parse(raw);
+  if (!Number.isFinite(t)) return null;
+  const deltaMs = t - Date.now();
+  if (!Number.isFinite(deltaMs)) return null;
+  return Math.max(0, Math.ceil(deltaMs / 1000));
+}
+
+function enrichError(err, extra = {}) {
+  try {
+    Object.assign(err, extra);
+  } catch {}
+  return err;
+}
+
 function isExpiredToken(errMsg) {
   return /token has expired/i.test(String(errMsg || ''));
 }
@@ -64,7 +86,7 @@ export async function call(method, params = {}) {
 
   // 1st attempt with freshest token we can read
   let csrf = getFreshCsrf();
-  let { ok, status, body, text } = await fetchJson(url, buildReq(csrf));
+  let { ok, status, body, text, headers } = await fetchJson(url, buildReq(csrf));
 
   // Retry once if token expired / 400/401/403
   if ((!ok || body?.error) && (status === 400 || status === 401 || status === 403)) {
@@ -74,7 +96,7 @@ export async function call(method, params = {}) {
       const newCsrf = getFreshCsrf();
       if (newCsrf && newCsrf !== csrf) {
         csrf = newCsrf;
-        ({ ok, status, body, text } = await fetchJson(url, buildReq(csrf)));
+        ({ ok, status, body, text, headers } = await fetchJson(url, buildReq(csrf)));
       }
       if (!ok || body?.error) {
         emitAuthExpired({ status, error: body?.error || msg });
@@ -86,12 +108,31 @@ export async function call(method, params = {}) {
     const errMsg = body?.error || body?.message || text || `HTTP ${status}`;
     console.error('[BSKY > call] HTTP error', { status, url, body: body ?? text });
 
+    if (status === 429) {
+      let ra = null;
+      try {
+        const h = headers?.get?.('retry-after') || headers?.get?.('Retry-After') || null;
+        if (h) ra = String(h);
+      } catch {}
+      const retryAfterSeconds = parseRetryAfterSeconds(ra);
+      const suffix = ra ? ` (retry-after: ${ra})` : '';
+      throw enrichError(new Error(`HTTP 429: Rate limited${suffix}`), {
+        name: 'RateLimitError',
+        status,
+        code: 'RATE_LIMITED',
+        retryAfterRaw: ra,
+        retryAfterSeconds,
+      });
+    }
+
     // If cache endpoints are failing due to missing SQLite support, stop retrying elsewhere.
     if (String(method || '').startsWith('cache')) {
       markCacheUnavailable(errMsg);
     }
 
-    throw new Error(errMsg.startsWith('HTTP ') ? errMsg : `HTTP ${status}: ${errMsg}`);
+    throw enrichError(new Error(errMsg.startsWith('HTTP ') ? errMsg : `HTTP ${status}: ${errMsg}`), {
+      status,
+    });
   }
 
   return body;

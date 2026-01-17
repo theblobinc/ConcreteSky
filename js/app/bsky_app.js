@@ -112,9 +112,18 @@ class BskyApp extends HTMLElement {
     this.shadowRoot.querySelectorAll('[data-bsky-mount]').forEach((el) => {
       const key = el.getAttribute('data-bsky-mount');
       const shouldMount = Array.isArray(activeTabs) && activeTabs.includes(key);
-      const html = shouldMount ? (map[key] || '') : '';
-      // Avoid needless DOM churn.
-      if (el.innerHTML.trim() !== html) el.innerHTML = html;
+
+      // Keep panels alive once mounted.
+      // Hiding/showing a panel should not destroy its web component instance,
+      // otherwise returning to a tab triggers connectedCallback() again and
+      // many panels do a full load/reset (which loses scroll position).
+      if (!shouldMount) return;
+
+      const html = (map[key] || '');
+      if (!html) return;
+
+      const isEmpty = (el.childNodes.length === 0) || (String(el.innerHTML || '').trim() === '');
+      if (isEmpty) el.innerHTML = html;
     });
   }
 

@@ -104,6 +104,39 @@ export function bindInfiniteScroll(scroller, loadMore, opts = {}) {
   let lastRunAt = 0;
   let lastExhaustedAt = 0;
 
+  const anchorOpts = (opts && typeof opts === 'object') ? opts.anchor : null;
+  const anchorEnabled = !!(anchorOpts && anchorOpts.itemSelector && (anchorOpts.root || anchorOpts.getRoot));
+  const anchorKeyAttr = anchorEnabled ? String(anchorOpts.keyAttr || 'data-uri') : null;
+  const anchorItemSelector = anchorEnabled ? String(anchorOpts.itemSelector || '') : null;
+  const anchorGetRoot = anchorEnabled
+    ? ((typeof anchorOpts.getRoot === 'function') ? anchorOpts.getRoot : () => anchorOpts.root)
+    : null;
+  const anchorTracker = anchorEnabled
+    ? createLiveScrollAnchorTracker({
+        scroller,
+        root: (typeof anchorGetRoot === 'function') ? anchorGetRoot() : null,
+        getRoot: anchorGetRoot,
+        itemSelector: anchorItemSelector,
+        keyAttr: anchorKeyAttr,
+      })
+    : null;
+
+  const applyAnchorSoon = (anchor) => {
+    if (!anchorEnabled || !anchor || typeof anchorGetRoot !== 'function') return;
+    queueMicrotask(() => {
+      requestAnimationFrame(() => {
+        try {
+          const r = anchorGetRoot();
+          if (!r) return;
+          applyScrollAnchor({ scroller, root: r, anchor, keyAttr: anchorKeyAttr });
+          setTimeout(() => applyScrollAnchor({ scroller, root: r, anchor, keyAttr: anchorKeyAttr }), 160);
+        } catch {
+          // ignore
+        }
+      });
+    });
+  };
+
   const tick = async () => {
     if (cancelled) return;
     try {
@@ -117,17 +150,20 @@ export function bindInfiniteScroll(scroller, loadMore, opts = {}) {
       if (hasMore()) {
         running = true;
         lastRunAt = now;
+        const anchor = anchorTracker?.getAnchor?.() || null;
         try {
           await loadMore?.();
         } finally {
           running = false;
         }
+        applyAnchorSoon(anchor);
         return;
       }
 
       if (onExhausted && (now - lastExhaustedAt >= exhaustedCooldownMs)) {
         exhaustedRunning = true;
         lastExhaustedAt = now;
+        const anchor = anchorTracker?.getAnchor?.() || null;
         try {
           await onExhausted();
         } finally {
@@ -144,6 +180,8 @@ export function bindInfiniteScroll(scroller, loadMore, opts = {}) {
         } finally {
           running = false;
         }
+
+        applyAnchorSoon(anchor);
       }
     } catch {
       // Ignore errors; the component should surface them.
@@ -157,6 +195,7 @@ export function bindInfiniteScroll(scroller, loadMore, opts = {}) {
   return () => {
     cancelled = true;
     try { unbind?.(); } catch {}
+    try { anchorTracker?.disconnect?.(); } catch {}
   };
 }
 
@@ -190,20 +229,23 @@ export function captureScrollAnchor({ scroller, root, itemSelector, keyAttr } = 
     const attr = String(keyAttr || 'data-uri');
 
     const scRect = scroller.getBoundingClientRect();
+    const scCenter = (scRect.top + scRect.bottom) / 2;
     const items = selector ? Array.from(root.querySelectorAll(selector)) : [];
 
     let best = null;
     let bestRect = null;
-    let bestTop = Infinity;
+    let bestDist = Infinity;
 
     for (const el of items) {
       const r = el.getBoundingClientRect();
       const visible = (r.bottom > scRect.top + 8) && (r.top < scRect.bottom - 8);
       if (!visible) continue;
-      if (r.top < bestTop) {
+      const itemCenter = (r.top + r.bottom) / 2;
+      const dist = Math.abs(itemCenter - scCenter);
+      if (dist < bestDist) {
         best = el;
         bestRect = r;
-        bestTop = r.top;
+        bestDist = dist;
       }
     }
 
@@ -252,6 +294,152 @@ export function applyScrollAnchor({ scroller, root, anchor, keyAttr } = {}) {
     // ignore
   }
   return false;
+}
+
+// Tracks which list entries are currently visible in the scroller and returns
+// the center-most visible entry as an anchor. This is more robust than a
+// one-time snapshot when the list is re-rendered or reflowed multiple times.
+export function createLiveScrollAnchorTracker({ scroller, root, getRoot, itemSelector, keyAttr } = {}) {
+  const selector = String(itemSelector || '');
+  const attr = String(keyAttr || 'data-uri');
+  if (!scroller || !selector || (!root && typeof getRoot !== 'function')) {
+    return {
+      getAnchor: () => null,
+      disconnect: () => {},
+    };
+  }
+
+  // Fallback for older browsers: compute anchors on-demand via a scan.
+  if (typeof IntersectionObserver === 'undefined' || typeof MutationObserver === 'undefined') {
+    const resolveRoot = () => {
+      try {
+        const r = (typeof getRoot === 'function') ? getRoot() : root;
+        return (r && typeof r.querySelectorAll === 'function') ? r : null;
+      } catch {
+        return null;
+      }
+    };
+    return {
+      getAnchor: () => captureScrollAnchor({ scroller, root: resolveRoot(), itemSelector: selector, keyAttr: attr }),
+      disconnect: () => {},
+    };
+  }
+
+  const resolveRoot = () => {
+    try {
+      const r = (typeof getRoot === 'function') ? getRoot() : root;
+      return (r && typeof r.querySelectorAll === 'function') ? r : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const visible = new Set();
+
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (e.isIntersecting) visible.add(e.target);
+      else visible.delete(e.target);
+    }
+  }, {
+    root: scroller,
+    threshold: [0, 0.01, 0.25],
+  });
+
+  const observeAllIn = (node) => {
+    try {
+      if (!node) return;
+      if (node instanceof Element && node.matches?.(selector)) io.observe(node);
+      const q = (node && typeof node.querySelectorAll === 'function') ? node : null;
+      const els = q ? q.querySelectorAll(selector) : [];
+      for (const el of Array.from(els || [])) io.observe(el);
+    } catch {
+      // ignore
+    }
+  };
+
+  const unobserveAllIn = (node) => {
+    try {
+      if (!node) return;
+      if (node instanceof Element && node.matches?.(selector)) {
+        visible.delete(node);
+        io.unobserve(node);
+      }
+      const q = (node && typeof node.querySelectorAll === 'function') ? node : null;
+      const els = q ? q.querySelectorAll(selector) : [];
+      for (const el of Array.from(els || [])) {
+        visible.delete(el);
+        io.unobserve(el);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const mo = new MutationObserver((muts) => {
+    for (const m of muts) {
+      for (const n of Array.from(m.addedNodes || [])) observeAllIn(n);
+      for (const n of Array.from(m.removedNodes || [])) unobserveAllIn(n);
+    }
+  });
+
+  const rootNow = resolveRoot();
+  if (rootNow) {
+    observeAllIn(rootNow);
+    try { mo.observe(rootNow, { childList: true, subtree: true }); } catch {}
+  }
+
+  const getAnchor = () => {
+    try {
+      const r = resolveRoot();
+      if (!r) return null;
+
+      // Prefer the center-most visible element for stability.
+      const scRect = scroller.getBoundingClientRect();
+      const scCenter = (scRect.top + scRect.bottom) / 2;
+
+      let best = null;
+      let bestRect = null;
+      let bestDist = Infinity;
+
+      for (const el of visible) {
+        if (!el || !el.isConnected) continue;
+        const rect = el.getBoundingClientRect();
+        const isVisible = (rect.bottom > scRect.top + 8) && (rect.top < scRect.bottom - 8);
+        if (!isVisible) continue;
+        const itemCenter = (rect.top + rect.bottom) / 2;
+        const dist = Math.abs(itemCenter - scCenter);
+        if (dist < bestDist) {
+          best = el;
+          bestRect = rect;
+          bestDist = dist;
+        }
+      }
+
+      const key = best?.getAttribute?.(attr) || '';
+      if (key && bestRect) {
+        const offsetY = bestRect.top - scRect.top;
+        return {
+          key,
+          offsetY,
+          scrollTop: scroller.scrollTop || 0,
+        };
+      }
+
+      // Fallback: a one-time scan if the observer set is empty or keys are missing.
+      return captureScrollAnchor({ scroller, root: r, itemSelector: selector, keyAttr: attr });
+    } catch {
+      return null;
+    }
+  };
+
+  const disconnect = () => {
+    try { mo.disconnect(); } catch {}
+    try { io.disconnect(); } catch {}
+    try { visible.clear(); } catch {}
+  };
+
+  return { getAnchor, disconnect };
 }
 
 // Coalesces repeated layout work into one rAF tick and preserves scroll position

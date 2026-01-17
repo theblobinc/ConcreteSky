@@ -173,6 +173,10 @@ class BskyMyPosts extends HTMLElement {
     this._autoFillPending = true;
     this._autoFillTries = 0;
 
+    // When true, the next render() will explicitly apply this._scrollTop.
+    // Used for reset/reload flows; regular renders should not touch scrollTop.
+    this._forceScrollTopOnRender = false;
+
     this.total = 0;
 
     this._searchSpec = null;
@@ -187,6 +191,37 @@ class BskyMyPosts extends HTMLElement {
       const mins = Number(e?.detail?.minutes ?? 2);
       this.refreshRecent(mins);
     };
+  }
+
+  _isRateLimitError(e) {
+    return (e && (e.status === 429 || e.code === 'RATE_LIMITED' || e.name === 'RateLimitError'))
+      || /\bHTTP\s*429\b/i.test(String(e?.message || ''));
+  }
+
+  _retryAfterSeconds(e) {
+    const v = e?.retryAfterSeconds;
+    if (Number.isFinite(v) && v >= 0) return v;
+    const msg = String(e?.message || '');
+    const m = msg.match(/retry-after:\s*([^\)\s]+)/i);
+    if (!m) return null;
+    const raw = String(m[1] || '').trim();
+    if (/^\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10));
+    const t = Date.parse(raw);
+    if (!Number.isFinite(t)) return null;
+    return Math.max(0, Math.ceil((t - Date.now()) / 1000));
+  }
+
+  async _backoffIfRateLimited(e, { quiet = false } = {}) {
+    if (!this._isRateLimitError(e)) return false;
+    const sec = this._retryAfterSeconds(e);
+    const waitSec = Number.isFinite(sec) ? Math.min(3600, Math.max(1, sec)) : 10;
+
+    if (!quiet) {
+      this.error = `Rate limited. Waiting ${waitSec}s…`;
+      this.render();
+    }
+    await new Promise((r) => setTimeout(r, waitSec * 1000));
+    return true;
   }
 
   async _fetchSearchResultsFromApi(spec) {
@@ -429,7 +464,8 @@ class BskyMyPosts extends HTMLElement {
 
   _captureScrollAnchor(){
     try {
-      const scroller = resolvePanelScroller(this);
+      const scroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.()
+        || resolvePanelScroller(this);
       if (!scroller) return;
 
       this._scrollAnchor = captureScrollAnchor({
@@ -448,7 +484,8 @@ class BskyMyPosts extends HTMLElement {
     if (!this._restoreScrollNext) return;
 
     try {
-      const scroller = resolvePanelScroller(this);
+      const scroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.()
+        || resolvePanelScroller(this);
       if (!scroller) return;
 
       const a = this._scrollAnchor;
@@ -912,10 +949,15 @@ class BskyMyPosts extends HTMLElement {
       this._backfillDone = false;
       this._restoreScrollNext = false;
       this._scrollTop = 0;
+      this._forceScrollTopOnRender = true;
       this._autoFillPending = true;
       this._autoFillTries = 0;
     } else {
-      this._restoreScrollNext = true;
+      // For paging (append older entries), preserving scrollTop is the most reliable
+      // behavior: new content is added below the viewport, so the user's position
+      // shouldn't change. Masonry/relayout uses its own anchoring in ensureMagicGrid().
+      this._restoreScrollNext = false;
+      this._forceScrollTopOnRender = false;
     }
 
     this.loading = true;
@@ -949,12 +991,21 @@ class BskyMyPosts extends HTMLElement {
       // If cache is empty on first load, do a one-time seed sync.
       if (reset && batch.length === 0) {
         const filter = this.remoteFilterForSelection();
-        await call('cacheSyncMyPosts', {
-          // Seed sync should always use a small recent window.
-          hours: 24,
-          pagesMax: this._pagesMax,
-          filter,
-        });
+        for (;;) {
+          try {
+            await call('cacheSyncMyPosts', {
+              // Seed sync should always use a small recent window.
+              hours: 24,
+              pagesMax: this._pagesMax,
+              filter,
+            });
+            break;
+          } catch (e) {
+            const waited = await this._backoffIfRateLimited(e, { quiet: false });
+            if (waited) continue;
+            throw e;
+          }
+        }
         out = await call('cacheQueryMyPosts', {
           since: this.currentSinceIso(),
           until: this.currentUntilIso(),
@@ -1009,11 +1060,21 @@ class BskyMyPosts extends HTMLElement {
 
     this._backfillInFlight = true;
     try {
-      const res = await call('cacheBackfillMyPosts', {
-        // One author-feed page = 100 posts.
-        pagesMax: 1,
-        filter: this.remoteFilterForSelection(),
-      });
+      let res;
+      for (;;) {
+        try {
+          res = await call('cacheBackfillMyPosts', {
+            // One author-feed page = 100 posts.
+            pagesMax: 1,
+            filter: this.remoteFilterForSelection(),
+          });
+          break;
+        } catch (e) {
+          const waited = await this._backoffIfRateLimited(e, { quiet: true });
+          if (waited) continue;
+          throw e;
+        }
+      }
 
       const done = !!res?.done;
       const inserted = Number(res?.inserted || 0);
@@ -1091,16 +1152,10 @@ class BskyMyPosts extends HTMLElement {
   }
 
   render(){
-    // Preserve scroll position across re-renders.
-    // For paging renders, capture a visible-entry anchor so masonry reflows don't jump the user.
-    if (this._restoreScrollNext) {
-      this._captureScrollAnchor();
-    } else {
-      try {
-        const prevScroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.();
-        if (prevScroller) this._scrollTop = prevScroller.scrollTop || 0;
-      } catch {}
-    }
+    // Preserve scroll position.
+    // - For prepend flows (refreshRecent), capture a visible-entry anchor before mutating the list.
+    // - For reset/reload, we explicitly scroll to this._scrollTop once.
+    if (this._restoreScrollNext && !this._scrollAnchor) this._captureScrollAnchor();
 
     const fromVal = this._toInputValue(this.filters.from);
     const toVal = this._toInputValue(this.filters.to);
@@ -1256,8 +1311,12 @@ class BskyMyPosts extends HTMLElement {
       return groups;
     };
 
-    const renderThreadEntry = (group) => {
+    const renderThreadEntry = (group, batchId) => {
       const key = String(group?.key || '');
+      // Anchor key must be unique across the entire rendered DOM.
+      // A thread root URI can legitimately appear across multiple pages/batches (replies
+      // spread out over time), so include the batch id to avoid duplicate [data-k] values.
+      const anchorKey = `${key}::${String(batchId || '')}`;
       const rootUri = String(group?.rootUri || '');
       const items = Array.isArray(group?.items) ? group.items : [];
 
@@ -1311,7 +1370,7 @@ class BskyMyPosts extends HTMLElement {
       return {
         key,
         html: `
-          <article class="entry thread" data-k="${esc(key)}" data-uri="${esc(rootUri)}" data-cid="${esc(rootCid)}">
+          <article class="entry thread" data-k="${esc(anchorKey)}" data-uri="${esc(rootUri)}" data-cid="${esc(rootCid)}">
             ${rootIt ? renderPostBlock(rootIt, rootOrd, 0) : ''}
             ${childrenHtml}
           </article>
@@ -1339,7 +1398,7 @@ class BskyMyPosts extends HTMLElement {
             }
           })
         : groupsAll;
-      const cards = groups.map((g) => renderThreadEntry(g));
+      const cards = groups.map((g) => renderThreadEntry(g, b.id));
       const entriesHtml = cards.map((c) => c.html).join('');
       const divider = idx > 0 ? `<hr class="batch-hr" aria-hidden="true">` : '';
       return `
@@ -1354,7 +1413,11 @@ class BskyMyPosts extends HTMLElement {
 
     const listHtml = (searchStatus ? `${searchStatus}${batchesHtml}` : batchesHtml) || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No posts.</div>');
 
-    this.shadowRoot.innerHTML = `
+    const ensureStaticDom = () => {
+      const existing = this.shadowRoot.querySelector('bsky-panel-shell');
+      if (existing) return false;
+
+      this.shadowRoot.innerHTML = `
       <style>
         :host, *, *::before, *::after{box-sizing:border-box}
         :host{display:block;margin:0;--bsky-posts-ui-offset:290px}
@@ -1455,18 +1518,11 @@ class BskyMyPosts extends HTMLElement {
         .img-wrap bsky-lazy-img{width:100%}
       </style>
       <bsky-panel-shell title="Posts" dense style="--bsky-panel-ui-offset: var(--bsky-posts-ui-offset)">
-        <div slot="head-right" class="muted">Showing: ${esc(shownCount)} / ${esc(totalCount)}</div>
-        <div slot="toolbar">${filters}</div>
-
-        ${listHtml}
-
-        ${this.error ? `<div class="muted" style="color:#f88">Error: ${esc(this.error)}</div>` : ''}
-
-        <div slot="footer" class="footer">
-          <button id="more" ${this.loading || (this._backfillDone && !this.cursor) ? 'disabled':''}>
-            ${this.cursor ? 'Load more' : (this._backfillDone ? 'No more' : 'Load more')}
-          </button>
-        </div>
+        <div id="head-right" slot="head-right" class="muted"></div>
+        <div id="toolbar" slot="toolbar"></div>
+        <div id="list"></div>
+        <div id="err" class="muted" style="color:#f88" hidden></div>
+        <div slot="footer" class="footer"><button id="more"></button></div>
       </bsky-panel-shell>
 
       <dialog id="range-dlg">
@@ -1474,10 +1530,10 @@ class BskyMyPosts extends HTMLElement {
           <div class="dlg-head"><strong>Date range</strong></div>
           <div class="dlg-body">
             <label>From
-              <input id="dlg-from" type="date" value="${esc(fromDate)}">
+              <input id="dlg-from" type="date" value="">
             </label>
             <label>To
-              <input id="dlg-to" type="date" value="${esc(toDate)}">
+              <input id="dlg-to" type="date" value="">
             </label>
             <div class="muted">Pick a lower/upper timeframe to filter posts.</div>
           </div>
@@ -1490,12 +1546,63 @@ class BskyMyPosts extends HTMLElement {
       </dialog>
     `;
 
-    // After re-render + relayout, lock the user's view to the same top-most visible entry.
-    // We do this *after* column balancing so the anchor survives DOM reparenting.
+      return true;
+    };
+
+    const created = ensureStaticDom();
+
+    // Update dynamic regions without recreating the scroller.
+    try {
+      const headRightEl = this.shadowRoot.getElementById('head-right');
+      if (headRightEl) headRightEl.textContent = `Showing: ${shownCount} / ${totalCount}`;
+
+      const toolbarEl = this.shadowRoot.getElementById('toolbar');
+      if (toolbarEl) toolbarEl.innerHTML = filters;
+
+      const listEl = this.shadowRoot.getElementById('list');
+      if (listEl) listEl.innerHTML = listHtml;
+
+      const errEl = this.shadowRoot.getElementById('err');
+      if (errEl) {
+        if (this.error) {
+          errEl.hidden = false;
+          errEl.textContent = `Error: ${String(this.error || '')}`;
+        } else {
+          errEl.hidden = true;
+          errEl.textContent = '';
+        }
+      }
+
+      const moreBtn = this.shadowRoot.getElementById('more');
+      if (moreBtn) {
+        moreBtn.disabled = !!(this.loading || (this._backfillDone && !this.cursor));
+        moreBtn.textContent = this.cursor ? 'Load more' : (this._backfillDone ? 'No more' : 'Load more');
+      }
+
+      const dlgFrom = this.shadowRoot.getElementById('dlg-from');
+      const dlgTo = this.shadowRoot.getElementById('dlg-to');
+      if (dlgFrom) dlgFrom.value = String(fromDate || '');
+      if (dlgTo) dlgTo.value = String(toDate || '');
+    } catch {
+      // ignore
+    }
+
+    // Restore viewport anchoring only for prepend flows.
+    // For normal paging (append older entries), we intentionally do not touch scrollTop.
     queueMicrotask(() => {
       requestAnimationFrame(() => {
-        this._applyScrollAnchor();
-        setTimeout(() => this._applyScrollAnchor(), 160);
+        const scroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.();
+        if (!scroller) return;
+
+        if (this._restoreScrollNext) {
+          this._applyScrollAnchor();
+          setTimeout(() => this._applyScrollAnchor(), 160);
+          return;
+        }
+
+        const force = !!this._forceScrollTopOnRender;
+        this._forceScrollTopOnRender = false;
+        if (force || created) scroller.scrollTop = Math.max(0, Number(this._scrollTop || 0) || 0);
       });
     });
 
@@ -1511,6 +1618,8 @@ class BskyMyPosts extends HTMLElement {
         hasMore: () => !!this.cursor,
         onExhausted: () => this.queueOlderFromServer(),
         exhaustedCooldownMs: 5000,
+        // No anchoring for append-older paging. If we keep the scroller alive and
+        // only add content below the viewport, scroll position should not change.
         // We do a smarter "fill viewport" loop ourselves.
         initialTick: false,
       });

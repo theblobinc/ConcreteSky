@@ -6,24 +6,26 @@ This file is largely a historical planning doc. Most of the Phase 0/1 items here
 
 Current actionable work is tracked in the top-level package TODO: `packages/concretesky/TODO.md`.
 
+If you're looking for what to do next (security/access control, UX/config, notifications UX, etc), use `packages/concretesky/TODO.md`.
+
 ## Goals
 - Make the SPA a useful “local analyst’s console” for Bluesky data (followers, following, posts, notifications).
 - Add a local SQLite cache so the SPA can sort/filter/search without re-fetching everything.
 - Track changes over time (adds/removals, mutuals, suspicious patterns) to support AI workflows.
 
 ## Phase 0 — UI improvements (no DB yet)
-- [ ] Replace two-column layout with tabs:
+- [x] Replace two-column layout with tabs/panels:
   - [x] My Posts
   - [x] Notifications
-  - [ ] Followers
-  - [ ] Following
-  - [ ] Search
-- [ ] Persist selected tab (URL hash + localStorage)
-- [ ] Add a “People” table-style list UI:
-  - [ ] Sort by: name/handle, followersCount, followsCount, postsCount, account age (createdAt when available)
-  - [ ] Filter: show only mutuals / only not-mutuals
-  - [ ] Quick search (client-side) across handle/displayName/description (supports emoji)
-- [ ] Improve loading/error states across components
+  - [x] Followers
+  - [x] Following
+  - [x] Search (superseded by in-panel filtering + Connections UI)
+- [x] Persist selected tab (URL hash + localStorage)
+- [x] Add a “People” table-style list UI (followers/following + Connections):
+  - [x] Sort by: name/handle, followersCount, followsCount, postsCount, account age (createdAt when available)
+  - [x] Filter: show only mutuals / only not-mutuals
+  - [x] Quick search (client-side) across handle/displayName/description (supports emoji)
+- [x] Improve loading/error states across components
 - [ ] Add a compact themeable style system (CSS vars)
 
 ## Phase 1 — SQLite cache (server-side)
@@ -42,28 +44,34 @@ You can override the subdir name via env var `BSKY_STORAGE_SUBDIR`.
 - `notifications(id TEXT PRIMARY KEY, indexed_at TEXT, reason TEXT, author_did TEXT, reason_subject TEXT, raw_json TEXT)`
 - (optional) `posts(uri TEXT PRIMARY KEY, author_did TEXT, created_at TEXT, text TEXT, raw_json TEXT)`
 
+Status: Implemented (schema is now source-of-truth in the migrations).
+
 ### Full‑text search
 - Prefer SQLite FTS5 when available:
   - `profiles_fts` over `handle`, `display_name`, `description`
   - Keep in sync with `profiles` (triggers or application-side upserts)
 
+Status: Optional FTS is implemented for posts with fallback behavior when unavailable; profiles FTS is optional/future.
+
 ### Sync behavior
-- [ ] “Refresh” triggers server sync:
+- [x] “Refresh” triggers server sync:
   - Fetch my profile → determine `me_did`
   - Fetch followers/follows (paginated)
   - Upsert all profiles encountered
   - Save follower/follow edges for a new snapshot timestamp
   - Fetch notifications window (e.g., 7–30 days) and upsert
-- [ ] Compute diffs vs prior snapshot:
+- [x] Compute diffs vs prior snapshot:
   - Added followers / removed followers
   - Added mutuals / removed mutuals
   - Show counts + list top changes
 
 ### API endpoints (proposal)
 Add new methods to the existing JSON POST controller:
-- `cacheSync` → runs sync and returns summary counts
-- `cacheQueryPeople` → filtered/sorted paginated people list from SQLite
-- `cacheFriendDiff` → returns added/removed follower/follow/mutuals since last snapshot
+- [x] `cacheSync` → runs sync and returns summary counts
+- [x] `cacheQueryPeople` → filtered/sorted paginated people list from SQLite
+- [x] `cacheFriendDiff` → returns added/removed follower/follow/mutuals since last snapshot
+
+Additional endpoints now exist as well (posts/notifications query, exports, maintenance, etc); see the package API controller.
 
 ## Phase 2 — Suspicious-account signals (for AI)
 - [ ] Feature engineering ideas:
@@ -73,11 +81,11 @@ Add new methods to the existing JSON POST controller:
   - Sudden follower spikes (snapshot deltas)
   - Text similarity / emoji-heavy bios (queryable via FTS)
 - [ ] Export datasets:
-  - CSV/JSON export endpoints
+  - [x] CSV/JSON export endpoints
   - “Top N suspicious” views
 
 ## Security & ops
-- [ ] Remove hardcoded defaults for credentials (use env vars only)
+- [x] Remove hardcoded defaults for credentials (superseded: OAuth is the default; legacy app-password path is optional/legacy)
 - [ ] Rate-limit and/or throttle sync calls to avoid Bluesky rate limits
 - [ ] Access control: restrict SPA to admin/whitelisted users
-- [ ] Avoid storing sensitive tokens in SQLite; store only derived public data
+- [x] Avoid storing sensitive tokens in SQLite; store only derived public data

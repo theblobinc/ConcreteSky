@@ -69,9 +69,21 @@ class BskyDbManager extends HTMLElement {
       postsFilter: null,
       notificationsHours: 24 * 90,
       notificationsPagesMax: 60,
+      postsStaleHours: 24 * 7,
+      notifsStaleHours: 24 * 7,
     };
 
     this._profile = null; // { did, handle, displayName, createdAt }
+
+    this._maint = {
+      keepDaysPosts: 365,
+      keepDaysNotifs: 365,
+      lastResult: null,
+      lastError: null,
+      inspect: null,
+      inspectError: null,
+      inspectLoading: false,
+    };
 
     this._cal = {
       open: false,
@@ -107,6 +119,8 @@ class BskyDbManager extends HTMLElement {
         if (typeof cfg.postsFilter !== 'undefined') this._cfg.postsFilter = (cfg.postsFilter ? String(cfg.postsFilter) : null);
         if (typeof cfg.notificationsHours !== 'undefined') this._cfg.notificationsHours = clampInt(cfg.notificationsHours, 1, 24 * 365 * 30, this._cfg.notificationsHours);
         if (typeof cfg.notificationsPagesMax !== 'undefined') this._cfg.notificationsPagesMax = clampInt(cfg.notificationsPagesMax, 1, 60, this._cfg.notificationsPagesMax);
+        if (typeof cfg.postsStaleHours !== 'undefined') this._cfg.postsStaleHours = clampInt(cfg.postsStaleHours, 1, 24 * 365 * 30, this._cfg.postsStaleHours);
+        if (typeof cfg.notifsStaleHours !== 'undefined') this._cfg.notifsStaleHours = clampInt(cfg.notifsStaleHours, 1, 24 * 365 * 30, this._cfg.notifsStaleHours);
       }
 
       const cal = p.cal && typeof p.cal === 'object' ? p.cal : null;
@@ -140,6 +154,8 @@ class BskyDbManager extends HTMLElement {
               postsFilter: this._cfg.postsFilter || null,
               notificationsHours: this._cfg.notificationsHours,
               notificationsPagesMax: this._cfg.notificationsPagesMax,
+              postsStaleHours: this._cfg.postsStaleHours,
+              notifsStaleHours: this._cfg.notifsStaleHours,
             },
             cal: {
               month: this._cal.month || null,
@@ -524,6 +540,43 @@ class BskyDbManager extends HTMLElement {
     this.render();
   }
 
+  isRateLimitError(e) {
+    return (e && (e.status === 429 || e.code === 'RATE_LIMITED' || e.name === 'RateLimitError'))
+      || /\bHTTP\s*429\b/i.test(String(e?.message || ''));
+  }
+
+  getRetryAfterSeconds(e) {
+    const v = e?.retryAfterSeconds;
+    if (Number.isFinite(v) && v >= 0) return v;
+    const msg = String(e?.message || '');
+    const m = msg.match(/retry-after:\s*([^\)\s]+)/i);
+    if (!m) return null;
+    const raw = String(m[1] || '').trim();
+    if (/^\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10));
+    const t = Date.parse(raw);
+    if (!Number.isFinite(t)) return null;
+    return Math.max(0, Math.ceil((t - Date.now()) / 1000));
+  }
+
+  async backoffForRateLimit(e, label) {
+    if (!this.isRateLimitError(e)) return false;
+    const sec = this.getRetryAfterSeconds(e);
+    const waitSec = Number.isFinite(sec) ? Math.min(3600, Math.max(1, sec)) : 10;
+
+    this.log(`Rate limited. Backing off ${waitSec}s…`, 'info');
+    const endAt = Date.now() + (waitSec * 1000);
+    while (!this._cancelRequested) {
+      const remaining = Math.max(0, Math.ceil((endAt - Date.now()) / 1000));
+      this.setOp({
+        ...this._op,
+        phase: `${label}: rate limited; waiting ${remaining}s`,
+      });
+      if (remaining <= 0) break;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    return true;
+  }
+
   earliestSelectedIso() {
     const all = Array.from(this._cal.selected.values());
     if (!all.length) return null;
@@ -549,13 +602,20 @@ class BskyDbManager extends HTMLElement {
       let loops = 0;
       while (loops < 250) {
         if (this._cancelRequested) break;
+        let out;
+        try {
+          out = await call('cacheBackfillMyPosts', {
+            pagesMax: this._cfg.postsPagesMax,
+            filter: this._cfg.postsFilter || null,
+            reset: false,
+            stopBefore,
+          });
+        } catch (e) {
+          const waited = await this.backoffForRateLimit(e, `Posts → ${earliest}`);
+          if (waited) continue;
+          throw e;
+        }
         loops++;
-        const out = await call('cacheBackfillMyPosts', {
-          pagesMax: this._cfg.postsPagesMax,
-          filter: this._cfg.postsFilter || null,
-          reset: false,
-          stopBefore,
-        });
         const inserted = out?.inserted ?? 0;
         const updated = out?.updated ?? 0;
         const done = !!out?.done;
@@ -595,13 +655,20 @@ class BskyDbManager extends HTMLElement {
       let loops = 0;
       while (loops < 250) {
         if (this._cancelRequested) break;
+        let out;
+        try {
+          out = await call('cacheBackfillMyPosts', {
+            pagesMax: this._cfg.postsPagesMax,
+            filter: this._cfg.postsFilter || null,
+            reset: loops === 0,
+            stopBefore,
+          });
+        } catch (e) {
+          const waited = await this.backoffForRateLimit(e, `Refresh posts → ${earliest}`);
+          if (waited) continue;
+          throw e;
+        }
         loops++;
-        const out = await call('cacheBackfillMyPosts', {
-          pagesMax: this._cfg.postsPagesMax,
-          filter: this._cfg.postsFilter || null,
-          reset: loops === 1,
-          stopBefore,
-        });
         const inserted = out?.inserted ?? 0;
         const updated = out?.updated ?? 0;
         const stoppedEarly = !!out?.stoppedEarly;
@@ -645,21 +712,42 @@ class BskyDbManager extends HTMLElement {
       let loops = 0;
       while (loops < 250) {
         if (this._cancelRequested) break;
+        let out;
+        try {
+          out = await call('cacheBackfillNotifications', {
+            hours,
+            pagesMax: this._cfg.notificationsPagesMax,
+            reset: loops === 0,
+            stopBefore,
+          });
+        } catch (e) {
+          const waited = await this.backoffForRateLimit(e, `Notifications → ${earliest}`);
+          if (waited) continue;
+          throw e;
+        }
         loops++;
-        const out = await call('cacheBackfillNotifications', {
-          hours,
-          pagesMax: this._cfg.notificationsPagesMax,
-          reset: loops === 1,
-          stopBefore,
-        });
         const cursor = out?.cursor;
-        this.setOp({ ...this._op, loops });
-        const stoppedEarly = !!out?.result?.stoppedEarly;
-        this.log(`Notifications → ${earliest}: pagesMax ${this._cfg.notificationsPagesMax}${stoppedEarly ? ' REACHED' : ''}${cursor ? ' (more…) ' : ' DONE'}`, (stoppedEarly || !cursor) ? 'ok' : 'info');
+        const r = out?.result || {};
+        const inserted = r?.inserted ?? 0;
+        const updated = r?.updated ?? 0;
+        const skipped = r?.skipped ?? 0;
+        const pages = r?.pages ?? '?';
+        const stoppedEarly = !!r?.stoppedEarly;
+        const done = !!r?.done || !cursor;
+        const cutoffIso = r?.cutoffIso;
+        const retentionLimited = !!r?.retentionLimited;
+        const oldestSeenIso = r?.oldestSeenIso;
+        this.setOp({
+          ...this._op,
+          loops,
+          inserted: (this._op.inserted || 0) + inserted,
+          updated: (this._op.updated || 0) + updated,
+        });
+        this.log(`Notifications → ${earliest}: +${inserted} / ~${updated} / skip ${skipped} (pages ${pages})${cutoffIso ? ` cutoff ${cutoffIso}` : ''}${retentionLimited ? ` RETENTION? (oldest ${oldestSeenIso || '?'})` : ''}${stoppedEarly ? ' REACHED' : ''}${done ? ' DONE' : ''}`, (stoppedEarly || done) ? 'ok' : 'info');
         this.queueStatusRefresh();
         if (this._cal.month) this._cal.cache.delete(this._cal.month);
         this.loadCalendarMonth(this._cal.month);
-        if (stoppedEarly || !cursor) break;
+        if (stoppedEarly || done) break;
         await new Promise((r) => setTimeout(r, 250));
       }
       if (this._cancelRequested) this.log('Notifications range backfill cancelled.', 'info');
@@ -748,12 +836,19 @@ class BskyDbManager extends HTMLElement {
       let loops = 0;
       while (loops < loopsMax) {
         if (this._cancelRequested) break;
+        let out;
+        try {
+          out = await call('cacheBackfillMyPosts', {
+            pagesMax: this._cfg.postsPagesMax,
+            filter: this._cfg.postsFilter || null,
+            reset: !!reset,
+          });
+        } catch (e) {
+          const waited = await this.backoffForRateLimit(e, 'Posts');
+          if (waited) continue;
+          throw e;
+        }
         loops++;
-        const out = await call('cacheBackfillMyPosts', {
-          pagesMax: this._cfg.postsPagesMax,
-          filter: this._cfg.postsFilter || null,
-          reset: !!reset,
-        });
         reset = false;
         const inserted = out?.inserted ?? 0;
         const updated = out?.updated ?? 0;
@@ -812,21 +907,40 @@ class BskyDbManager extends HTMLElement {
       let loops = 0;
       while (loops < loopsMax) {
         if (this._cancelRequested) break;
+        let out;
+        try {
+          out = await call('cacheBackfillNotifications', {
+            hours: this._cfg.notificationsHours,
+            pagesMax: this._cfg.notificationsPagesMax,
+            reset: !!reset,
+          });
+        } catch (e) {
+          const waited = await this.backoffForRateLimit(e, 'Notifications');
+          if (waited) continue;
+          throw e;
+        }
         loops++;
-        const out = await call('cacheBackfillNotifications', {
-          hours: this._cfg.notificationsHours,
-          pagesMax: this._cfg.notificationsPagesMax,
-          reset: !!reset,
-        });
         reset = false;
         const cursor = out?.cursor;
+        const r = out?.result || {};
+        const inserted = r?.inserted ?? 0;
+        const updated = r?.updated ?? 0;
+        const skipped = r?.skipped ?? 0;
+        const pages = r?.pages ?? '?';
+        const stoppedEarly = !!r?.stoppedEarly;
+        const done = !!r?.done || !cursor;
+      const cutoffIso = r?.cutoffIso;
+      const retentionLimited = !!r?.retentionLimited;
+      const oldestSeenIso = r?.oldestSeenIso;
 			this.setOp({
 				...this._op,
 				loops,
+				inserted: (this._op.inserted || 0) + inserted,
+				updated: (this._op.updated || 0) + updated,
 			});
-        this.log(`Notifications backfill: pagesMax ${this._cfg.notificationsPagesMax}${cursor ? ' (more…)' : ' DONE'}`, cursor ? 'info' : 'ok');
+        this.log(`Notifications backfill: +${inserted} / ~${updated} / skip ${skipped} (pages ${pages})${cutoffIso ? ` cutoff ${cutoffIso}` : ''}${retentionLimited ? ` RETENTION? (oldest ${oldestSeenIso || '?'})` : ''}${stoppedEarly ? ' REACHED' : ''}${done ? ' DONE' : ''}`, (stoppedEarly || done) ? 'ok' : 'info');
         await this.refreshStatus();
-        if (!cursor) break;
+        if (stoppedEarly || done) break;
         await new Promise((r) => setTimeout(r, 250));
       }
 			if (this._cancelRequested) this.log('Notifications backfill cancelled.', 'info');
@@ -874,8 +988,115 @@ class BskyDbManager extends HTMLElement {
 		if (id === 'postsFilter') this._cfg.postsFilter = (String(e.target.value || '') || null);
 		if (id === 'notificationsHours') this._cfg.notificationsHours = clampInt(e.target.value, 1, 24 * 365 * 30, 24 * 90);
     if (id === 'notificationsPagesMax') this._cfg.notificationsPagesMax = clampInt(e.target.value, 1, 60, 60);
+    if (id === 'postsStaleHours') this._cfg.postsStaleHours = clampInt(e.target.value, 1, 24 * 365 * 30, 24 * 7);
+    if (id === 'notifsStaleHours') this._cfg.notifsStaleHours = clampInt(e.target.value, 1, 24 * 365 * 30, 24 * 7);
+
+    if (id === 'keepDaysPosts') this._maint.keepDaysPosts = clampInt(e.target.value, 1, 3650, this._maint.keepDaysPosts);
+    if (id === 'keepDaysNotifs') this._maint.keepDaysNotifs = clampInt(e.target.value, 1, 3650, this._maint.keepDaysNotifs);
+
     this.savePrefsDebounced();
     this.render();
+  }
+
+  downloadText(filename, text, mime = 'text/plain') {
+    try {
+      const blob = new Blob([String(text ?? '')], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 5000);
+    } catch (e) {
+      this.log(`Download failed: ${e?.message || e}`, 'error');
+    }
+  }
+
+  downloadJson(filename, obj) {
+    const txt = JSON.stringify(obj, null, 2);
+    this.downloadText(filename, txt, 'application/json');
+  }
+
+  async runDbInspect() {
+    if (this._busy) return;
+    this._maint.inspectLoading = true;
+    this._maint.inspectError = null;
+    this.render();
+    try {
+      const res = await call('cacheDbInspect', {});
+      this._maint.inspect = res;
+      this._maint.inspectError = null;
+      this.log('DB inspect: loaded.', 'ok');
+    } catch (e) {
+      this._maint.inspect = null;
+      this._maint.inspectError = e?.message || String(e);
+      this.log(`DB inspect failed: ${this._maint.inspectError}`, 'error');
+    } finally {
+      this._maint.inspectLoading = false;
+      this.render();
+    }
+  }
+
+  async runDbVacuum() {
+    if (this._busy) return;
+    this.setBusy(true);
+    this._cancelRequested = false;
+    this.setOp({ name: 'Maintenance', phase: 'VACUUM', steps: 0, step: 0, loopsMax: 0, loops: 0, inserted: 0, updated: 0, startedAt: Date.now() });
+    try {
+      const res = await call('cacheVacuum', {});
+      this._maint.lastResult = res;
+      this._maint.lastError = null;
+      this.log(`VACUUM complete (${res?.vacuumedAt || 'ok'}).`, 'ok');
+      await this.runDbInspect();
+    } catch (e) {
+      this._maint.lastError = e?.message || String(e);
+      this.log(`VACUUM failed: ${this._maint.lastError}`, 'error');
+    } finally {
+      this.setBusy(false);
+      this.clearOp();
+    }
+  }
+
+  async runDbPrune() {
+    if (this._busy) return;
+    this.setBusy(true);
+    this._cancelRequested = false;
+    this.setOp({ name: 'Maintenance', phase: 'Prune', steps: 0, step: 0, loopsMax: 0, loops: 0, inserted: 0, updated: 0, startedAt: Date.now() });
+    try {
+      const res = await call('cachePrune', { keepDaysPosts: this._maint.keepDaysPosts, keepDaysNotifs: this._maint.keepDaysNotifs });
+      this._maint.lastResult = res;
+      this._maint.lastError = null;
+      this.log(`Prune: posts -${res?.deleted?.posts ?? '?'} notifs -${res?.deleted?.notifications ?? '?'} (oauth_states -${res?.deleted?.oauth_states ?? '?'})`, 'ok');
+      this.queueStatusRefresh();
+      // Refresh current month view so rings update.
+      if (this._cal.month) this._cal.cache.delete(this._cal.month);
+      this.loadCalendarMonth(this._cal.month);
+      await this.runDbInspect();
+    } catch (e) {
+      this._maint.lastError = e?.message || String(e);
+      this.log(`Prune failed: ${this._maint.lastError}`, 'error');
+    } finally {
+      this.setBusy(false);
+      this.clearOp();
+    }
+  }
+
+  async exportKind(kind) {
+    if (this._busy) return;
+    this.setBusy(true);
+    this._cancelRequested = false;
+    this.setOp({ name: 'Export', phase: kind, steps: 0, step: 0, loopsMax: 0, loops: 0, inserted: 0, updated: 0, startedAt: Date.now() });
+    try {
+      const res = await call('cacheExport', { kind, format: 'json', limit: 5000, offset: 0 });
+      const ts = new Date().toISOString().replace(/[:.]/g, '-');
+      this.downloadJson(`concretesky-${kind}-${ts}.json`, res);
+      this.log(`Exported ${kind} (limit ${res?.limit ?? '?'})`, 'ok');
+    } catch (e) {
+      this.log(`Export failed: ${e?.message || e}`, 'error');
+    } finally {
+      this.setBusy(false);
+      this.clearOp();
+    }
   }
 
   onClick(e) {
@@ -911,6 +1132,14 @@ class BskyDbManager extends HTMLElement {
     if (act === 'cal-refresh-posts') { this.refreshPostsSelection(); return; }
     if (act === 'cal-sync-notifs') { this.syncNotificationsToSelection(); return; }
     if (act === 'cal-refresh-notifs') { this.refreshNotificationsSelection(); return; }
+
+    if (act === 'db-inspect') { this.runDbInspect(); return; }
+    if (act === 'db-vacuum') { this.runDbVacuum(); return; }
+    if (act === 'db-prune') { this.runDbPrune(); return; }
+    if (act === 'export-posts') { this.exportKind('posts'); return; }
+    if (act === 'export-notifications') { this.exportKind('notifications'); return; }
+    if (act === 'export-followers') { this.exportKind('followers'); return; }
+    if (act === 'export-following') { this.exportKind('following'); return; }
 
     if (act === 'cal-mode') {
       const m = e.target?.getAttribute?.('data-mode') || e.target?.closest?.('[data-mode]')?.getAttribute?.('data-mode');
@@ -976,6 +1205,8 @@ class BskyDbManager extends HTMLElement {
     const lastNotifsSyncAt = ok ? (d.lastNotificationsSyncAt || null) : null;
     const lastPostsSyncTs = lastPostsSyncAt ? Date.parse(String(lastPostsSyncAt)) : NaN;
     const lastNotifsSyncTs = lastNotifsSyncAt ? Date.parse(String(lastNotifsSyncAt)) : NaN;
+    const postsStale = !Number.isFinite(lastPostsSyncTs) ? true : ((Date.now() - lastPostsSyncTs) > (this._cfg.postsStaleHours * 3600000));
+    const notifsStale = !Number.isFinite(lastNotifsSyncTs) ? true : ((Date.now() - lastNotifsSyncTs) > (this._cfg.notifsStaleHours * 3600000));
     const postsSyncAge = lastPostsSyncAt ? this.formatAge(lastPostsSyncAt) : '—';
     const notifsSyncAge = lastNotifsSyncAt ? this.formatAge(lastNotifsSyncAt) : '—';
 
@@ -989,6 +1220,69 @@ class BskyDbManager extends HTMLElement {
     const earliestSelHours = (earliestSelTs && Number.isFinite(earliestSelTs)) ? Math.ceil((Date.now() - earliestSelTs) / 3600000) : null;
     const notifsRangeDays = (earliestSelHours !== null) ? Math.floor(earliestSelHours / 24) : null;
     const notifsBeyond90 = (notifsRangeDays !== null) ? (notifsRangeDays > 90) : false;
+
+    const backfillStatusHtml = (() => {
+      const bf = ok ? (d?.backfill || null) : null;
+      if (!bf) return '';
+
+      const n = bf.notifications || null;
+      const p = bf.posts || null;
+
+      const fmtIso = (iso) => {
+        const s = String(iso || '').trim();
+        return s ? s : '—';
+      };
+
+      const coversTarget = (oldestIso, targetIso) => {
+        const o = this.parseIso(oldestIso);
+        const t = this.parseIso(targetIso);
+        if (!o || !t) return null;
+        return o <= t;
+      };
+
+      const targetEarliest = earliestSel ? (earliestSel + 'T00:00:00Z') : null;
+
+      const lines = [];
+      if (n) {
+        const cursor = String(n.cursor || '').trim();
+        const done = !!n.done;
+        const lastStop = String(n.lastStopBefore || '').trim();
+        const oldestCached = String(n.oldestCachedIso || '').trim();
+        const retentionHint = !!n.retentionHint || !!n.lastRetentionLimited;
+
+        const cov = targetEarliest ? coversTarget(oldestCached, targetEarliest) : null;
+        const covTxt = (cov === null) ? '' : (cov ? 'covers earliest selection' : 'does NOT reach earliest selection');
+
+        lines.push([
+          'Notifs backfill:',
+          done ? 'DONE' : (cursor ? 'more…' : 'unknown'),
+          lastStop ? `target ${fmtIso(lastStop)}` : null,
+          oldestCached ? `oldest cached ${fmtIso(oldestCached)}` : null,
+          retentionHint ? 'RETENTION?' : null,
+          covTxt || null,
+        ].filter(Boolean).join(' • '));
+      }
+
+      if (p) {
+        const cursor = String(p.cursor || '').trim();
+        const done = !!p.done;
+        const lastStop = String(p.lastStopBefore || '').trim();
+        const oldestCached = String(p.oldestCachedIso || '').trim();
+        const cov = targetEarliest ? coversTarget(oldestCached, targetEarliest) : null;
+        const covTxt = (cov === null) ? '' : (cov ? 'covers earliest selection' : 'does NOT reach earliest selection');
+
+        lines.push([
+          'Posts backfill:',
+          done ? 'DONE' : (cursor ? 'more…' : 'unknown'),
+          lastStop ? `target ${fmtIso(lastStop)}` : null,
+          oldestCached ? `oldest cached ${fmtIso(oldestCached)}` : null,
+          covTxt || null,
+        ].filter(Boolean).join(' • '));
+      }
+
+      if (!lines.length) return '';
+      return `<div class="muted" style="margin-top:6px">${lines.map(esc).join('<br>')}</div>`;
+    })();
 
     let calGridHtml = '<div class="muted">Pick a month…</div>';
     if (calBounds) {
@@ -1018,8 +1312,8 @@ class BskyDbManager extends HTMLElement {
         const pu = postsUpdatedAt?.[iso] ? Date.parse(String(postsUpdatedAt[iso])) : NaN;
         const nu = notifUpdatedAt?.[iso] ? Date.parse(String(notifUpdatedAt[iso])) : NaN;
 
-        const needsPostsUpdate = disabled ? false : (!hasPosts ? true : (!Number.isFinite(lastPostsSyncTs) ? true : (Number.isFinite(pu) && pu > lastPostsSyncTs)));
-        const needsNotifsUpdate = disabled ? false : (!hasNotifs ? true : (!Number.isFinite(lastNotifsSyncTs) ? true : (Number.isFinite(nu) && nu > lastNotifsSyncTs)));
+        const needsPostsUpdate = disabled ? false : (!hasPosts ? true : (postsStale ? true : (Number.isFinite(pu) && pu > lastPostsSyncTs)));
+        const needsNotifsUpdate = disabled ? false : (!hasNotifs ? true : (notifsStale ? true : (Number.isFinite(nu) && nu > lastNotifsSyncTs)));
 
         // Ring color heuristic:
         // - pre-join/future: grey
@@ -1334,6 +1628,8 @@ class BskyDbManager extends HTMLElement {
         </label>
           <label>Notifs hours <input id="notificationsHours" type="number" min="1" max="${24 * 365 * 30}" value="${esc(this._cfg.notificationsHours)}" ${this._busy ? 'disabled' : ''}></label>
           <label>Notifs pagesMax <input id="notificationsPagesMax" type="number" min="1" max="60" value="${esc(this._cfg.notificationsPagesMax)}" ${this._busy ? 'disabled' : ''}></label>
+          <label>Posts stale hours <input id="postsStaleHours" type="number" min="1" max="${24 * 365 * 30}" value="${esc(this._cfg.postsStaleHours)}" ${this._busy ? 'disabled' : ''}></label>
+          <label>Notifs stale hours <input id="notifsStaleHours" type="number" min="1" max="${24 * 365 * 30}" value="${esc(this._cfg.notifsStaleHours)}" ${this._busy ? 'disabled' : ''}></label>
         </div>
 
         <div class="row">
@@ -1344,6 +1640,102 @@ class BskyDbManager extends HTMLElement {
           <button class="btn" type="button" data-action="backfill-posts-reset" ${this._busy ? 'disabled' : ''}>Reset + backfill posts</button>
           <button class="btn" type="button" data-action="backfill-notifs" ${this._busy ? 'disabled' : ''}>Backfill notifications</button>
           <button class="btn" type="button" data-action="backfill-notifs-reset" ${this._busy ? 'disabled' : ''}>Reset + backfill notifs</button>
+        </div>
+
+        ${backfillStatusHtml}
+
+        <div class="card" style="margin-top:10px">
+          <div class="row" style="margin-bottom:8px">
+            <div class="title">Maintenance</div>
+            <div class="muted">Admin-only: inspect, prune, vacuum, export</div>
+            <span style="flex:1"></span>
+            <button class="btn" type="button" data-action="db-inspect" ${this._maint.inspectLoading ? 'disabled' : ''}>${this._maint.inspectLoading ? 'Inspecting…' : 'Inspect DB'}</button>
+            <button class="btn" type="button" data-action="db-prune" ${this._busy ? 'disabled' : ''}>Prune</button>
+            <button class="btn" type="button" data-action="db-vacuum" ${this._busy ? 'disabled' : ''}>VACUUM</button>
+          </div>
+
+          <div class="row" style="margin-bottom:8px">
+            <label>Keep posts days <input id="keepDaysPosts" type="number" min="1" max="3650" value="${esc(this._maint.keepDaysPosts)}" ${this._busy ? 'disabled' : ''}></label>
+            <label>Keep notifs days <input id="keepDaysNotifs" type="number" min="1" max="3650" value="${esc(this._maint.keepDaysNotifs)}" ${this._busy ? 'disabled' : ''}></label>
+            <span style="flex:1"></span>
+            <button class="btn" type="button" data-action="export-posts" ${this._busy ? 'disabled' : ''}>Export posts (JSON)</button>
+            <button class="btn" type="button" data-action="export-notifications" ${this._busy ? 'disabled' : ''}>Export notifications (JSON)</button>
+            <button class="btn" type="button" data-action="export-followers" ${this._busy ? 'disabled' : ''}>Export followers (JSON)</button>
+            <button class="btn" type="button" data-action="export-following" ${this._busy ? 'disabled' : ''}>Export following (JSON)</button>
+          </div>
+
+          ${this._maint.inspectError ? `<div class="muted" style="color:#ff9a9a">Inspect error: ${esc(this._maint.inspectError)}</div>` : ''}
+          ${this._maint.inspect ? `
+            <div class="muted">DB: ${esc(this._maint.inspect.path || '')} • size ${(this._maint.inspect.sizeBytes ?? null) !== null ? esc(Math.round((this._maint.inspect.sizeBytes || 0) / 1024 / 1024) + ' MB') : '—'} • journal ${esc(this._maint.inspect.journalMode || '—')} • sqlite ${esc(this._maint.inspect.sqliteVersion || '—')}</div>
+            <div class="muted">Schema: ${esc(this._maint.inspect.cacheSchemaVersion || '—')} (expected ${esc(this._maint.inspect.cacheSchemaExpected || '—')}) • last vacuum: ${esc(this._maint.inspect.lastVacuumAt || '—')}</div>
+            <div class="muted">Table bytes: ${(() => {
+              const ok = (typeof this._maint.inspect.dbstatAvailable === 'boolean') ? this._maint.inspect.dbstatAvailable : null;
+              if (ok === false) return 'dbstat unavailable (size per table disabled)';
+              const tot = (this._maint.inspect.tablesTotalBytesApprox ?? null);
+              if (typeof tot === 'number') return Math.round(tot / 1024 / 1024) + ' MB (approx)';
+              if (ok === true) return 'enabled';
+              return 'unknown';
+            })()}</div>
+            <div class="muted">FTS: ${(() => {
+              const f = this._maint.inspect.fts || {};
+              const fts5 = (typeof f.fts5Enabled === 'boolean') ? f.fts5Enabled : null;
+              const exists = (typeof f.postsFtsExists === 'boolean') ? f.postsFtsExists : null;
+              const ok = (typeof f.postsFtsOperational === 'boolean') ? f.postsFtsOperational : null;
+              if (ok === true) return 'posts_fts ON';
+              if (ok === false) return 'posts_fts ERROR';
+              if (exists === true) return 'posts_fts present';
+              if (exists === false) return (fts5 === false) ? 'unavailable' : 'not enabled';
+              if (fts5 === false) return 'unavailable';
+              return 'unknown';
+            })()}</div>
+
+            <div class="muted" style="margin-top:8px">Tables:</div>
+            <div class="muted" style="font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; white-space:pre; overflow:auto; max-height:220px; border:1px solid rgba(255,255,255,.08); padding:8px; border-radius:8px">
+${(() => {
+  const fmtBytes = (b) => {
+    if (typeof b !== 'number' || !isFinite(b)) return '—';
+    if (b < 1024) return b + ' B';
+    if (b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+    if (b < 1024 * 1024 * 1024) return (b / 1024 / 1024).toFixed(1) + ' MB';
+    return (b / 1024 / 1024 / 1024).toFixed(1) + ' GB';
+  };
+
+  const rows = Array.isArray(this._maint.inspect.tables) ? this._maint.inspect.tables.slice() : [];
+  rows.sort((a, b) => {
+    const ab = (a?.approxBytes ?? null);
+    const bb = (b?.approxBytes ?? null);
+    if (typeof ab === 'number' && typeof bb === 'number') return bb - ab;
+    if (typeof ab === 'number') return -1;
+    if (typeof bb === 'number') return 1;
+    const ar = (a?.rows ?? null);
+    const br = (b?.rows ?? null);
+    if (typeof ar === 'number' && typeof br === 'number') return br - ar;
+    return String(a?.name || '').localeCompare(String(b?.name || ''));
+  });
+
+  if (!rows.length) return esc('—');
+
+  const header = 'name                           rows        approx     oldest                      newest\n' +
+                 '----------------------------------------------------------------------------------------';
+  const lines = rows.map((t) => {
+    const name = String(t?.name || '').padEnd(30, ' ');
+    const r = (typeof t?.rows === 'number') ? String(t.rows).padStart(10, ' ') : '         —';
+    const sz = fmtBytes(t?.approxBytes).padStart(10, ' ');
+    const oldest = String(t?.oldest || '—').padEnd(26, ' ');
+    const newest = String(t?.newest || '—');
+    return `${name} ${r} ${sz} ${oldest} ${newest}`;
+  });
+
+  return esc([header].concat(lines).join('\n'));
+})()}
+            </div>
+
+            <div class="muted" style="margin-top:8px">Indexes: ${(() => {
+              const idx = Array.isArray(this._maint.inspect.indexes) ? this._maint.inspect.indexes : [];
+              if (!idx.length) return '—';
+              return idx.length;
+            })()}</div>
+          ` : ''}
         </div>
 
         <div class="log">

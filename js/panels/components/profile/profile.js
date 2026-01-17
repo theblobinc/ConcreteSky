@@ -719,6 +719,7 @@ class BskyProfile extends HTMLElement {
     const day = String(this._hudCal.selectedDay);
     const busy = !!this._hudCal.dayLoading || !!this._hudCal.backfillRunning;
     const err = this._hudCal.dayError ? `<div class="muted" style="color:#f88">${esc(this._hudCal.dayError)}</div>` : '';
+    const prog = this._hudCal.backfillMsg ? `<div class="muted">${esc(this._hudCal.backfillMsg)}</div>` : '';
 
     const posts = Array.isArray(this._hudCal.dayPosts) ? this._hudCal.dayPosts : [];
     const notifs = Array.isArray(this._hudCal.dayNotifs) ? this._hudCal.dayNotifs : [];
@@ -771,6 +772,7 @@ class BskyProfile extends HTMLElement {
         </div>
       </div>
       ${busy ? '<div class="muted">Working…</div>' : ''}
+      ${prog}
       ${err}
       <div class="cols">
         <div class="card2">
@@ -846,15 +848,58 @@ class BskyProfile extends HTMLElement {
     this._hudCal.backfillRunning = true;
     this._hudCal.backfillCancel = false;
     this._hudCal.dayError = null;
+    this._hudCal.backfillMsg = '';
     this.renderHudCacheCalendarModal();
 
     const stopIso = String(stopBeforeIso || '').trim();
     const month = this._hudCal.month;
 
-    const runLoop = async (method, payload, isDone) => {
-      for (let i = 0; i < 25; i++) {
+    const isRateLimitError = (e) => (e && (e.status === 429 || e.code === 'RATE_LIMITED' || e.name === 'RateLimitError'))
+      || /\bHTTP\s*429\b/i.test(String(e?.message || ''));
+
+    const getRetryAfterSeconds = (e) => {
+      const v = e?.retryAfterSeconds;
+      if (Number.isFinite(v) && v >= 0) return v;
+      const msg = String(e?.message || '');
+      const m = msg.match(/retry-after:\s*([^\)\s]+)/i);
+      if (!m) return null;
+      const raw = String(m[1] || '').trim();
+      if (/^\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10));
+      const t = Date.parse(raw);
+      if (!Number.isFinite(t)) return null;
+      return Math.max(0, Math.ceil((t - Date.now()) / 1000));
+    };
+
+    const backoffForRateLimit = async (e, label) => {
+      if (!isRateLimitError(e)) return false;
+      const sec = getRetryAfterSeconds(e);
+      const waitSec = Number.isFinite(sec) ? Math.min(3600, Math.max(1, sec)) : 10;
+
+      const endAt = Date.now() + (waitSec * 1000);
+      while (!this._hudCal.backfillCancel) {
+        const remaining = Math.max(0, Math.ceil((endAt - Date.now()) / 1000));
+        this._hudCal.backfillMsg = `${label}: rate limited; waiting ${remaining}s`;
+        this.renderHudCacheCalendarModal();
+        if (remaining <= 0) break;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+      return true;
+    };
+
+    const runLoop = async (method, payload, isDone, onIter) => {
+      let iter = 0;
+      while (iter < 25) {
         if (this._hudCal.backfillCancel) break;
-        const res = await call(method, payload);
+        let res;
+        try {
+          res = await call(method, payload);
+        } catch (e) {
+          const waited = await backoffForRateLimit(e, method);
+          if (waited) continue;
+          throw e;
+        }
+        iter++;
+        try { onIter && onIter(res, iter); } catch {}
         if (isDone(res)) break;
       }
     };
@@ -864,7 +909,29 @@ class BskyProfile extends HTMLElement {
       await runLoop(
         'cacheBackfillNotifications',
         { hours: 24 * 365 * 30, pagesMax: 80, stopBefore: stopIso },
-        (res) => !!res?.done || !!res?.stoppedEarly || !String(res?.cursor || ''),
+        (res) => !!res?.result?.done || !!res?.result?.stoppedEarly || !!res?.result?.retentionLimited || !String(res?.cursor || ''),
+        (res, iter) => {
+          const cursor = String(res?.cursor || '');
+          const r = res?.result || {};
+          const inserted = r?.inserted ?? 0;
+          const updated = r?.updated ?? 0;
+          const skipped = r?.skipped ?? 0;
+          const pages = r?.pages ?? '?';
+          const cutoffIso = r?.cutoffIso;
+          const retentionLimited = !!r?.retentionLimited;
+          const oldestSeenIso = r?.oldestSeenIso;
+          const stoppedEarly = !!r?.stoppedEarly;
+          const done = !!r?.done || !cursor;
+          this._hudCal.backfillMsg = [
+            `Notifications: iter ${iter}`,
+            `+${inserted}/~${updated}/skip ${skipped} (pages ${pages})`,
+            cutoffIso ? `cutoff ${cutoffIso}` : null,
+            retentionLimited ? `RETENTION? (oldest ${oldestSeenIso || '?'})` : null,
+            stoppedEarly ? 'REACHED' : null,
+            done ? 'DONE' : 'more…',
+          ].filter(Boolean).join(' • ');
+          this.renderHudCacheCalendarModal();
+        },
       );
 
       // Posts backfill until we reach stopBefore.
@@ -872,6 +939,20 @@ class BskyProfile extends HTMLElement {
         'cacheBackfillMyPosts',
         { pagesMax: 80, stopBefore: stopIso },
         (res) => !!res?.done || !!res?.stoppedEarly || !String(res?.cursor || ''),
+        (res, iter) => {
+          const cursor = String(res?.cursor || '');
+          const inserted = res?.inserted ?? 0;
+          const updated = res?.updated ?? 0;
+          const stoppedEarly = !!res?.stoppedEarly;
+          const done = !!res?.done || !cursor;
+          this._hudCal.backfillMsg = [
+            `Posts: iter ${iter}`,
+            `+${inserted}/~${updated}`,
+            stoppedEarly ? 'REACHED' : null,
+            done ? 'DONE' : 'more…',
+          ].filter(Boolean).join(' • ');
+          this.renderHudCacheCalendarModal();
+        },
       );
 
       // Refresh sync timestamps and month cache.
@@ -884,6 +965,7 @@ class BskyProfile extends HTMLElement {
       this._hudCal.dayError = e?.message || String(e);
     } finally {
       this._hudCal.backfillRunning = false;
+      this._hudCal.backfillMsg = '';
       this.renderHudCacheCalendarModal();
     }
   }

@@ -354,8 +354,26 @@ class BskyCacheStatus extends HTMLElement {
     try {
       const res = await call('cacheBackfillNotifications', { hours: 24 * 30, pagesMax: 30 });
       this._data = await call('cacheStatus', {});
-      const cur = (res && typeof res.cursor === 'string' && res.cursor.length) ? ' (more remaining)' : '';
-      this.flash('Notifications backfill synced' + cur + '.');
+      const cursor = (res && typeof res.cursor === 'string') ? res.cursor : '';
+      const r = res?.result || {};
+      const inserted = r?.inserted ?? 0;
+      const updated = r?.updated ?? 0;
+      const skipped = r?.skipped ?? 0;
+      const pages = r?.pages ?? '?';
+      const cutoffIso = r?.cutoffIso;
+      const retentionLimited = !!r?.retentionLimited;
+      const oldestSeenIso = r?.oldestSeenIso;
+      const stoppedEarly = !!r?.stoppedEarly;
+      const done = !!r?.done || !cursor;
+
+      const bits = [
+        `Notifs backfill 30d: +${inserted} / ~${updated} / skip ${skipped} (pages ${pages})`,
+        cutoffIso ? `cutoff ${cutoffIso}` : null,
+        retentionLimited ? `RETENTION? (oldest ${oldestSeenIso || '?'})` : null,
+        stoppedEarly ? 'REACHED' : null,
+        done ? 'DONE' : 'more…',
+      ].filter(Boolean);
+      this.flash(bits.join(' • '));
     } catch (e) {
       this.flash(`Backfill failed: ${e?.message || e}`, true);
     } finally {

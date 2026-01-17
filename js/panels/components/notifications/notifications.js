@@ -79,6 +79,37 @@ class BskyNotifications extends HTMLElement {
     };
   }
 
+  _isRateLimitError(e) {
+    return (e && (e.status === 429 || e.code === 'RATE_LIMITED' || e.name === 'RateLimitError'))
+      || /\bHTTP\s*429\b/i.test(String(e?.message || ''));
+  }
+
+  _retryAfterSeconds(e) {
+    const v = e?.retryAfterSeconds;
+    if (Number.isFinite(v) && v >= 0) return v;
+    const msg = String(e?.message || '');
+    const m = msg.match(/retry-after:\s*([^\)\s]+)/i);
+    if (!m) return null;
+    const raw = String(m[1] || '').trim();
+    if (/^\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10));
+    const t = Date.parse(raw);
+    if (!Number.isFinite(t)) return null;
+    return Math.max(0, Math.ceil((t - Date.now()) / 1000));
+  }
+
+  async _backoffIfRateLimited(e, { quiet = false } = {}) {
+    if (!this._isRateLimitError(e)) return false;
+    const sec = this._retryAfterSeconds(e);
+    const waitSec = Number.isFinite(sec) ? Math.min(3600, Math.max(1, sec)) : 10;
+
+    if (!quiet) {
+      this.error = `Rate limited. Waiting ${waitSec}s…`;
+      this.render();
+    }
+    await new Promise((r) => setTimeout(r, waitSec * 1000));
+    return true;
+  }
+
   connectedCallback(){
     this.render();
     this.load(true);
@@ -227,17 +258,30 @@ class BskyNotifications extends HTMLElement {
 
     this._backfillInFlight = true;
     try {
-      const res = await call('cacheBackfillNotifications', {
-        hours: this.filters.hours,
-        // One page per request keeps UI responsive.
-        pagesMax: 1,
-      });
+      let res;
+      for (;;) {
+        try {
+          res = await call('cacheBackfillNotifications', {
+            hours: this.filters.hours,
+            // One page per request keeps UI responsive.
+            pagesMax: 1,
+          });
+          break;
+        } catch (e) {
+          const waited = await this._backoffIfRateLimited(e, { quiet: true });
+          if (waited) continue;
+          throw e;
+        }
+      }
 
-      // Server doesn't return inserted/updated for notifications; treat an empty cursor as "done".
       const cursor = String(res?.cursor || '');
-      if (!cursor) {
+      const r = res?.result || {};
+      const done = !!r?.done || !cursor;
+      const stoppedEarly = !!r?.stoppedEarly;
+      const retentionLimited = !!r?.retentionLimited;
+      if (done || stoppedEarly || retentionLimited) {
         // If the server can't advance any further, stop trying.
-        // (This is conservative; the cache will also be kept warm by periodic syncs.)
+        // (Cache will still be kept warm by periodic syncs.)
         this._backfillDone = true;
       }
     } catch {
@@ -389,7 +433,16 @@ class BskyNotifications extends HTMLElement {
       // If cache is empty on a reset load, seed with a recent sync.
       const firstBatch = (data.items || data.notifications || []).map(normalizeNotification);
       if (reset && firstBatch.length === 0) {
-        await call('cacheSyncRecent', { minutes: 60 });
+        for (;;) {
+          try {
+            await call('cacheSyncRecent', { minutes: 60 });
+            break;
+          } catch (e) {
+            const waited = await this._backoffIfRateLimited(e, { quiet: false });
+            if (waited) continue;
+            throw e;
+          }
+        }
         data = await call('cacheQueryNotifications', {
           hours: this.filters.hours,
           reasons,

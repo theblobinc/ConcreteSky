@@ -25,27 +25,27 @@ This is the top-level TODO for the package (GitHub-facing). A more detailed/lega
 
 ### 1) Backfill clarity + progress
 
-- Deep notifications backfill status: show retention caveats + current cursor/coverage + whether we’re “done” for a chosen cutoff.
-- Add better progress stats for notification backfill (inserted/updated/skipped per chunk) and surface it in the UI.
-- Make long-running backfills safer: explicit cancel/stop controls and clearer “stoppedEarly vs done” messaging.
+- Deep notifications/posts backfill status: retention caveats + current cursor/coverage + “done” signal. (Implemented: `cacheStatus.backfill` + DB Manager display.)
+- Better progress stats for notification backfill (inserted/updated/skipped per chunk) + surfaced in UI. (Implemented.)
+- Long-running backfills safer: explicit cancel/stop controls + clearer messaging. (Implemented: DB Manager stop + HUD cancel hooks; copy tweaks optional.)
 
 ### 2) Cache lifecycle + maintenance
 
-- Add cache pruning strategy (retention / TTL + vacuum) to keep `cache.sqlite` bounded.
-- Add an admin-only “DB inspector” view (table sizes, indexes, schema version, last vacuum, writable-path checks).
-- Add cache schema migration smoke checks (at least a minimal command/script to run migrate + verify schema version).
+- Add cache pruning strategy (retention / TTL + vacuum) to keep `cache.sqlite` bounded. (Implemented: admin actions + scheduled job `concretesky_cache_maintenance`.)
+- Add an admin-only “DB inspector” view (table sizes, indexes, schema version, last vacuum, writable-path checks). (Implemented: `cacheDbInspect` + DB Manager.)
+- Add cache schema migration smoke checks (at least a minimal command/script to run migrate + verify schema version). (Implemented: CLI `concretesky:cache:migrate-check`.)
 
 ### 3) Security / access control
 
-- Add configurable access-control guard for the SPA (admin/whitelist/group-based).
+- Add configurable access-control guard for the SPA (admin/whitelist/group-based). (Implemented: `CONCRETESKY_UI_*` + server-side enforcement.)
 - Keep OAuth endpoints workable: `/oauth/client_metadata` and `/oauth/callback` must remain reachable.
-- Document and harden automation mode defaults (JWT allowlist, superuser requirement, when to enable `CONCRETESKY_JWT_ENFORCE`).
+- Document and harden automation mode defaults (JWT allowlist, superuser requirement, when to enable `CONCRETESKY_JWT_ENFORCE`). (Implemented: README guidance + safe defaults.)
 
 ### 4) UX / configuration
 
-- Persist DB Manager settings (calendar selections, pagesMax, notifications window, posts filter) optionally in localStorage.
-- Add staleness threshold configuration (what counts as “stale” for cached rows and UI warnings).
-- Improve rate-limit errors (surface retry-after / backoff hints; reduce spammy retries).
+- Persist DB Manager settings (calendar selections, pagesMax, notifications window, posts filter) optionally in localStorage. (Implemented: `bsky.dbManager.prefs`.)
+- Add staleness threshold configuration (what counts as “stale” for cached rows and UI warnings). (Implemented in DB Manager; can be propagated to other panels if desired.)
+- Improve rate-limit errors (surface retry-after / backoff hints; reduce spammy retries). (Implemented: Retry-After surfaced + UI backoff in long-running loops.)
 
 ### 5) Notifications UX (bar + panel)
 
@@ -54,8 +54,8 @@ This is the top-level TODO for the package (GitHub-facing). A more detailed/lega
 
 ### 6) Data features
 
-- Optional FTS search for cached profiles/posts (SQLite FTS5), with a clean fallback to LIKE when unavailable.
-- Export tools (CSV/JSON) for cached datasets (followers/following/notifications/posts) for AI workflows.
+- Optional FTS search for cached profiles/posts (SQLite FTS5), with a clean fallback to LIKE when unavailable. (Posts FTS implemented; falls back to LIKE if FTS5 isn't available.)
+- Export tools (CSV/JSON) for cached datasets (followers/following/notifications/posts) for AI workflows. (Posts/notifications/followers/following export implemented via `cacheExport`.)
 
 ## Maintenance
 

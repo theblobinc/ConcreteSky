@@ -215,6 +215,29 @@ class Api extends ParentController
             ];
         }
 
+        protected function requireSuperUser(array $jwt = []): void
+        {
+            // Allow superuser JWT automation to perform admin-only maintenance.
+            if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                return;
+            }
+
+            $u = new User();
+            if (!$u->isRegistered()) {
+                throw new \RuntimeException('ConcreteCMS login required', 401);
+            }
+
+            $ui = UserInfo::getByID((int)$u->getUserID());
+            if (!$ui) {
+                throw new \RuntimeException('ConcreteCMS user not found', 401);
+            }
+
+            $isSuper = method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+            if (!$isSuper) {
+                throw new \RuntimeException('Super user required', 403);
+            }
+        }
+
     protected function cacheSyncMyPosts(\PDO $pdo, array &$session, string $actorDid, int $hours = 24, int $pagesMax = 25, ?string $filter = null): array
     {
         $cutoffTs = time() - ($hours * 3600);
@@ -230,18 +253,20 @@ class Api extends ParentController
         $skipped = 0;
         $stoppedEarly = false;
         $maxSeenTs = null;
+        $minSeenTs = null;
 
         $cursor = null;
 
         // Prepared statement for upsert.
         $stmtUpsert = $pdo->prepare(
-            'INSERT INTO posts(actor_did, uri, cid, created_at, indexed_at, kind, raw_json, updated_at) '
-            . 'VALUES(:actor_did, :uri, :cid, :created_at, :indexed_at, :kind, :raw_json, :updated_at) '
+            'INSERT INTO posts(actor_did, uri, cid, created_at, indexed_at, kind, text, raw_json, updated_at) '
+            . 'VALUES(:actor_did, :uri, :cid, :created_at, :indexed_at, :kind, :text, :raw_json, :updated_at) '
             . 'ON CONFLICT(actor_did, uri) DO UPDATE SET '
             . '  cid=excluded.cid, '
             . '  created_at=excluded.created_at, '
             . '  indexed_at=excluded.indexed_at, '
             . '  kind=excluded.kind, '
+            . '  text=excluded.text, '
             . '  raw_json=excluded.raw_json, '
             . '  updated_at=excluded.updated_at'
         );
@@ -282,6 +307,7 @@ class Api extends ParentController
                 $cid = $item['post']['cid'] ?? null;
                 $indexedAt = $item['post']['indexedAt'] ?? null;
                 $kind = $this->postKindFromFeedItem($item);
+                $text = $this->postTextFromFeedItem($item);
 
                 // Determine if this is insert vs update.
                 $stmtExists->execute([':actor_did' => $actorDid, ':uri' => $uri]);
@@ -294,6 +320,7 @@ class Api extends ParentController
                     ':created_at' => $createdAt,
                     ':indexed_at' => $indexedAt,
                     ':kind' => $kind,
+                    ':text' => $text,
                     ':raw_json' => json_encode($item, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
                     ':updated_at' => gmdate('c'),
                 ]);
@@ -361,13 +388,14 @@ class Api extends ParentController
         $stoppedEarly = false;
 
         $stmtUpsert = $pdo->prepare(
-            'INSERT INTO posts(actor_did, uri, cid, created_at, indexed_at, kind, raw_json, updated_at) '
-            . 'VALUES(:actor_did, :uri, :cid, :created_at, :indexed_at, :kind, :raw_json, :updated_at) '
+            'INSERT INTO posts(actor_did, uri, cid, created_at, indexed_at, kind, text, raw_json, updated_at) '
+            . 'VALUES(:actor_did, :uri, :cid, :created_at, :indexed_at, :kind, :text, :raw_json, :updated_at) '
             . 'ON CONFLICT(actor_did, uri) DO UPDATE SET '
             . '  cid=excluded.cid, '
             . '  created_at=excluded.created_at, '
             . '  indexed_at=excluded.indexed_at, '
             . '  kind=excluded.kind, '
+            . '  text=excluded.text, '
             . '  raw_json=excluded.raw_json, '
             . '  updated_at=excluded.updated_at'
         );
@@ -396,6 +424,7 @@ class Api extends ParentController
                 $cid = $item['post']['cid'] ?? null;
                 $indexedAt = $item['post']['indexedAt'] ?? null;
                 $kind = $this->postKindFromFeedItem($item);
+                $text = $this->postTextFromFeedItem($item);
 
                 $stmtExists->execute([':actor_did' => $actorDid, ':uri' => $uri]);
                 $had = (bool)$stmtExists->fetchColumn();
@@ -407,6 +436,7 @@ class Api extends ParentController
                     ':created_at' => $createdAt,
                     ':indexed_at' => $indexedAt,
                     ':kind' => $kind,
+                    ':text' => $text,
                     ':raw_json' => json_encode($item, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE),
                     ':updated_at' => gmdate('c'),
                 ]);
@@ -549,6 +579,18 @@ class Api extends ParentController
         return 'post';
     }
 
+    protected function postTextFromFeedItem(array $item): string
+    {
+        try {
+            $text = (string)($item['post']['record']['text'] ?? '');
+            $text = trim((string)preg_replace('/\s+/', ' ', $text));
+            if (strlen($text) > 5000) $text = substr($text, 0, 5000);
+            return $text;
+        } catch (\Throwable $e) {
+            return '';
+        }
+    }
+
     public function view()
     {
         $jwt = $this->jwtTryAuthenticate();
@@ -684,6 +726,13 @@ class Api extends ParentController
                     return $this->json(['error' => 'User not validated'], 403);
                 }
 
+                // If the UI is restricted, only allow logging in as a user who would be allowed to use it.
+                try {
+                    $this->requireUiAccess($ui);
+                } catch (\Throwable $e) {
+                    return $this->json(['error' => 'Forbidden'], 403);
+                }
+
                 /** @var LoginService $login */
                 $login = app(LoginService::class);
                 $login->loginByUserID((int)$ui->getUserID());
@@ -700,6 +749,24 @@ class Api extends ParentController
                         'userName' => (string)$ui->getUserName(),
                     ],
                 ]);
+            }
+
+            // For all other methods, require a logged-in Concrete user (or a valid JWT user)
+            // AND apply the same access guard used for the SPA.
+            try {
+                if (!empty($jwt['ok'])) {
+                    $callerUi = UserInfo::getByID((int)$jwt['userId']);
+                    $this->requireUiAccess($callerUi);
+                } else {
+                    $u = new User();
+                    if (!$u->isRegistered()) {
+                        return $this->json(['error' => 'ConcreteCMS login required'], 401);
+                    }
+                    $callerUi = UserInfo::getByID((int)$u->getUserID());
+                    $this->requireUiAccess($callerUi);
+                }
+            } catch (\Throwable $e) {
+                return $this->json(['error' => 'Forbidden'], 403);
             }
 
             // ConcreteCMS user must be logged in for all other API calls.
@@ -1599,6 +1666,45 @@ class Api extends ParentController
 
                     $meDid = $session['did'] ?? null;
 
+                    // Backfill status helpers (best-effort, used for UI clarity).
+                    $minNotifIso = null;
+                    $minPostIso = null;
+                    try {
+                        $st = $pdo->prepare('SELECT MIN(indexed_at) FROM notifications WHERE actor_did = :a AND indexed_at IS NOT NULL');
+                        $st->execute([':a' => $meDid]);
+                        $v = $st->fetchColumn();
+                        $minNotifIso = ($v !== false && $v !== null && (string)$v !== '') ? (string)$v : null;
+                    } catch (\Throwable $e) {
+                        $minNotifIso = null;
+                    }
+                    try {
+                        $st = $pdo->prepare('SELECT MIN(created_at) FROM posts WHERE actor_did = :a AND created_at IS NOT NULL');
+                        $st->execute([':a' => $meDid]);
+                        $v = $st->fetchColumn();
+                        $minPostIso = ($v !== false && $v !== null && (string)$v !== '') ? (string)$v : null;
+                    } catch (\Throwable $e) {
+                        $minPostIso = null;
+                    }
+
+                    $notifCursor = $this->cacheMetaGet($pdo, $meDid, 'notifications_backfill_cursor');
+                    $notifStopBefore = $this->cacheMetaGet($pdo, $meDid, 'notifications_backfill_last_stop_before');
+                    $notifDone = $notifCursor ? false : true;
+                    $notifRetentionHint = false;
+                    try {
+                        if ($notifStopBefore && $minNotifIso) {
+                            $s = strtotime($notifStopBefore);
+                            $m = strtotime($minNotifIso);
+                            if ($s !== false && $m !== false && $m > $s) {
+                                $notifRetentionHint = true;
+                            }
+                        }
+                    } catch (\Throwable $e) {
+                        $notifRetentionHint = false;
+                    }
+
+                    $postsCursor = $this->cacheMetaGet($pdo, $meDid, 'posts_backfill_cursor');
+                    $postsDoneFlag = $this->cacheMetaGet($pdo, $meDid, 'posts_backfill_done');
+
                     $status = [
                         'ok' => true,
                         'actorDid' => $meDid,
@@ -1607,6 +1713,26 @@ class Api extends ParentController
                         'lastNotificationsSeenAt' => $this->cacheMetaGet($pdo, $meDid, 'last_notifications_seen_at'),
                         'lastPostsSyncAt' => $this->cacheMetaGet($pdo, $meDid, 'last_posts_sync_at'),
                         'lastPostsSeenAt' => $this->cacheMetaGet($pdo, $meDid, 'last_posts_seen_at'),
+                        'backfill' => [
+                            'notifications' => [
+                                'cursor' => $notifCursor,
+                                'done' => $notifDone,
+                                'lastHours' => $this->cacheMetaGet($pdo, $meDid, 'notifications_backfill_last_hours'),
+                                'lastStopBefore' => $notifStopBefore,
+                                'lastCutoffIso' => $this->cacheMetaGet($pdo, $meDid, 'notifications_backfill_last_cutoff_iso'),
+                                'lastOldestSeenIso' => $this->cacheMetaGet($pdo, $meDid, 'notifications_backfill_last_oldest_seen_iso'),
+                                'lastRetentionLimited' => $this->cacheMetaGet($pdo, $meDid, 'notifications_backfill_last_retention_limited') === '1',
+                                'lastDone' => $this->cacheMetaGet($pdo, $meDid, 'notifications_backfill_last_done') === '1',
+                                'oldestCachedIso' => $minNotifIso,
+                                'retentionHint' => $notifRetentionHint,
+                            ],
+                            'posts' => [
+                                'cursor' => $postsCursor,
+                                'done' => ($postsDoneFlag === '1') && !$postsCursor,
+                                'lastStopBefore' => $this->cacheMetaGet($pdo, $meDid, 'posts_backfill_last_stop_before'),
+                                'oldestCachedIso' => $minPostIso,
+                            ],
+                        ],
                         'snapshots' => [
                             'followers' => $this->cacheLatestSnapshotInfo($pdo, $meDid, 'followers'),
                             'following' => $this->cacheLatestSnapshotInfo($pdo, $meDid, 'following'),
@@ -1834,6 +1960,19 @@ class Api extends ParentController
                         }
 
                         $res = $this->cacheSyncNotifications($pdo, $session, $meDid, $hours, $pagesMax, $stopBefore);
+
+                        // Best-effort: persist some backfill context for status/UI.
+                        try {
+                            $this->cacheMetaSet($pdo, $meDid, 'notifications_backfill_last_hours', (string)$hours);
+                            $this->cacheMetaSet($pdo, $meDid, 'notifications_backfill_last_stop_before', (string)($stopBefore ?: ''));
+                            $this->cacheMetaSet($pdo, $meDid, 'notifications_backfill_last_cutoff_iso', (string)($res['cutoffIso'] ?? ''));
+                            $this->cacheMetaSet($pdo, $meDid, 'notifications_backfill_last_oldest_seen_iso', (string)($res['oldestSeenIso'] ?? ''));
+                            $this->cacheMetaSet($pdo, $meDid, 'notifications_backfill_last_retention_limited', !empty($res['retentionLimited']) ? '1' : '');
+                            $this->cacheMetaSet($pdo, $meDid, 'notifications_backfill_last_done', !empty($res['done']) ? '1' : '');
+                        } catch (\Throwable $e) {
+                            // ignore
+                        }
+
                         $this->cacheMetaSet($pdo, $meDid, 'last_notifications_sync_at', $now);
                         $cursor = $this->cacheMetaGet($pdo, $meDid, 'notifications_backfill_cursor');
                         $pdo->commit();
@@ -1866,6 +2005,14 @@ class Api extends ParentController
                     try {
                         $now = gmdate('c');
                         $res = $this->cacheBackfillMyPosts($pdo, $session, $meDid, $pagesMax, $filter, $reset, $stopBefore);
+
+                        // Best-effort: keep last target cutoff for UI/status.
+                        try {
+                            $this->cacheMetaSet($pdo, $meDid, 'posts_backfill_last_stop_before', (string)($stopBefore ?: ''));
+                        } catch (\Throwable $e) {
+                            // ignore
+                        }
+
                         $this->cacheMetaSet($pdo, $meDid, 'last_posts_sync_at', $now);
                         $pdo->commit();
                         return $this->json(['ok' => true, 'syncedAt' => $now] + $res);
@@ -1952,6 +2099,422 @@ class Api extends ParentController
 
                     $out = $this->cacheQueryMyPosts($pdo, $meDid, $since, $until, $hours, $types, $limit, $offset, $newestFirst);
                     return $this->json($out);
+                }
+
+                case 'cacheDbInspect': {
+                    // Admin-only DB inspector.
+                    $this->requireSuperUser($jwt);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $path = $this->cacheDbPath();
+                    $dir = $this->cacheDir();
+                    $exists = is_file($path);
+                    $size = $exists ? @filesize($path) : null;
+                    $size = ($size !== false) ? $size : null;
+
+                    $sqliteVersion = null;
+                    try { $sqliteVersion = $pdo->query('SELECT sqlite_version()')->fetchColumn() ?: null; } catch (\Throwable $e) { /* ignore */ }
+
+                    $pragma = static function (\PDO $pdo, string $key) {
+                        try {
+                            $v = $pdo->query('PRAGMA ' . $key)->fetchColumn();
+                            return $v !== false ? $v : null;
+                        } catch (\Throwable $e) {
+                            return null;
+                        }
+                    };
+
+                    $dbstatAvailable = false;
+                    try {
+                        $pdo->query('SELECT name FROM dbstat LIMIT 1')->fetchColumn();
+                        $dbstatAvailable = true;
+                    } catch (\Throwable $e) {
+                        $dbstatAvailable = false;
+                    }
+
+                    $stDbstat = null;
+                    if ($dbstatAvailable) {
+                        try {
+                            $stDbstat = $pdo->prepare('SELECT SUM(pgsize) FROM dbstat WHERE name = :n');
+                        } catch (\Throwable $e) {
+                            $stDbstat = null;
+                            $dbstatAvailable = false;
+                        }
+                    }
+
+                    $timeCandidates = ['indexed_at', 'created_at', 'synced_at', 'updated_at', 'seen_at', 'at', 'ts'];
+                    $tablesTotalBytesApprox = 0;
+
+                    $tables = [];
+                    try {
+                        $names = $pdo->query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")->fetchAll(\PDO::FETCH_COLUMN) ?: [];
+                        foreach ($names as $name) {
+                            $n = (string)$name;
+                            if ($n === '') continue;
+                            $q = '"' . str_replace('"', '""', $n) . '"';
+
+                            $cnt = null;
+                            try {
+                                $cnt = (int)$pdo->query('SELECT COUNT(*) FROM ' . $q)->fetchColumn();
+                            } catch (\Throwable $e) {
+                                $cnt = null;
+                            }
+
+                            $approxBytes = null;
+                            if ($dbstatAvailable && $stDbstat) {
+                                try {
+                                    $stDbstat->execute([':n' => $n]);
+                                    $v = $stDbstat->fetchColumn();
+                                    $approxBytes = ($v !== false && $v !== null) ? (int)$v : null;
+                                    if ($approxBytes !== null) $tablesTotalBytesApprox += max(0, $approxBytes);
+                                } catch (\Throwable $e) {
+                                    $approxBytes = null;
+                                }
+                            }
+
+                            // Best-effort oldest/newest timestamps based on a detected time column.
+                            $timeCol = null;
+                            $oldest = null;
+                            $newest = null;
+                            try {
+                                $cols = $pdo->query('PRAGMA table_info(' . $q . ')')->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+                                $have = [];
+                                foreach ($cols as $c) {
+                                    $cn = (string)($c['name'] ?? '');
+                                    if ($cn === '') continue;
+                                    $have[strtolower($cn)] = $cn;
+                                }
+                                foreach ($timeCandidates as $cand) {
+                                    if (isset($have[$cand])) { $timeCol = $have[$cand]; break; }
+                                }
+                            } catch (\Throwable $e) {
+                                $timeCol = null;
+                            }
+
+                            if ($timeCol) {
+                                $qt = '"' . str_replace('"', '""', $timeCol) . '"';
+                                try {
+                                    $row = $pdo->query('SELECT MIN(' . $qt . '), MAX(' . $qt . ') FROM ' . $q . ' WHERE ' . $qt . ' IS NOT NULL AND ' . $qt . " != ''")->fetch(\PDO::FETCH_NUM) ?: null;
+                                    if ($row) {
+                                        $oldest = $row[0] !== null ? (string)$row[0] : null;
+                                        $newest = $row[1] !== null ? (string)$row[1] : null;
+                                    }
+                                } catch (\Throwable $e) {
+                                    $oldest = null;
+                                    $newest = null;
+                                }
+                            }
+
+                            $tables[] = [
+                                'name' => $n,
+                                'rows' => $cnt,
+                                'approxBytes' => $approxBytes,
+                                'timeColumn' => $timeCol,
+                                'oldest' => $oldest,
+                                'newest' => $newest,
+                            ];
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+
+                    $indexes = [];
+                    try {
+                        $rows = $pdo->query("SELECT name, tbl_name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name")->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+                        foreach ($rows as $r) {
+                            $indexes[] = ['name' => $r['name'] ?? null, 'table' => $r['tbl_name'] ?? null];
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+
+                    // FTS5 availability + whether our posts_fts index exists and is queryable.
+                    $fts5Enabled = null;
+                    try {
+                        $v = $pdo->query("SELECT sqlite_compileoption_used('ENABLE_FTS5')")->fetchColumn();
+                        if ($v !== false) $fts5Enabled = ((int)$v) === 1;
+                    } catch (\Throwable $e) {
+                        $fts5Enabled = null;
+                    }
+
+                    $postsFtsExists = null;
+                    try {
+                        $v = $pdo->query("SELECT 1 FROM sqlite_master WHERE type='table' AND name='posts_fts' LIMIT 1")->fetchColumn();
+                        $postsFtsExists = $v !== false;
+                    } catch (\Throwable $e) {
+                        $postsFtsExists = null;
+                    }
+
+                    $postsFtsOperational = null;
+                    if ($postsFtsExists) {
+                        try {
+                            // Smoke query: just ensure the virtual table can be read.
+                            $pdo->query("SELECT rowid FROM posts_fts LIMIT 1")->fetchColumn();
+                            $postsFtsOperational = true;
+                        } catch (\Throwable $e) {
+                            $postsFtsOperational = false;
+                        }
+                    }
+
+                    return $this->json([
+                        'ok' => true,
+                        'path' => $path,
+                        'dir' => $dir,
+                        'exists' => $exists,
+                        'writableDir' => is_writable($dir),
+                        'writableDb' => $exists ? is_writable($path) : null,
+                        'sizeBytes' => $size,
+                        'sqliteVersion' => $sqliteVersion,
+                        'journalMode' => $pragma($pdo, 'journal_mode'),
+                        'pageSize' => $pragma($pdo, 'page_size'),
+                        'pageCount' => $pragma($pdo, 'page_count'),
+                        'freelistCount' => $pragma($pdo, 'freelist_count'),
+                        'cacheSchemaVersion' => $this->cacheMetaGet($pdo, null, 'schema_version'),
+                        'cacheSchemaExpected' => self::CACHE_SCHEMA_VERSION,
+                        'lastVacuumAt' => $this->cacheMetaGet($pdo, null, 'last_vacuum_at'),
+                        'dbstatAvailable' => $dbstatAvailable,
+                        'tablesTotalBytesApprox' => $dbstatAvailable ? $tablesTotalBytesApprox : null,
+                        'tables' => $tables,
+                        'indexes' => $indexes,
+                        'fts' => [
+                            'fts5Enabled' => $fts5Enabled,
+                            'postsFtsExists' => $postsFtsExists,
+                            'postsFtsOperational' => $postsFtsOperational,
+                        ],
+                    ]);
+                }
+
+                case 'cacheVacuum': {
+                    // Admin-only vacuum/checkpoint.
+                    $this->requireSuperUser($jwt);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    // WAL checkpoint first to reduce WAL growth.
+                    try { $pdo->exec('PRAGMA wal_checkpoint(TRUNCATE);'); } catch (\Throwable $e) { /* ignore */ }
+                    $pdo->exec('VACUUM;');
+                    try { $pdo->exec('ANALYZE;'); } catch (\Throwable $e) { /* ignore */ }
+
+                    $now = gmdate('c');
+                    $this->cacheMetaSet($pdo, null, 'last_vacuum_at', $now);
+                    return $this->json(['ok' => true, 'vacuumedAt' => $now]);
+                }
+
+                case 'cachePrune': {
+                    // Admin-only pruning for the active account.
+                    $this->requireSuperUser($jwt);
+
+                    $keepDaysPosts = min(3650, max(1, (int)($params['keepDaysPosts'] ?? 365)));
+                    $keepDaysNotifs = min(3650, max(1, (int)($params['keepDaysNotifs'] ?? 365)));
+
+                    $meDid = $session['did'] ?? null;
+                    if (!$meDid) return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $cutPosts = gmdate('c', time() - ($keepDaysPosts * 86400));
+                    $cutNotifs = gmdate('c', time() - ($keepDaysNotifs * 86400));
+
+                    $deletedPosts = 0;
+                    $deletedNotifs = 0;
+                    $deletedOauth = 0;
+
+                    $pdo->beginTransaction();
+                    try {
+                        $st = $pdo->prepare('DELETE FROM posts WHERE actor_did = :a AND created_at IS NOT NULL AND created_at < :cut');
+                        $st->execute([':a' => $meDid, ':cut' => $cutPosts]);
+                        $deletedPosts = (int)$st->rowCount();
+
+                        $st2 = $pdo->prepare('DELETE FROM notifications WHERE actor_did = :a AND indexed_at IS NOT NULL AND indexed_at < :cut');
+                        $st2->execute([':a' => $meDid, ':cut' => $cutNotifs]);
+                        $deletedNotifs = (int)$st2->rowCount();
+
+                        // Clean up old OAuth state rows (safe + bounded).
+                        try {
+                            $cutOauth = gmdate('c', time() - (14 * 86400));
+                            $st3 = $pdo->prepare('DELETE FROM oauth_states WHERE created_at IS NOT NULL AND created_at < :cut');
+                            $st3->execute([':cut' => $cutOauth]);
+                            $deletedOauth = (int)$st3->rowCount();
+                        } catch (\Throwable $e) {
+                            $deletedOauth = 0;
+                        }
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json([
+                        'ok' => true,
+                        'actorDid' => $meDid,
+                        'keepDaysPosts' => $keepDaysPosts,
+                        'keepDaysNotifs' => $keepDaysNotifs,
+                        'cutoffPosts' => $cutPosts,
+                        'cutoffNotifs' => $cutNotifs,
+                        'deleted' => [
+                            'posts' => $deletedPosts,
+                            'notifications' => $deletedNotifs,
+                            'oauth_states' => $deletedOauth,
+                        ],
+                    ]);
+                }
+
+                case 'cacheMigrateCheck': {
+                    // Admin-only migrate + assert schema version.
+                    $this->requireSuperUser($jwt);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+                    $cur = $this->cacheMetaGet($pdo, null, 'schema_version');
+                    $ok = ($cur === self::CACHE_SCHEMA_VERSION);
+                    return $this->json([
+                        'ok' => $ok,
+                        'schemaVersion' => $cur,
+                        'expected' => self::CACHE_SCHEMA_VERSION,
+                        'path' => $this->cacheDbPath(),
+                    ], $ok ? 200 : 500);
+                }
+
+                case 'cacheExport': {
+                    // Export cached data for AI workflows.
+                    // Params:
+                    // - kind: posts|notifications|followers|following
+                    // - format: json|csv
+                    // - limit/offset
+                    $kind = (string)($params['kind'] ?? 'posts');
+                    $format = (string)($params['format'] ?? 'json');
+                    if (!in_array($kind, ['posts', 'notifications', 'followers', 'following'], true)) $kind = 'posts';
+                    if ($format !== 'csv') $format = 'json';
+                    $limit = min(5000, max(1, (int)($params['limit'] ?? 1000)));
+                    $offset = max(0, (int)($params['offset'] ?? 0));
+
+                    $meDid = $session['did'] ?? null;
+                    if (!$meDid) return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if ($kind === 'posts') {
+                        $st = $pdo->prepare('SELECT uri, cid, kind, created_at, indexed_at, raw_json, updated_at FROM posts WHERE actor_did = :a ORDER BY created_at DESC LIMIT :lim OFFSET :off');
+                        $st->bindValue(':a', $meDid);
+                        $st->bindValue(':lim', $limit, \PDO::PARAM_INT);
+                        $st->bindValue(':off', $offset, \PDO::PARAM_INT);
+                        $st->execute();
+                        $rows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+
+                        if ($format === 'csv') {
+                            $out = "uri,cid,kind,created_at,indexed_at,updated_at\n";
+                            foreach ($rows as $r) {
+                                $vals = [
+                                    (string)($r['uri'] ?? ''),
+                                    (string)($r['cid'] ?? ''),
+                                    (string)($r['kind'] ?? ''),
+                                    (string)($r['created_at'] ?? ''),
+                                    (string)($r['indexed_at'] ?? ''),
+                                    (string)($r['updated_at'] ?? ''),
+                                ];
+                                $vals = array_map(static function ($v) {
+                                    $v = str_replace('"', '""', (string)$v);
+                                    return '"' . $v . '"';
+                                }, $vals);
+                                $out .= implode(',', $vals) . "\n";
+                            }
+                            return $this->json(['ok' => true, 'kind' => $kind, 'format' => $format, 'actorDid' => $meDid, 'limit' => $limit, 'offset' => $offset, 'csv' => $out]);
+                        }
+
+                        return $this->json(['ok' => true, 'kind' => $kind, 'format' => $format, 'actorDid' => $meDid, 'limit' => $limit, 'offset' => $offset, 'items' => $rows]);
+                    }
+
+                    if ($kind === 'followers' || $kind === 'following') {
+                        $snap = $this->cacheLatestSnapshotInfo($pdo, $meDid, $kind);
+                        if (!$snap) {
+                            return $this->json(['ok' => false, 'kind' => $kind, 'error' => 'No snapshot available yet. Run Sync followers/following first.'], 400);
+                        }
+
+                        $sid = (int)$snap['id'];
+                        $st = $pdo->prepare('SELECT
+                                e.other_did,
+                                p.handle,
+                                p.display_name,
+                                p.avatar,
+                                p.description,
+                                p.created_at,
+                                p.followers_count,
+                                p.follows_count,
+                                p.posts_count,
+                                p.updated_at AS profile_updated_at
+                            FROM edges e
+                            LEFT JOIN profiles p ON p.did = e.other_did
+                            WHERE e.snapshot_id = :sid
+                            ORDER BY e.other_did ASC
+                            LIMIT :lim OFFSET :off');
+                        $st->bindValue(':sid', $sid, \PDO::PARAM_INT);
+                        $st->bindValue(':lim', $limit, \PDO::PARAM_INT);
+                        $st->bindValue(':off', $offset, \PDO::PARAM_INT);
+                        $st->execute();
+                        $rows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+
+                        if ($format === 'csv') {
+                            $out = "other_did,handle,display_name,avatar,description,created_at,followers_count,follows_count,posts_count,profile_updated_at\n";
+                            foreach ($rows as $r) {
+                                $vals = [
+                                    (string)($r['other_did'] ?? ''),
+                                    (string)($r['handle'] ?? ''),
+                                    (string)($r['display_name'] ?? ''),
+                                    (string)($r['avatar'] ?? ''),
+                                    (string)($r['description'] ?? ''),
+                                    (string)($r['created_at'] ?? ''),
+                                    (string)($r['followers_count'] ?? ''),
+                                    (string)($r['follows_count'] ?? ''),
+                                    (string)($r['posts_count'] ?? ''),
+                                    (string)($r['profile_updated_at'] ?? ''),
+                                ];
+                                $vals = array_map(static function ($v) {
+                                    $v = str_replace('"', '""', (string)$v);
+                                    return '"' . $v . '"';
+                                }, $vals);
+                                $out .= implode(',', $vals) . "\n";
+                            }
+                            return $this->json(['ok' => true, 'kind' => $kind, 'format' => $format, 'actorDid' => $meDid, 'snapshot' => $snap, 'limit' => $limit, 'offset' => $offset, 'csv' => $out]);
+                        }
+
+                        return $this->json(['ok' => true, 'kind' => $kind, 'format' => $format, 'actorDid' => $meDid, 'snapshot' => $snap, 'limit' => $limit, 'offset' => $offset, 'items' => $rows]);
+                    }
+
+                    // notifications
+                    $st = $pdo->prepare('SELECT notif_id, indexed_at, reason, author_did, reason_subject, raw_json, updated_at FROM notifications WHERE actor_did = :a AND indexed_at IS NOT NULL ORDER BY indexed_at DESC LIMIT :lim OFFSET :off');
+                    $st->bindValue(':a', $meDid);
+                    $st->bindValue(':lim', $limit, \PDO::PARAM_INT);
+                    $st->bindValue(':off', $offset, \PDO::PARAM_INT);
+                    $st->execute();
+                    $rows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+
+                    if ($format === 'csv') {
+                        $out = "notif_id,indexed_at,reason,author_did,reason_subject,updated_at\n";
+                        foreach ($rows as $r) {
+                            $vals = [
+                                (string)($r['notif_id'] ?? ''),
+                                (string)($r['indexed_at'] ?? ''),
+                                (string)($r['reason'] ?? ''),
+                                (string)($r['author_did'] ?? ''),
+                                (string)($r['reason_subject'] ?? ''),
+                                (string)($r['updated_at'] ?? ''),
+                            ];
+                            $vals = array_map(static function ($v) {
+                                $v = str_replace('"', '""', (string)$v);
+                                return '"' . $v . '"';
+                            }, $vals);
+                            $out .= implode(',', $vals) . "\n";
+                        }
+                        return $this->json(['ok' => true, 'kind' => $kind, 'format' => $format, 'actorDid' => $meDid, 'limit' => $limit, 'offset' => $offset, 'csv' => $out]);
+                    }
+
+                    return $this->json(['ok' => true, 'kind' => $kind, 'format' => $format, 'actorDid' => $meDid, 'limit' => $limit, 'offset' => $offset, 'items' => $rows]);
                 }
 
                 case 'search': {
@@ -2179,15 +2742,97 @@ class Api extends ParentController
 
                     if (in_array('posts', $targets, true)) {
                         $types = $postTypes ?: ['post', 'reply', 'repost'];
-                        $res = $this->cacheQueryMyPosts($pdo, $meDid, null, null, $hours, $types, $limit, 0, true);
-                        $items = $res['items'] ?? [];
-                        if ($q !== '') {
+                        $items = [];
+                        if ($q === '') {
+                            $res = $this->cacheQueryMyPosts($pdo, $meDid, null, null, $hours, $types, $limit, 0, true);
+                            $items = $res['items'] ?? [];
+                        } else {
+                            // Pull a best-effort positive search term for FTS/LIKE.
+                            $term = trim((string)$q);
+                            try {
+                                $allowFields = ['type', 'uri'];
+                                $bits = preg_split('/\s+/', $term);
+                                $picked = [];
+                                foreach ($bits as $b) {
+                                    $b = trim((string)$b);
+                                    if ($b === '') continue;
+                                    if ($b[0] === '-') continue;
+                                    $idx = strpos($b, ':');
+                                    if ($idx !== false && $idx > 0) {
+                                        $field = strtolower(substr($b, 0, $idx));
+                                        if (in_array($field, $allowFields, true)) continue;
+                                    }
+                                    $picked[] = $b;
+                                }
+                                $term = trim(implode(' ', $picked));
+                            } catch (\Throwable $e) {
+                                $term = trim((string)$q);
+                            }
+
+                            $cutoffIso = gmdate('c', time() - ($hours * 3600));
+                            $in = [];
+                            $bind = [':actor_did' => $meDid, ':cutoff' => $cutoffIso, ':limit' => $limit];
+                            foreach ($types as $i => $t) {
+                                $k = ':t' . $i;
+                                $in[] = $k;
+                                $bind[$k] = $t;
+                            }
+                            $typeWhere = $in ? (' AND p.kind IN (' . implode(',', $in) . ')') : '';
+
+                            $rows = [];
+                            // Prefer FTS if available.
+                            $usedFts = false;
+                            if ($term !== '' && strlen($term) >= 2) {
+                                try {
+                                    $ftsQ = $this->cacheFtsQuery($term);
+                                    $sql = 'SELECT p.raw_json FROM posts_fts f '
+                                        . 'JOIN posts p ON p.rowid = f.rowid '
+                                        . 'WHERE p.actor_did = :actor_did AND p.created_at >= :cutoff' . $typeWhere
+                                        . ' AND f.text MATCH :q '
+                                        . 'ORDER BY p.created_at DESC LIMIT :limit';
+                                    $st = $pdo->prepare($sql);
+                                    foreach ($bind as $k => $v) {
+                                        if ($k === ':limit') continue;
+                                        $st->bindValue($k, $v);
+                                    }
+                                    $st->bindValue(':q', $ftsQ);
+                                    $st->bindValue(':limit', $limit, \PDO::PARAM_INT);
+                                    $st->execute();
+                                    $rows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+                                    $usedFts = true;
+                                } catch (\Throwable $e) {
+                                    $rows = [];
+                                }
+                            }
+
+                            if (!$usedFts) {
+                                $like = '%' . $term . '%';
+                                $sql = 'SELECT raw_json FROM posts p '
+                                    . 'WHERE p.actor_did = :actor_did AND p.created_at >= :cutoff' . $typeWhere
+                                    . ' AND (COALESCE(p.text, "") LIKE :like OR p.uri LIKE :like OR COALESCE(p.raw_json, "") LIKE :like) '
+                                    . 'ORDER BY p.created_at DESC LIMIT :limit';
+                                $st = $pdo->prepare($sql);
+                                foreach ($bind as $k => $v) {
+                                    if ($k === ':limit') continue;
+                                    $st->bindValue($k, $v);
+                                }
+                                $st->bindValue(':like', $like);
+                                $st->bindValue(':limit', $limit, \PDO::PARAM_INT);
+                                $st->execute();
+                                $rows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+                            }
+
+                            foreach ($rows as $r) {
+                                $raw = !empty($r['raw_json']) ? json_decode((string)$r['raw_json'], true) : null;
+                                if ($raw) $items[] = $raw;
+                            }
+
+                            // Apply full matcher (supports negation and field tokens).
                             $items = array_values(array_filter($items, static function ($it) use ($matcher, $matches) {
                                 $text = (string)($it['post']['record']['text'] ?? '');
                                 $uri = (string)($it['post']['uri'] ?? '');
                                 $kind = '';
                                 try {
-                                    // Roughly align with front-end kind: post/reply/repost.
                                     if (!empty($it['reason']['$type']) && stripos((string)$it['reason']['$type'], 'Repost') !== false) $kind = 'repost';
                                     elseif (!empty($it['post']['record']['reply'])) $kind = 'reply';
                                     else $kind = 'post';
@@ -2201,6 +2846,7 @@ class Api extends ParentController
                                 return $matches($matcher, $text . ' ' . $uri . ' ' . $kind, $fields);
                             }));
                         }
+
                         $out['results']['posts'] = $items;
                     }
 
@@ -2690,6 +3336,7 @@ class Api extends ParentController
             uri TEXT NOT NULL,
             cid TEXT,
             kind TEXT,
+            text TEXT,
             created_at TEXT,
             indexed_at TEXT,
             raw_json TEXT,
@@ -2697,6 +3344,29 @@ class Api extends ParentController
             PRIMARY KEY(actor_did, uri)
         )');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_posts_actor_created ON posts(actor_did, created_at)');
+
+        // If upgrading an existing DB, ensure the text column exists.
+        $this->cacheEnsureColumn($pdo, 'posts', 'text', 'TEXT');
+
+        // Optional FTS index for cached post text.
+        // If FTS5 isn't compiled into SQLite, these will fail and we fall back to LIKE.
+        try {
+            $pdo->exec('CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts USING fts5(text, content="posts", content_rowid="rowid")');
+
+            // Triggers to keep posts_fts in sync with posts.text.
+            $pdo->exec('CREATE TRIGGER IF NOT EXISTS posts_ai AFTER INSERT ON posts BEGIN
+                INSERT INTO posts_fts(rowid, text) VALUES (new.rowid, new.text);
+            END');
+            $pdo->exec('CREATE TRIGGER IF NOT EXISTS posts_ad AFTER DELETE ON posts BEGIN
+                INSERT INTO posts_fts(posts_fts, rowid, text) VALUES ("delete", old.rowid, old.text);
+            END');
+            $pdo->exec('CREATE TRIGGER IF NOT EXISTS posts_au AFTER UPDATE ON posts BEGIN
+                INSERT INTO posts_fts(posts_fts, rowid, text) VALUES ("delete", old.rowid, old.text);
+                INSERT INTO posts_fts(rowid, text) VALUES (new.rowid, new.text);
+            END');
+        } catch (\Throwable $e) {
+            // ignore; LIKE fallback will still work using posts.text/raw_json.
+        }
 
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_snapshots_actor_kind ON snapshots(actor_did, kind, taken_at)');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_edges_actor_kind ON edges(actor_did, kind)');
@@ -2803,6 +3473,7 @@ class Api extends ParentController
         $cursor = null;
         $count = 0;
         $page = 0;
+        $pagesProcessed = 0;
 
         $stEdge = $pdo->prepare('INSERT OR IGNORE INTO edges(snapshot_id, actor_did, other_did, kind) VALUES(:sid,:a,:o,:k)');
         $stProfSnap = $pdo->prepare('INSERT OR REPLACE INTO profile_snapshots(snapshot_id,did,handle,avatar,display_name,description,created_at,followers_count,follows_count,posts_count)
@@ -2908,20 +3579,32 @@ class Api extends ParentController
             $storedCursor = $this->cacheMetaGet($pdo, $actorDid, 'notifications_backfill_cursor');
             if ($storedCursor) $cursor = $storedCursor;
         }
+
         $count = 0;
+        $inserted = 0;
+        $updated = 0;
+        $skipped = 0;
         $page = 0;
+        $pagesProcessed = 0;
         $stoppedEarly = false;
         $maxSeenTs = null;
+        $minSeenTs = null;
 
-        $st = $pdo->prepare('INSERT INTO notifications(actor_did, notif_id, indexed_at, reason, author_did, reason_subject, raw_json, updated_at)
+        // We want insert vs update counts for better UX/progress.
+        // SQLite upsert doesn't directly expose which path happened, so we do an INSERT-OR-IGNORE
+        // followed by UPDATE only when needed. Conflicts should be rare for backfill.
+        $stInsert = $pdo->prepare('INSERT INTO notifications(actor_did, notif_id, indexed_at, reason, author_did, reason_subject, raw_json, updated_at)
             VALUES(:a,:id,:ts,:reason,:author,:subject,:raw,:u)
-            ON CONFLICT(actor_did, notif_id) DO UPDATE SET
-              indexed_at=excluded.indexed_at,
-              reason=excluded.reason,
-              author_did=excluded.author_did,
-              reason_subject=excluded.reason_subject,
-              raw_json=excluded.raw_json,
-              updated_at=excluded.updated_at');
+            ON CONFLICT(actor_did, notif_id) DO NOTHING');
+
+        $stUpdate = $pdo->prepare('UPDATE notifications SET
+                indexed_at=:ts,
+                reason=:reason,
+                author_did=:author,
+                reason_subject=:subject,
+                raw_json=:raw,
+                updated_at=:u
+            WHERE actor_did=:a AND notif_id=:id');
 
         while ($page < $pagesMax) {
             $data = $this->xrpcSession('GET', 'app.bsky.notification.listNotifications', $session, [
@@ -2932,6 +3615,8 @@ class Api extends ParentController
             $batch = $data['notifications'] ?? [];
             if (!$batch) break;
 
+            $pagesProcessed++;
+
             foreach ($batch as $n) {
                 $ts = $n['indexedAt'] ?? $n['createdAt'] ?? null;
                 if ($ts) {
@@ -2939,6 +3624,7 @@ class Api extends ParentController
                         $dt = new \DateTimeImmutable($ts);
                         $t = $dt->getTimestamp();
                         if ($maxSeenTs === null || $t > $maxSeenTs) $maxSeenTs = $t;
+                        if ($minSeenTs === null || $t < $minSeenTs) $minSeenTs = $t;
 
                         // Stop once we hit notifications older than our cutoff.
                         if ($t <= $cutoffTs) {
@@ -2964,7 +3650,12 @@ class Api extends ParentController
                     ]));
                 }
 
-                $st->execute([
+                if ($notifId === '') {
+                    $skipped++;
+                    continue;
+                }
+
+                $bind = [
                     ':a' => $actorDid,
                     ':id' => $notifId,
                     ':ts' => $ts,
@@ -2973,7 +3664,15 @@ class Api extends ParentController
                     ':subject' => isset($n['reasonSubject']) ? (string)$n['reasonSubject'] : null,
                     ':raw' => json_encode($n),
                     ':u' => gmdate('c'),
-                ]);
+                ];
+
+                $stInsert->execute($bind);
+                if ($stInsert->rowCount() === 1) {
+                    $inserted++;
+                } else {
+                    $stUpdate->execute($bind);
+                    $updated++;
+                }
                 $count++;
             }
 
@@ -2999,12 +3698,26 @@ class Api extends ParentController
             }
         }
 
+        $retentionLimited = false;
+        if (!$cursor && !$stoppedEarly && $minSeenTs !== null && $minSeenTs > $cutoffTs) {
+            // We ran out of API history before reaching our cutoff.
+            // This likely indicates server-side retention limits.
+            $retentionLimited = true;
+        }
+
+        $done = !$cursor;
         return [
             'hours' => $hours,
             'count' => $count,
-            'pages' => $page + 1,
+            'pages' => $pagesProcessed,
             'truncated' => (bool)$cursor,
             'stoppedEarly' => $stoppedEarly,
+            'done' => $done,
+            'retentionLimited' => $retentionLimited,
+            'oldestSeenIso' => $minSeenTs !== null ? gmdate('c', $minSeenTs) : null,
+            'inserted' => $inserted,
+            'updated' => $updated,
+            'skipped' => $skipped,
             'cutoffIso' => gmdate('c', $cutoffTs),
         ];
     }

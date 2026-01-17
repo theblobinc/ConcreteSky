@@ -1,5 +1,6 @@
 import { call } from '../../../api.js';
 import { identityCss, identityHtml, bindCopyClicks } from '../../../lib/identity.js';
+import { captureScrollAnchor, applyScrollAnchor } from '../../panel_api.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
   ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[m])
@@ -13,6 +14,38 @@ class BskyFeed extends HTMLElement {
     this.cursor=null; this.loading=false; this.items=[]; this.error=null;
     this.followMap = {}; // did -> {following:boolean}
     this.modal = { open:false, uri:null, loading:false, error:null, likers:[], followingMap:{}, statsMap:null };
+
+    this._restoreScrollNext = false;
+    this._scrollAnchor = null;
+    this._scrollTop = 0;
+  }
+
+  _isRateLimitError(e) {
+    return (e && (e.status === 429 || e.code === 'RATE_LIMITED' || e.name === 'RateLimitError'))
+      || /\bHTTP\s*429\b/i.test(String(e?.message || ''));
+  }
+
+  _retryAfterSeconds(e) {
+    const v = e?.retryAfterSeconds;
+    if (Number.isFinite(v) && v >= 0) return v;
+    const msg = String(e?.message || '');
+    const m = msg.match(/retry-after:\s*([^\)\s]+)/i);
+    if (!m) return null;
+    const raw = String(m[1] || '').trim();
+    if (/^\d+$/.test(raw)) return Math.max(0, parseInt(raw, 10));
+    const t = Date.parse(raw);
+    if (!Number.isFinite(t)) return null;
+    return Math.max(0, Math.ceil((t - Date.now()) / 1000));
+  }
+
+  async _backoffIfRateLimited(e) {
+    if (!this._isRateLimitError(e)) return false;
+    const sec = this._retryAfterSeconds(e);
+    const waitSec = Number.isFinite(sec) ? Math.min(3600, Math.max(1, sec)) : 10;
+    this.error = `Rate limited. Waiting ${waitSec}s…`;
+    this.render();
+    await new Promise((r) => setTimeout(r, waitSec * 1000));
+    return true;
   }
 
   connectedCallback(){
@@ -52,9 +85,20 @@ class BskyFeed extends HTMLElement {
 
   async loadMore(){
     if (this.loading) return;
+    if (this.items.length) this._restoreScrollNext = true;
     this.loading = true; this.render();
     try{
-      const data = await call('getAuthorFeed', { limit: 25, cursor: this.cursor || null });
+      let data;
+      for (;;) {
+        try {
+          data = await call('getAuthorFeed', { limit: 25, cursor: this.cursor || null });
+          break;
+        } catch (e) {
+          const waited = await this._backoffIfRateLimited(e);
+          if (waited) continue;
+          throw e;
+        }
+      }
       this.cursor = data.cursor || null;
       const newItems = (data.feed || []);
       this.items.push(...newItems);
@@ -152,6 +196,22 @@ class BskyFeed extends HTMLElement {
   }
 
   render(){
+    // Preserve scroll position inside the feed scroller.
+    try {
+      const scroller = this.shadowRoot.querySelector('#scroll');
+      if (scroller) {
+        this._scrollTop = scroller.scrollTop || 0;
+        if (this._restoreScrollNext) {
+          this._scrollAnchor = captureScrollAnchor({
+            scroller,
+            root: this.shadowRoot,
+            itemSelector: 'article.post[data-uri]',
+            keyAttr: 'data-uri',
+          });
+        }
+      }
+    } catch {}
+
     const meDid = window.BSKY?.meDid;
 
     const posts = this.items.map(it => {
@@ -166,7 +226,7 @@ class BskyFeed extends HTMLElement {
       const rel = this.followMap[author.did] || {};
       const following = !!rel.following;
 
-      return `<article class="post">
+      return `<article class="post" data-uri="${esc(uri)}">
         <header class="meta">
           <img class="avatar" src="${esc(author.avatar || '')}" alt="" onerror="this.style.display='none'">
           <div class="who">
@@ -277,6 +337,24 @@ class BskyFeed extends HTMLElement {
         </div>
       </div>
     `;
+
+    // Restore anchor after DOM rebuild.
+    if (this._restoreScrollNext) {
+      queueMicrotask(() => {
+        requestAnimationFrame(() => {
+          const scroller = this.shadowRoot.querySelector('#scroll');
+          if (!scroller) return;
+          if (this._scrollAnchor) {
+            applyScrollAnchor({ scroller, root: this.shadowRoot, anchor: this._scrollAnchor, keyAttr: 'data-uri' });
+            setTimeout(() => applyScrollAnchor({ scroller, root: this.shadowRoot, anchor: this._scrollAnchor, keyAttr: 'data-uri' }), 160);
+          } else {
+            scroller.scrollTop = Math.max(0, this._scrollTop || 0);
+          }
+          this._restoreScrollNext = false;
+          this._scrollAnchor = null;
+        });
+      });
+    }
   }
 }
 customElements.define('bsky-feed', BskyFeed);
