@@ -1784,8 +1784,14 @@ class Api extends ParentController
 
                 case 'cacheQueryNotifications': {
                     // Query cached notifications.
-                    // Params: hours (default 720), reasons[] (optional), limit/offset, newestFirst (default true)
-                    $hours = min(24 * 365 * 30, max(1, (int)($params['hours'] ?? 720)));
+                    // Params:
+                    // - since: optional ISO timestamp (inclusive)
+                    // - until: optional ISO timestamp (inclusive)
+                    // - hours: if >0 and since is not provided, use now-hours as cutoff
+                    // - reasons[] (optional), limit/offset, newestFirst (default true)
+                    $hours = min(24 * 365 * 30, max(0, (int)($params['hours'] ?? 720)));
+                    $since = isset($params['since']) ? (string)$params['since'] : null;
+                    $until = isset($params['until']) ? (string)$params['until'] : null;
                     $reasons = (isset($params['reasons']) && is_array($params['reasons'])) ? array_values(array_unique(array_map('strval', $params['reasons']))) : [];
                     $limit = min(200, max(1, (int)($params['limit'] ?? 100)));
                     $offset = max(0, (int)($params['offset'] ?? 0));
@@ -1797,7 +1803,7 @@ class Api extends ParentController
                     $pdo = $this->cacheDb();
                     $this->cacheMigrate($pdo);
 
-                    $out = $this->cacheQueryNotifications($pdo, $meDid, $hours, $reasons, $limit, $offset, $newestFirst);
+                    $out = $this->cacheQueryNotifications($pdo, $meDid, $since, $until, $hours, $reasons, $limit, $offset, $newestFirst);
                     return $this->json($out);
                 }
 
@@ -2203,20 +2209,19 @@ class Api extends ParentController
                         if (!$useReasons) {
                             $useReasons = ['follow','like','reply','repost','mention','quote','subscribed-post','subscribed'];
                         }
-                        $res = $this->cacheQueryNotifications($pdo, $meDid, $hours, $useReasons, $limit, 0, true);
+                        $res = $this->cacheQueryNotifications($pdo, $meDid, null, null, $hours, $useReasons, $limit, 0, true);
                         $items = $res['items'] ?? [];
                         if ($q !== '') {
                             $items = array_values(array_filter($items, static function ($n) use ($matcher, $matches) {
-                                $a = $n['author'] ?? [];
-                                $who = (string)($a['displayName'] ?? $a['handle'] ?? $a['did'] ?? '');
+                                $who = (string)($n['authorDisplayName'] ?? $n['authorHandle'] ?? $n['authorDid'] ?? '');
                                 $reason = (string)($n['reason'] ?? '');
                                 $subject = (string)($n['reasonSubject'] ?? '');
                                 $text = trim($who . ' ' . $reason . ' ' . $subject);
                                 $fields = [
                                     'reason' => $reason,
                                     'subject' => $subject,
-                                    'handle' => (string)($a['handle'] ?? ''),
-                                    'did' => (string)($a['did'] ?? ''),
+                                    'handle' => (string)($n['authorHandle'] ?? ''),
+                                    'did' => (string)($n['authorDid'] ?? ''),
                                 ];
                                 return $matches($matcher, $text, $fields);
                             }));
@@ -3176,13 +3181,28 @@ class Api extends ParentController
         ];
     }
 
-    protected function cacheQueryNotifications(\PDO $pdo, string $actorDid, int $hours, array $reasons, int $limit, int $offset, bool $newestFirst): array
+    protected function cacheQueryNotifications(\PDO $pdo, string $actorDid, ?string $sinceIso, ?string $untilIso, int $hours, array $reasons, int $limit, int $offset, bool $newestFirst): array
     {
-        $cutoff = new \DateTimeImmutable("-{$hours} hours");
-        $cutoffIso = $cutoff->format('c');
+        $cutoffIso = $hours > 0 ? gmdate('c', time() - ($hours * 3600)) : null;
 
-        $where = ['n.actor_did = ?', 'n.indexed_at >= ?'];
-        $params = [$actorDid, $cutoffIso];
+        $where = ['n.actor_did = ?'];
+        $params = [$actorDid];
+
+        if ($sinceIso) {
+            $where[] = 'n.indexed_at >= ?';
+            $params[] = $sinceIso;
+        } elseif ($cutoffIso) {
+            $where[] = 'n.indexed_at >= ?';
+            $params[] = $cutoffIso;
+        }
+
+        if ($untilIso) {
+            $where[] = 'n.indexed_at <= ?';
+            $params[] = $untilIso;
+        }
+
+        // Avoid NULL times in range queries.
+        $where[] = 'n.indexed_at IS NOT NULL';
 
         if ($reasons) {
             $in = implode(',', array_fill(0, count($reasons), '?'));
@@ -3215,6 +3235,9 @@ class Api extends ParentController
 
         return [
             'ok' => true,
+            'since' => $sinceIso,
+            'until' => $untilIso,
+            'cutoffIso' => $sinceIso ?: $cutoffIso,
             'hours' => $hours,
             'items' => $st->fetchAll(\PDO::FETCH_ASSOC) ?: [],
             'total' => $total,

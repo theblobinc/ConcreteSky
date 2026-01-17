@@ -10,6 +10,28 @@ const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
 );
 const fmtTime = (iso) => { try { return new Date(iso).toLocaleString(); } catch { return ''; } };
 
+function normalizeNotification(n) {
+  const base = (n && typeof n === 'object') ? n : {};
+  const rawAuthor = (base.author && typeof base.author === 'object') ? base.author : {};
+
+  const did = rawAuthor.did || base.authorDid || base.author_did || '';
+  const handle = rawAuthor.handle || base.authorHandle || base.author_handle || '';
+  const displayName = rawAuthor.displayName || base.authorDisplayName || base.author_display_name || '';
+  const avatar = rawAuthor.avatar || base.authorAvatar || base.author_avatar || '';
+
+  // Keep original keys for back-compat; provide the nested shape used by UI.
+  return {
+    ...base,
+    author: {
+      ...rawAuthor,
+      did: did || rawAuthor.did || '',
+      handle: handle || rawAuthor.handle || '',
+      displayName: displayName || rawAuthor.displayName || '',
+      avatar: avatar || rawAuthor.avatar || '',
+    },
+  };
+}
+
 // Convert at://did/app.bsky.feed.post/rkey → https://bsky.app/profile/did/post/rkey
 const atUriToWebPost = (uri) => {
   const m = String(uri || '').match(/^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/([^/]+)/);
@@ -182,7 +204,7 @@ class BskyNotifications extends HTMLElement {
       if (Array.isArray(reasonsFromHud)) payload.reasons = reasonsFromHud;
 
       const res = await call('search', payload);
-      const items = Array.isArray(res?.results?.notifications) ? res.results.notifications : [];
+      const items = Array.isArray(res?.results?.notifications) ? res.results.notifications.map(normalizeNotification) : [];
       this._searchApiItems = items;
 
       const dids = Array.from(new Set(items.map(n => n?.author?.did).filter(Boolean)))
@@ -256,11 +278,12 @@ class BskyNotifications extends HTMLElement {
       });
 
       const batch = data.items || data.notifications || [];
-      if (!batch.length) return;
+      const normalizedBatch = batch.map(normalizeNotification);
+      if (!normalizedBatch.length) return;
 
       const have = new Set(this.items.map(n => this.notifKey(n)));
       const fresh = [];
-      for (const n of batch) {
+      for (const n of normalizedBatch) {
         const t = new Date(n.indexedAt || n.createdAt || 0).getTime();
         if (!t || Number.isNaN(t) || t < since) continue;
         const k = this.notifKey(n);
@@ -364,7 +387,7 @@ class BskyNotifications extends HTMLElement {
       });
 
       // If cache is empty on a reset load, seed with a recent sync.
-      const firstBatch = data.items || data.notifications || [];
+      const firstBatch = (data.items || data.notifications || []).map(normalizeNotification);
       if (reset && firstBatch.length === 0) {
         await call('cacheSyncRecent', { minutes: 60 });
         data = await call('cacheQueryNotifications', {
@@ -376,7 +399,7 @@ class BskyNotifications extends HTMLElement {
         });
       }
 
-      const batch = data.items || data.notifications || [];
+      const batch = (data.items || data.notifications || []).map(normalizeNotification);
       const have = new Set(this.items.map(n => this.notifKey(n)));
       const fresh = [];
       for (const n of batch) {

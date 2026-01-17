@@ -1,5 +1,11 @@
 # ConcreteSky (ConcreteCMS v9) — TODO
 
+## Status (2026-01)
+
+This file is largely a historical planning doc. Most of the Phase 0/1 items here are implemented now (tabs/panels, SQLite cache, snapshots/diffs, calendar coverage, backfills).
+
+Current actionable work is tracked in the top-level package TODO: `packages/concretesky/TODO.md`.
+
 ## Goals
 - Make the SPA a useful “local analyst’s console” for Bluesky data (followers, following, posts, notifications).
 - Add a local SQLite cache so the SPA can sort/filter/search without re-fetching everything.

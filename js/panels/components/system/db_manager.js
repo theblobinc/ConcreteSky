@@ -3,6 +3,36 @@ import { getAuthStatusCached, isNotConnectedError } from '../../../auth_state.js
 
 const esc = (s) => String(s ?? '').replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
 
+// Convert at://did/app.bsky.feed.post/rkey → https://bsky.app/profile/did/post/rkey
+const atUriToWebPost = (uri) => {
+  const m = String(uri || '').match(/^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/([^/]+)/);
+  return m ? `https://bsky.app/profile/${m[1]}/post/${m[2]}` : '';
+};
+
+const dayStartIso = (ymd) => `${String(ymd)}T00:00:00Z`;
+const dayEndIso = (ymd) => `${String(ymd)}T23:59:59Z`;
+
+function normalizeCachedNotifRow(n) {
+  const base = (n && typeof n === 'object') ? n : {};
+  const a = (base.author && typeof base.author === 'object') ? base.author : {};
+  const did = a.did || base.authorDid || base.author_did || '';
+  const handle = a.handle || base.authorHandle || base.author_handle || '';
+  const displayName = a.displayName || base.authorDisplayName || base.author_display_name || '';
+  const avatar = a.avatar || base.authorAvatar || base.author_avatar || '';
+  return { ...base, author: { ...a, did, handle, displayName, avatar } };
+}
+
+function fmtCompactTime(iso) {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return '';
+    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch {
+    return '';
+  }
+}
+
 function clampInt(v, min, max, fallback) {
   const n = Number.parseInt(String(v ?? ''), 10);
   if (!Number.isFinite(n)) return fallback;
@@ -16,6 +46,9 @@ class BskyDbManager extends HTMLElement {
     this._busy = false;
     this._status = null;
     this._log = [];
+
+    this._prefsKey = 'bsky.dbManager.prefs';
+    this._prefsTimer = null;
 
     this._op = {
       name: null,
@@ -47,18 +80,99 @@ class BskyDbManager extends HTMLElement {
       loading: false,
       error: null,
       selected: new Set(), // YYYY-MM-DD
+
+      mode: 'select', // 'select' | 'inspect'
+      selectedDay: null,
+      dayLoading: false,
+      dayError: null,
+      dayPosts: null,
+      dayNotifs: null,
     };
 
     this._queued = new Map();
     this._queueTimer = null;
   }
 
+  loadPrefs() {
+    try {
+      const raw = localStorage.getItem(this._prefsKey);
+      if (!raw) return;
+      const p = JSON.parse(raw);
+      if (!p || typeof p !== 'object') return;
+
+      const cfg = p.cfg && typeof p.cfg === 'object' ? p.cfg : null;
+      if (cfg) {
+        if (typeof cfg.pagesMax !== 'undefined') this._cfg.pagesMax = clampInt(cfg.pagesMax, 1, 200, this._cfg.pagesMax);
+        if (typeof cfg.postsPagesMax !== 'undefined') this._cfg.postsPagesMax = clampInt(cfg.postsPagesMax, 1, 200, this._cfg.postsPagesMax);
+        if (typeof cfg.postsFilter !== 'undefined') this._cfg.postsFilter = (cfg.postsFilter ? String(cfg.postsFilter) : null);
+        if (typeof cfg.notificationsHours !== 'undefined') this._cfg.notificationsHours = clampInt(cfg.notificationsHours, 1, 24 * 365 * 30, this._cfg.notificationsHours);
+        if (typeof cfg.notificationsPagesMax !== 'undefined') this._cfg.notificationsPagesMax = clampInt(cfg.notificationsPagesMax, 1, 60, this._cfg.notificationsPagesMax);
+      }
+
+      const cal = p.cal && typeof p.cal === 'object' ? p.cal : null;
+      if (cal) {
+        if (cal.mode === 'select' || cal.mode === 'inspect') this._cal.mode = cal.mode;
+        if (typeof cal.month === 'string' && /^\d{4}-\d{2}$/.test(cal.month)) this._cal.month = cal.month;
+        if (typeof cal.selectedDay === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(cal.selectedDay)) this._cal.selectedDay = cal.selectedDay;
+        if (Array.isArray(cal.selected)) {
+          this._cal.selected.clear();
+          for (const v of cal.selected.slice(0, 400)) {
+            if (typeof v === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(v)) this._cal.selected.add(v);
+          }
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  savePrefsDebounced() {
+    try {
+      if (this._prefsTimer) clearTimeout(this._prefsTimer);
+      this._prefsTimer = setTimeout(() => {
+        this._prefsTimer = null;
+        try {
+          const payload = {
+            v: 1,
+            cfg: {
+              pagesMax: this._cfg.pagesMax,
+              postsPagesMax: this._cfg.postsPagesMax,
+              postsFilter: this._cfg.postsFilter || null,
+              notificationsHours: this._cfg.notificationsHours,
+              notificationsPagesMax: this._cfg.notificationsPagesMax,
+            },
+            cal: {
+              month: this._cal.month || null,
+              mode: this._cal.mode,
+              selectedDay: this._cal.selectedDay || null,
+              selected: Array.from(this._cal.selected.values()).slice(0, 400),
+            },
+          };
+          localStorage.setItem(this._prefsKey, JSON.stringify(payload));
+        } catch {
+          // ignore
+        }
+      }, 250);
+    } catch {
+      // ignore
+    }
+  }
+
   connectedCallback() {
+    this.loadPrefs();
     this.render();
     this.refreshStatus();
 		this.refreshProfile();
     this.shadowRoot.addEventListener('click', (e) => this.onClick(e));
     this.shadowRoot.addEventListener('change', (e) => this.onChange(e));
+
+    // When embedded as a calendar-only view (e.g. inside the cache settings lightbox),
+    // render the calendar inline and load the current month immediately.
+    if (this.getAttribute('data-view') === 'calendar') {
+      queueMicrotask(() => {
+        try { this.openCalendar(); } catch { /* ignore */ }
+      });
+    }
   }
 
   setOp(op) {
@@ -244,11 +358,13 @@ class BskyDbManager extends HTMLElement {
     this._cal.open = true;
     if (!this._cal.month) this._cal.month = this.monthKey();
     this.loadCalendarMonth(this._cal.month);
+    this.savePrefsDebounced();
     this.render();
   }
 
   closeCalendar() {
     this._cal.open = false;
+    this.savePrefsDebounced();
     this.render();
   }
 
@@ -258,6 +374,7 @@ class BskyDbManager extends HTMLElement {
     const d = new Date(Date.UTC(b.y, b.mo - 1 + delta, 1));
     this._cal.month = this.monthKey(d);
     this.loadCalendarMonth(this._cal.month);
+    this.savePrefsDebounced();
     this.render();
   }
 
@@ -332,6 +449,8 @@ class BskyDbManager extends HTMLElement {
       this._cal.month = preserveMonth;
       // Ensure current month view is available after running.
       this.loadCalendarMonth(this._cal.month);
+
+      this.savePrefsDebounced();
       this.setBusy(false);
       this.clearOp();
     }
@@ -341,7 +460,39 @@ class BskyDbManager extends HTMLElement {
     if (!ymd) return;
     if (this._cal.selected.has(ymd)) this._cal.selected.delete(ymd);
     else this._cal.selected.add(ymd);
+    this.savePrefsDebounced();
     this.render();
+  }
+
+  async openCalendarDay(ymd) {
+    const day = String(ymd || '').trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) return;
+    this._cal.selectedDay = day;
+    this._cal.dayLoading = true;
+    this._cal.dayError = null;
+    this._cal.dayPosts = null;
+    this._cal.dayNotifs = null;
+    this.savePrefsDebounced();
+    this.render();
+
+    try {
+      const auth = await getAuthStatusCached();
+      if (!auth?.connected) {
+        this._cal.dayError = 'Not connected. Use the Connect button.';
+        return;
+      }
+      const [postsRes, notifRes] = await Promise.all([
+        call('cacheQueryMyPosts', { since: dayStartIso(day), until: dayEndIso(day), hours: 0, limit: 200, offset: 0, newestFirst: true }),
+        call('cacheQueryNotifications', { since: dayStartIso(day), until: dayEndIso(day), hours: 0, limit: 200, offset: 0, newestFirst: true }),
+      ]);
+      this._cal.dayPosts = Array.isArray(postsRes?.items) ? postsRes.items : [];
+      this._cal.dayNotifs = Array.isArray(notifRes?.items) ? notifRes.items : [];
+    } catch (e) {
+      this._cal.dayError = isNotConnectedError(e) ? 'Not connected. Use the Connect button.' : (e?.message || String(e));
+    } finally {
+      this._cal.dayLoading = false;
+      this.render();
+    }
   }
 
   selectAllInCurrentMonth({ missingOnly }) {
@@ -363,11 +514,13 @@ class BskyDbManager extends HTMLElement {
       if (missingOnly && hasData(day)) continue;
       this._cal.selected.add(iso);
     }
+    this.savePrefsDebounced();
     this.render();
   }
 
   clearSelection() {
     this._cal.selected.clear();
+    this.savePrefsDebounced();
     this.render();
   }
 
@@ -721,12 +874,15 @@ class BskyDbManager extends HTMLElement {
 		if (id === 'postsFilter') this._cfg.postsFilter = (String(e.target.value || '') || null);
 		if (id === 'notificationsHours') this._cfg.notificationsHours = clampInt(e.target.value, 1, 24 * 365 * 30, 24 * 90);
     if (id === 'notificationsPagesMax') this._cfg.notificationsPagesMax = clampInt(e.target.value, 1, 60, 60);
+    this.savePrefsDebounced();
     this.render();
   }
 
   onClick(e) {
     const act = e.target?.getAttribute?.('data-action') || e.target?.closest?.('[data-action]')?.getAttribute?.('data-action');
     if (!act) return;
+
+    const calendarOnly = this.getAttribute('data-view') === 'calendar';
 
     if (act === 'refresh') { this.refreshStatus(); return; }
     if (act === 'sync-both') { this.runSync('both'); return; }
@@ -744,7 +900,7 @@ class BskyDbManager extends HTMLElement {
       return;
     }
     if (act === 'open-calendar') { this.openCalendar(); return; }
-    if (act === 'close-calendar') { this.closeCalendar(); return; }
+    if (act === 'close-calendar') { if (!calendarOnly) this.closeCalendar(); return; }
     if (act === 'cal-prev') { this.shiftCalendarMonth(-1); return; }
     if (act === 'cal-next') { this.shiftCalendarMonth(1); return; }
     if (act === 'cal-select-month') { this.selectAllInCurrentMonth({ missingOnly: false }); return; }
@@ -756,8 +912,39 @@ class BskyDbManager extends HTMLElement {
     if (act === 'cal-sync-notifs') { this.syncNotificationsToSelection(); return; }
     if (act === 'cal-refresh-notifs') { this.refreshNotificationsSelection(); return; }
 
+    if (act === 'cal-mode') {
+      const m = e.target?.getAttribute?.('data-mode') || e.target?.closest?.('[data-mode]')?.getAttribute?.('data-mode');
+      if (m === 'select' || m === 'inspect') {
+        this._cal.mode = m;
+        this.savePrefsDebounced();
+        this.render();
+      }
+      return;
+    }
+
+    if (act === 'cal-clear-day') {
+      this._cal.selectedDay = null;
+      this._cal.dayError = null;
+      this._cal.dayPosts = null;
+      this._cal.dayNotifs = null;
+      this.savePrefsDebounced();
+      this.render();
+      return;
+    }
+
     if (act === 'cal-day') {
       const ymd = e.target?.getAttribute?.('data-ymd') || e.target?.closest?.('[data-ymd]')?.getAttribute?.('data-ymd');
+      // Shift/meta/ctrl click always toggles selection (so you can select while in Inspect mode).
+      if (e.shiftKey || e.metaKey || e.ctrlKey) {
+        this.toggleSelectedDay(ymd);
+        return;
+      }
+
+      if (this._cal.mode === 'inspect') {
+        this.openCalendarDay(ymd);
+        return;
+      }
+
       this.toggleSelectedDay(ymd);
       return;
     }
@@ -766,6 +953,8 @@ class BskyDbManager extends HTMLElement {
   render() {
     const d = this._status;
     const ok = !!d?.ok;
+
+    const calendarOnly = this.getAttribute('data-view') === 'calendar';
 
     const op = this._op || {};
     const hasOp = !!op?.name;
@@ -785,6 +974,8 @@ class BskyDbManager extends HTMLElement {
     const accountAge = createdAt ? this.formatAge(createdAt) : '—';
     const lastPostsSyncAt = ok ? (d.lastPostsSyncAt || null) : null;
     const lastNotifsSyncAt = ok ? (d.lastNotificationsSyncAt || null) : null;
+    const lastPostsSyncTs = lastPostsSyncAt ? Date.parse(String(lastPostsSyncAt)) : NaN;
+    const lastNotifsSyncTs = lastNotifsSyncAt ? Date.parse(String(lastNotifsSyncAt)) : NaN;
     const postsSyncAge = lastPostsSyncAt ? this.formatAge(lastPostsSyncAt) : '—';
     const notifsSyncAge = lastNotifsSyncAt ? this.formatAge(lastNotifsSyncAt) : '—';
 
@@ -805,6 +996,8 @@ class BskyDbManager extends HTMLElement {
       const startDow = new Date(Date.UTC(calBounds.y, calBounds.mo - 1, 1)).getUTCDay(); // 0=Sun
       const postsDays = new Set((calRes?.posts?.days || []).map(Number));
       const notifDays = new Set((calRes?.notifications?.days || []).map(Number));
+      const postsCounts = calRes?.posts?.counts || {};
+      const notifCounts = calRes?.notifications?.counts || {};
       const postsUpdatedAt = calRes?.posts?.updatedAt || {};
       const notifUpdatedAt = calRes?.notifications?.updatedAt || {};
       const hasData = (day) => postsDays.has(day) || notifDays.has(day);
@@ -817,74 +1010,167 @@ class BskyDbManager extends HTMLElement {
         const future = t > todayTs;
         const disabled = beforeJoin || future;
         const sel = this._cal.selected.has(iso);
-        const state = disabled ? 'disabled' : (hasData(day) ? 'has' : 'missing');
 
-        const pu = postsUpdatedAt?.[iso] || null;
-        const nu = notifUpdatedAt?.[iso] || null;
-        const lastU = nu || pu || null;
-        const ageH = lastU ? this.ageHours(lastU) : null;
-        // Staleness policy (can be tuned): mark stale if last ingestion for the day is > 7 days old.
-        const stale = (ageH !== null) ? (ageH > (24 * 7)) : false;
+        const hasPosts = postsDays.has(day);
+        const hasNotifs = notifDays.has(day);
+        const pCount = Number(postsCounts?.[iso] ?? 0);
+        const nCount = Number(notifCounts?.[iso] ?? 0);
+        const pu = postsUpdatedAt?.[iso] ? Date.parse(String(postsUpdatedAt[iso])) : NaN;
+        const nu = notifUpdatedAt?.[iso] ? Date.parse(String(notifUpdatedAt[iso])) : NaN;
+
+        const needsPostsUpdate = disabled ? false : (!hasPosts ? true : (!Number.isFinite(lastPostsSyncTs) ? true : (Number.isFinite(pu) && pu > lastPostsSyncTs)));
+        const needsNotifsUpdate = disabled ? false : (!hasNotifs ? true : (!Number.isFinite(lastNotifsSyncTs) ? true : (Number.isFinite(nu) && nu > lastNotifsSyncTs)));
+
+        // Ring color heuristic:
+        // - pre-join/future: grey
+        // - missing both: red
+        // - one missing: orange
+        // - both present: green unless one/both needs update
+        let ring = 'green';
+        if (disabled) ring = 'pre';
+        else if (!hasPosts && !hasNotifs) ring = 'red';
+        else if (hasPosts && hasNotifs) ring = (needsPostsUpdate && needsNotifsUpdate) ? 'red' : ((needsPostsUpdate || needsNotifsUpdate) ? 'orange' : 'green');
+        else ring = 'orange';
+
+        const state = disabled ? 'disabled' : (hasData(day) ? 'has' : 'missing');
         const tip = [
           iso,
-          hasData(day) ? 'have data' : 'missing',
-          lastU ? `last ingested ${this.formatAge(lastU)} ago` : '',
-          stale ? 'stale' : '',
+          (hasPosts && hasNotifs) ? 'full' : ((hasPosts || hasNotifs) ? 'partial' : 'missing'),
+          `posts ${pCount || 0}`,
+          `notifs ${nCount || 0}`,
+          disabled ? 'disabled' : ((needsPostsUpdate || needsNotifsUpdate) ? 'needs refresh/backfill' : 'up to date'),
+          (this._cal.mode === 'inspect') ? 'click to inspect (shift-click to select)' : 'click to select (shift-click to inspect)',
         ].filter(Boolean).join(' • ');
+
         cells.push(`
-          <button class="cal-cell ${state} ${stale ? 'stale' : ''} ${sel ? 'selected' : ''}" type="button" data-action="cal-day" data-ymd="${esc(iso)}" ${disabled ? 'disabled' : ''} title="${esc(tip)}">
-            <span class="num">${esc(day)}</span>
+          <button class="cal-cell ${state} ${sel ? 'selected' : ''}" type="button" data-action="cal-day" data-ymd="${esc(iso)}" ${disabled ? 'disabled' : ''} title="${esc(tip)}">
+            <span class="ring ${ring}">${esc(day)}</span>
+            <span class="counts"><b>P</b>${esc(pCount || 0)} <b>N</b>${esc(nCount || 0)}</span>
           </button>
         `);
       }
       calGridHtml = `<div class="cal-grid">${cells.join('')}</div>`;
     }
 
+    const dayPanel = (() => {
+      const day = this._cal.selectedDay;
+      if (!day) return '';
+      const posts = Array.isArray(this._cal.dayPosts) ? this._cal.dayPosts : [];
+      const notifs = Array.isArray(this._cal.dayNotifs) ? this._cal.dayNotifs : [];
+      const busy = !!this._cal.dayLoading;
+      const err = this._cal.dayError ? `<div class="muted" style="color:#ff9a9a">${esc(this._cal.dayError)}</div>` : '';
+
+      const postRows = posts.slice(0, 200).map((it) => {
+        const post = it?.post || {};
+        const rec = post?.record || {};
+        const uri = post?.uri || it?.uri || '';
+        const text = String(rec?.text || '').trim().replace(/\s+/g, ' ').slice(0, 180);
+        const when = fmtCompactTime(rec?.createdAt || post?.indexedAt || it?.indexedAt || '');
+        const kind = rec?.reply ? 'reply' : (it?.reason?.$type && String(it.reason.$type).includes('Repost') ? 'repost' : 'post');
+        const open = atUriToWebPost(uri);
+        return `
+          <div class="item">
+            <div style="min-width:0">
+              <div class="it">${esc(kind)}${when ? ` • ${esc(when)}` : ''}</div>
+              <div class="is">${text ? esc(text) : '<span class="muted">(no text)</span>'}${open ? ` • <a href="${esc(open)}" target="_blank" rel="noopener">Open</a>` : ''}</div>
+            </div>
+          </div>
+        `;
+      }).join('') || '<div class="muted">No cached posts/replies for this day.</div>';
+
+      const notifRows = notifs.slice(0, 250).map((raw) => {
+        const n = normalizeCachedNotifRow(raw);
+        const a = n.author || {};
+        const who = (a.displayName || (a.handle ? '@' + a.handle : '') || a.did || '');
+        const when = fmtCompactTime(n.indexedAt || n.createdAt || '');
+        const reason = String(n.reason || '').toUpperCase();
+        const open = atUriToWebPost(n.reasonSubject);
+        return `
+          <div class="item">
+            <img class="av" src="${esc(a.avatar || '')}" alt="" onerror="this.style.display='none'">
+            <div style="min-width:0">
+              <div class="it">${esc(who)} <span class="chip">${esc(reason || 'EVENT')}</span>${when ? ` <span class="muted">• ${esc(when)}` : ''}</span></div>
+              <div class="is">${esc(String(n.reasonSubject || ''))}${open ? ` • <a href="${esc(open)}" target="_blank" rel="noopener">Open</a>` : ''}</div>
+            </div>
+          </div>
+        `;
+      }).join('') || '<div class="muted">No cached notifications for this day.</div>';
+
+      return `
+        <div class="daypanel">
+          <div class="dayhdr">
+            <div class="dayt">${esc(day)} • day details</div>
+            <span style="flex:1"></span>
+            <button class="btn" type="button" data-action="cal-clear-day">Close day</button>
+          </div>
+          ${busy ? '<div class="muted">Loading day…</div>' : ''}
+          ${err}
+          <div class="daycols">
+            <div class="daycard"><h4>My posts + replies (${esc(posts.length)})</h4><div class="list">${postRows}</div></div>
+            <div class="daycard"><h4>Notifications (${esc(notifs.length)})</h4><div class="list">${notifRows}</div></div>
+          </div>
+        </div>
+      `;
+    })();
+
+    const calInner = `
+      <div class="dlg-head">
+        <div class="dlg-title">Calendar</div>
+        <div class="dlg-meta">Account age: ${esc(accountAge)} • Posts sync age: ${esc(postsSyncAge)} • Notifs sync age: ${esc(notifsSyncAge)}</div>
+        <span style="flex:1"></span>
+        ${calendarOnly ? '' : '<button class="btn" type="button" data-action="close-calendar">Close</button>'}
+      </div>
+
+      <div class="cal-toolbar">
+        <button class="btn" type="button" data-action="cal-prev">◀</button>
+        <div class="cal-month">${esc(month || '')}</div>
+        <button class="btn" type="button" data-action="cal-next">▶</button>
+        <span style="flex:1"></span>
+        <div class="legend"><span class="dot green"></span> ok <span class="dot amber"></span> partial/needs work <span class="dot red"></span> missing</div>
+      </div>
+
+      ${this._cal.loading ? '<div class="muted">Loading month…</div>' : ''}
+      ${this._cal.error ? `<div class="muted">Error: ${esc(this._cal.error)}</div>` : ''}
+
+      <div class="dow">
+        <div>Sun</div><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div>
+      </div>
+      ${calGridHtml}
+
+      <div class="cal-actions">
+        <div class="muted">Mode: ${this._cal.mode === 'inspect' ? 'Inspect (click day → details)' : 'Select (click day → toggle)'} • Selected: ${esc(this._cal.selected.size)}${earliestSel ? ` • earliest ${esc(earliestSel)}` : ''}</div>
+        <span style="flex:1"></span>
+        <button class="btn" type="button" data-action="cal-mode" data-mode="inspect" ${this._cal.mode === 'inspect' ? 'disabled' : ''}>Inspect</button>
+        <button class="btn" type="button" data-action="cal-mode" data-mode="select" ${this._cal.mode === 'select' ? 'disabled' : ''}>Select</button>
+        <button class="btn" type="button" data-action="cal-select-month">Select month</button>
+        <button class="btn" type="button" data-action="cal-select-missing">Select missing</button>
+        <button class="btn" type="button" data-action="cal-select-missing-all" ${this._busy ? 'disabled' : ''} title="Scans from your join date through today and selects only missing days">Select missing (since join)</button>
+        <button class="btn" type="button" data-action="cal-clear">Clear</button>
+      </div>
+
+      <div class="cal-actions">
+        <button class="btn primary" type="button" data-action="cal-backfill-posts" ${earliestSel ? '' : 'disabled'}>Fetch posts (to earliest)</button>
+        <button class="btn" type="button" data-action="cal-refresh-posts" ${earliestSel ? '' : 'disabled'} title="Rescans from newest down to earliest selected day">Refresh posts (rescan)</button>
+        <button class="btn" type="button" data-action="cal-sync-notifs" ${earliestSel ? '' : 'disabled'} title="Backfills notifications until the earliest selected day">Fetch notifications (to earliest)</button>
+        <button class="btn" type="button" data-action="cal-refresh-notifs" ${earliestSel ? '' : 'disabled'} title="Rescans notifications from newest down to earliest selected day">Refresh notifications (rescan)</button>
+        <button class="btn" type="button" data-action="cancel" ${(!this._busy || this._cancelRequested) ? 'disabled' : ''}>${this._cancelRequested ? 'Cancelling…' : 'Stop'}</button>
+      </div>
+
+      ${notifsBeyond90 ? `<div class="muted">Note: selected range is ~${esc(notifsRangeDays)} days. This will attempt to backfill beyond 90d, but Bluesky server retention may limit very old notifications.</div>` : ''}
+      ${dayPanel}
+    `;
+
+    const calInline = `
+      <div class="calBox" role="region" aria-label="Data coverage calendar">
+        ${calInner}
+      </div>
+    `;
+
     const calModal = `
       <div class="modal" ${this._cal.open ? '' : 'hidden'}>
         <div class="overlay" data-action="close-calendar"></div>
         <div class="dialog" role="dialog" aria-modal="true" aria-label="Data coverage calendar">
-          <div class="dlg-head">
-            <div class="dlg-title">Calendar</div>
-            <div class="dlg-meta">Account age: ${esc(accountAge)} • Posts sync age: ${esc(postsSyncAge)} • Notifs sync age: ${esc(notifsSyncAge)}</div>
-            <span style="flex:1"></span>
-            <button class="btn" type="button" data-action="close-calendar">Close</button>
-          </div>
-
-          <div class="cal-toolbar">
-            <button class="btn" type="button" data-action="cal-prev">◀</button>
-            <div class="cal-month">${esc(month || '')}</div>
-            <button class="btn" type="button" data-action="cal-next">▶</button>
-            <span style="flex:1"></span>
-            <div class="legend"><span class="dot green"></span> have data <span class="dot red"></span> missing <span class="dot amber"></span> stale</div>
-          </div>
-
-          ${this._cal.loading ? '<div class="muted">Loading month…</div>' : ''}
-          ${this._cal.error ? `<div class="muted">Error: ${esc(this._cal.error)}</div>` : ''}
-
-          <div class="dow">
-            <div>Sun</div><div>Mon</div><div>Tue</div><div>Wed</div><div>Thu</div><div>Fri</div><div>Sat</div>
-          </div>
-          ${calGridHtml}
-
-          <div class="cal-actions">
-            <div class="muted">Selected: ${esc(this._cal.selected.size)}${earliestSel ? ` • earliest ${esc(earliestSel)}` : ''}</div>
-            <span style="flex:1"></span>
-            <button class="btn" type="button" data-action="cal-select-month">Select month</button>
-            <button class="btn" type="button" data-action="cal-select-missing">Select missing</button>
-            <button class="btn" type="button" data-action="cal-select-missing-all" ${this._busy ? 'disabled' : ''} title="Scans from your join date through today and selects only missing days">Select missing (since join)</button>
-            <button class="btn" type="button" data-action="cal-clear">Clear</button>
-          </div>
-
-          <div class="cal-actions">
-            <button class="btn primary" type="button" data-action="cal-backfill-posts" ${earliestSel ? '' : 'disabled'}>Fetch posts (to earliest)</button>
-            <button class="btn" type="button" data-action="cal-refresh-posts" ${earliestSel ? '' : 'disabled'} title="Rescans from newest down to earliest selected day">Refresh posts (rescan)</button>
-            <button class="btn" type="button" data-action="cal-sync-notifs" ${earliestSel ? '' : 'disabled'} title="Backfills notifications until the earliest selected day">Fetch notifications (to earliest)</button>
-            <button class="btn" type="button" data-action="cal-refresh-notifs" ${earliestSel ? '' : 'disabled'} title="Rescans notifications from newest down to earliest selected day">Refresh notifications (rescan)</button>
-            <button class="btn" type="button" data-action="cancel" ${(!this._busy || this._cancelRequested) ? 'disabled' : ''}>${this._cancelRequested ? 'Cancelling…' : 'Stop'}</button>
-          </div>
-
-          ${notifsBeyond90 ? `<div class="muted">Note: selected range is ~${esc(notifsRangeDays)} days. This will attempt to backfill beyond 90d, but Bluesky server retention may limit very old notifications.</div>` : ''}
+          ${calInner}
         </div>
       </div>
     `;
@@ -922,7 +1208,7 @@ class BskyDbManager extends HTMLElement {
         .iconBtn{background:#111;border:1px solid #555;color:#fff;padding:6px 8px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
         .iconBtn:disabled{opacity:.6;cursor:not-allowed}
 
-        .modal{position:fixed;inset:0;z-index:100000}
+        .modal{position:fixed;inset:0;z-index:100002}
         .overlay{position:absolute;inset:0;background:rgba(0,0,0,.65)}
         .dialog{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:min(820px, calc(100vw - 24px));max-height:min(82vh, 820px);overflow:auto;background:#0b0b0b;border:1px solid #2b2b2b;border-radius: var(--bsky-radius, 0px);box-shadow:0 18px 60px rgba(0,0,0,.65);padding:12px}
         .dlg-head{display:flex;gap:10px;align-items:flex-start;flex-wrap:wrap}
@@ -931,22 +1217,43 @@ class BskyDbManager extends HTMLElement {
         .cal-toolbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
         .cal-month{font-weight:900}
         .legend{display:flex;gap:10px;align-items:center;color:#bbb;font-size:.9rem}
-        .dot{display:inline-block;width:10px;height:10px;border-radius: var(--bsky-radius, 0px)}
-        .dot.green{border:2px solid #89f0a2}
-        .dot.red{border:2px solid #ff9a9a}
-        .dot.amber{border:2px solid #f3c66c}
+        .dot{display:inline-block;width:10px;height:10px;border-radius:999px;border:2px solid rgba(255,255,255,.25)}
+        .dot.green{border-color:#89f0a2}
+        .dot.red{border-color:#ff9a9a}
+        .dot.amber{border-color:#f3c66c}
         .dow{display:grid;grid-template-columns:repeat(7, minmax(0,1fr));gap:6px;margin-top:10px;color:#bbb;font-size:.85rem}
         .cal-grid{display:grid;grid-template-columns:repeat(7, minmax(0,1fr));gap:6px;margin-top:6px}
-        .cal-cell{border:1px solid #2b2b2b;background:#0f0f0f;border-radius: var(--bsky-radius, 0px);min-height:44px;display:flex;align-items:center;justify-content:center;cursor:pointer;position:relative}
+        .cal-cell{border:1px solid #2b2b2b;background:#0f0f0f;border-radius: var(--bsky-radius, 0px);min-height:54px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;cursor:pointer;position:relative}
         .cal-cell.blank{border:none;background:transparent;cursor:default}
         .cal-cell.disabled{opacity:.35;cursor:not-allowed}
-        .cal-cell.has::after{content:'';position:absolute;inset:6px;border-radius: var(--bsky-radius, 0px);border:2px solid #89f0a2;pointer-events:none}
-        .cal-cell.missing::after{content:'';position:absolute;inset:6px;border-radius: var(--bsky-radius, 0px);border:2px solid #ff9a9a;pointer-events:none}
-        .cal-cell.stale::before{content:'';position:absolute;right:8px;top:8px;width:8px;height:8px;border-radius: var(--bsky-radius, 0px);background:#f3c66c;}
         .cal-cell.selected{background:#1d2a41;border-color:#2f4b7a}
-        .num{font-weight:900;color:#fff}
+        .ring{width:28px;height:28px;border-radius:999px;border:3px solid #666;display:flex;align-items:center;justify-content:center;font-weight:900;color:#fff;background:rgba(0,0,0,.2)}
+        .ring.green{border-color:#19b34a}
+        .ring.orange{border-color:#f59e0b}
+        .ring.red{border-color:#ef4444}
+        .ring.pre{border-color:#333;color:#888;background:#000}
+        .counts{font-size:.72rem;color:#bbb}
+        .counts b{color:#eee}
         .cal-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}
+
+        .daypanel{margin-top:12px;border-top:1px solid rgba(255,255,255,.10);padding-top:10px}
+        .dayhdr{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+        .dayt{font-weight:900}
+        .daycols{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:10px;margin-top:10px}
+        .daycard{border:1px solid #2b2b2b;border-radius: var(--bsky-radius, 0px);padding:10px;background:#0f0f0f}
+        .daycard h4{margin:0 0 6px 0}
+        .list{display:flex;flex-direction:column;gap:6px;max-height:280px;overflow:auto;padding-right:4px}
+        .item{display:flex;gap:8px;align-items:flex-start;border:1px solid #1f1f1f;border-radius: var(--bsky-radius, 0px);padding:6px;background:#101010}
+        .it{font-weight:900;color:#ddd}
+        .is{font-size:.85rem;color:#bbb;line-height:1.2}
+        .av{width:28px;height:28px;border-radius: var(--bsky-radius, 0px);background:#222;object-fit:cover;flex:0 0 auto}
+        .chip{background:#1d2a41;color:#cfe5ff;border:1px solid #2f4b7a;border-radius: var(--bsky-radius, 0px);padding:1px 6px;font-size:.72rem;font-weight:900;margin-left:6px}
+        a{color:#9cd3ff;text-decoration:none}
+        a:hover{text-decoration:underline}
+
+        .calBox{border:1px solid #2b2b2b;border-radius: var(--bsky-radius, 0px);padding:12px;background:#0b0b0b}
       </style>
+      ${calendarOnly ? `<div class="wrap">${calInline}</div>` : `
       <div class="wrap">
         <div class="row">
           <div class="title">Database Manager</div>
@@ -1044,9 +1351,10 @@ class BskyDbManager extends HTMLElement {
         </div>
       </div>
 			${calModal}
+      `}
     `;
 
-		if (this._cal.open) this.queueStatusRefresh();
+		if (calendarOnly || this._cal.open) this.queueStatusRefresh();
   }
 }
 

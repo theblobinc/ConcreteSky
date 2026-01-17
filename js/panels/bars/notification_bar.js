@@ -37,6 +37,27 @@ const atUriToWebProfile = (uri) => {
 const STORAGE_KEY_FILTERS = 'bsky.notifBar.filters.v1';
 const REASONS = ['follow', 'like', 'reply', 'repost', 'mention', 'quote', 'subscribed-post', 'subscribed'];
 
+ function normalizeNotification(n) {
+   const base = (n && typeof n === 'object') ? n : {};
+   const rawAuthor = (base.author && typeof base.author === 'object') ? base.author : {};
+
+   const did = rawAuthor.did || base.authorDid || base.author_did || '';
+   const handle = rawAuthor.handle || base.authorHandle || base.author_handle || '';
+   const displayName = rawAuthor.displayName || base.authorDisplayName || base.author_display_name || '';
+   const avatar = rawAuthor.avatar || base.authorAvatar || base.author_avatar || '';
+
+   return {
+     ...base,
+     author: {
+       ...rawAuthor,
+       did: did || rawAuthor.did || '',
+       handle: handle || rawAuthor.handle || '',
+       displayName: displayName || rawAuthor.displayName || '',
+       avatar: avatar || rawAuthor.avatar || '',
+     },
+   };
+ }
+
 class BskyNotificationBar extends HTMLElement {
   constructor() {
     super();
@@ -373,10 +394,10 @@ class BskyNotificationBar extends HTMLElement {
           offset: 0,
           newestFirst: true,
         });
-        batch = data.items || data.notifications || [];
+        batch = (data.items || data.notifications || []).map(normalizeNotification);
       } else {
         const data = await call('listNotificationsSince', { hours: 1, reasons, pagesMax: 5 });
-        batch = data.notifications || [];
+        batch = (data.notifications || []).map(normalizeNotification);
       }
 
       if (!batch.length) return;
@@ -447,7 +468,7 @@ class BskyNotificationBar extends HTMLElement {
           newestFirst: true,
         });
 
-        const batch = data.items || data.notifications || [];
+        const batch = (data.items || data.notifications || []).map(normalizeNotification);
         if (!batch.length) {
           this._page.done = true;
           return;
@@ -481,7 +502,7 @@ class BskyNotificationBar extends HTMLElement {
       // Grab a few pages per "load more" to keep it responsive.
       for (let i = 0; i < 5; i++) {
         const data = await call('listNotifications', { limit: 50, cursor });
-        const batch = data.notifications || [];
+        const batch = (data.notifications || []).map(normalizeNotification);
         cursor = data.cursor || null;
         if (!batch.length) {
           cursor = null;
@@ -560,7 +581,7 @@ class BskyNotificationBar extends HTMLElement {
           newestFirst: true,
         });
 
-        const firstBatch = data.items || data.notifications || [];
+        const firstBatch = (data.items || data.notifications || []).map(normalizeNotification);
         if (reset && firstBatch.length === 0) {
           await call('cacheSyncRecent', { minutes: 60 });
           data = await call('cacheQueryNotifications', {
@@ -572,7 +593,7 @@ class BskyNotificationBar extends HTMLElement {
           });
         }
 
-        items = data.items || data.notifications || [];
+        items = (data.items || data.notifications || []).map(normalizeNotification);
         this._page.cacheOffset = 0;
         this._page.done = items.length < this._page.cacheLimit;
       } else {
@@ -582,7 +603,7 @@ class BskyNotificationBar extends HTMLElement {
         const out = [];
         for (let i = 0; i < 6; i++) {
           const data = await call('listNotifications', { limit: 50, cursor });
-          const batch = data.notifications || [];
+          const batch = (data.notifications || []).map(normalizeNotification);
           cursor = data.cursor || null;
           if (!batch.length) {
             cursor = null;
@@ -599,7 +620,7 @@ class BskyNotificationBar extends HTMLElement {
           if (!cursor) break;
           if (out.length >= 200) break;
         }
-        items = out;
+        items = out.map(normalizeNotification);
         this._page.xrpcCursor = cursor;
         this._page.done = !cursor;
       }
@@ -767,6 +788,7 @@ class BskyNotificationBar extends HTMLElement {
           ${this.settingsTab === 'cache' ? `
             <div class="settings-actions">
               <button class="btn" type="button" data-action="reset-layout">Reset layout</button>
+              <button class="btn" type="button" data-action="open-cache-settings">Cache calendar</button>
             </div>
             <bsky-cache-status data-compact="1"></bsky-cache-status>
           ` : ''}
@@ -1034,6 +1056,15 @@ class BskyNotificationBar extends HTMLElement {
       }
       try {
         window.dispatchEvent(new CustomEvent('bsky-reset-layout'));
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    if (act === 'open-cache-settings') {
+      try {
+        window.dispatchEvent(new CustomEvent('bsky-open-cache-settings', { detail: { tab: 'calendar' } }));
       } catch {
         // ignore
       }

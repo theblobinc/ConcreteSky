@@ -21,5 +21,6 @@ import './follows/followers.js';
 import './follows/following.js';
 import './system/cache_status.js';
 import './system/db_manager.js';
+import './system/cache_settings_lightbox.js';
 
 // Nothing to export; modules are imported for side effects.
