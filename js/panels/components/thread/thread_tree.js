@@ -1,4 +1,11 @@
+import { call } from '../../../api.js';
+
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
+
+const atUriToWebPost = (uri) => {
+  const m = String(uri || '').match(/^at:\/\/([^/]+)\/app\.bsky\.feed\.post\/([^/]+)/);
+  return m ? `https://bsky.app/profile/${m[1]}/post/${m[2]}` : '';
+};
 
 function pickText(post) {
   const rec = post?.record || {};
@@ -61,7 +68,7 @@ function renderImagesGrid(images) {
   `;
 }
 
-function renderVideo(video) {
+function renderVideo(video, openUrl = '') {
   if (!video) return '';
   const src = String(video.playlist || '');
   if (!src) return '';
@@ -73,6 +80,7 @@ function renderVideo(video) {
       <video controls playsinline preload="metadata"${poster}>
         <source src="${esc(src)}" type="${esc(type)}" />
       </video>
+      ${openUrl ? `<a class="open" href="${esc(openUrl)}" target="_blank" rel="noopener">Open on Bluesky</a>` : ''}
     </div>
   `;
 }
@@ -83,6 +91,41 @@ export class BskyThreadTree extends HTMLElement {
     this.attachShadow({ mode: 'open' });
     this._thread = null; // getPostThread().thread
     this._replyTo = null; // { uri, author }
+    this._toggleBusy = new Set(); // uri
+  }
+
+  _findPostByUriInThread(uri) {
+    const target = String(uri || '');
+    if (!target) return null;
+
+    const visit = (node) => {
+      if (!node) return null;
+      const p = node?.post || null;
+      if (p && String(p.uri || '') === target) return p;
+
+      const replies = Array.isArray(node?.replies) ? node.replies : [];
+      for (const r of replies) {
+        const hit = visit(r);
+        if (hit) return hit;
+      }
+      return null;
+    };
+
+    // Root + replies
+    let hit = visit(this._thread);
+    if (hit) return hit;
+
+    // Ancestors (via parent chain)
+    try {
+      let cur = this._thread?.parent || null;
+      while (cur) {
+        const p = cur?.post || null;
+        if (p && String(p.uri || '') === target) return p;
+        cur = cur.parent || null;
+      }
+    } catch {}
+
+    return null;
   }
 
   collectAncestors(node) {
@@ -112,7 +155,7 @@ export class BskyThreadTree extends HTMLElement {
     this.shadowRoot.addEventListener('click', (e) => this.onClick(e));
   }
 
-  onClick(e) {
+  async onClick(e) {
     const btn = e.target?.closest?.('[data-reply-uri]');
     if (btn) {
       const uri = btn.getAttribute('data-reply-uri') || '';
@@ -125,6 +168,41 @@ export class BskyThreadTree extends HTMLElement {
       }));
       return;
     }
+
+    const rep = e.target?.closest?.('[data-repost-uri]');
+    if (rep) {
+      const uri = rep.getAttribute('data-repost-uri') || '';
+      const cid = rep.getAttribute('data-repost-cid') || '';
+      const reposted = rep.getAttribute('data-reposted') === '1';
+      if (!uri || !cid) return;
+      if (this._toggleBusy.has(uri)) return;
+
+      this._toggleBusy.add(uri);
+      try {
+        rep.setAttribute('disabled', '');
+        await call(reposted ? 'unrepost' : 'repost', { uri, cid });
+
+        const post = this._findPostByUriInThread(uri);
+        if (post) {
+          post.viewer = post.viewer || {};
+          if (reposted) {
+            try { delete post.viewer.repost; } catch { post.viewer.repost = null; }
+            if (typeof post.repostCount === 'number') post.repostCount = Math.max(0, post.repostCount - 1);
+          } else {
+            post.viewer.repost = post.viewer.repost || { uri: 'local' };
+            if (typeof post.repostCount === 'number') post.repostCount = post.repostCount + 1;
+          }
+        }
+
+        this.render();
+      } catch (err) {
+        console.warn('repost toggle failed', err);
+      } finally {
+        this._toggleBusy.delete(uri);
+        try { rep.removeAttribute('disabled'); } catch {}
+      }
+      return;
+    }
   }
 
   renderNode(node, depth, opts = {}) {
@@ -135,10 +213,13 @@ export class BskyThreadTree extends HTMLElement {
     const when = pickTime(post);
     const text = pickText(post);
 
+    const open = atUriToWebPost(uri);
+    const reposted = !!(post?.viewer && post.viewer.repost);
+
     const embed = post?.embed || null;
     const images = extractImagesFromEmbed(embed);
     const video = extractVideoFromEmbed(embed);
-    const embedsHtml = (images?.length ? renderImagesGrid(images) : '') + (video ? renderVideo(video) : '');
+    const embedsHtml = (images?.length ? renderImagesGrid(images) : '') + (video ? renderVideo(video, open) : '');
 
     const variant = String(opts?.variant || '');
 
@@ -151,7 +232,9 @@ export class BskyThreadTree extends HTMLElement {
           <div class="meta">
             <div class="who">${esc(who)}</div>
             <div class="when">${esc(when)}</div>
+            ${(open) ? `<a class="open" href="${esc(open)}" target="_blank" rel="noopener">Open</a>` : ''}
             ${(variant !== 'ancestor' && uri) ? `<button class="reply" type="button" data-reply-uri="${esc(uri)}" data-reply-cid="${esc(cid)}" data-reply-author="${esc(who)}">Reply</button>` : ''}
+            ${(variant !== 'ancestor' && uri) ? `<button class="repost" type="button" data-repost-uri="${esc(uri)}" data-repost-cid="${esc(cid)}" data-reposted="${reposted ? '1' : '0'}">${reposted ? 'Undo repost' : 'Repost'}</button>` : ''}
           </div>
           ${text ? `<div class="text">${esc(text)}</div>` : '<div class="text muted">(no text)</div>'}
           ${embedsHtml ? `<div class="embeds">${embedsHtml}</div>` : ''}
@@ -181,18 +264,23 @@ export class BskyThreadTree extends HTMLElement {
         .when{margin-left:auto; white-space:nowrap}
         .text{white-space:pre-wrap; line-height:1.25}
 
+        .open{color:#9cd3ff; text-decoration:none}
+        .open:hover{text-decoration:underline}
+
         .embeds{margin-top:8px}
         .images-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:6px}
         .img-wrap{margin:0;background:#111;overflow:hidden}
         .img-wrap img{width:100%;height:auto;display:block}
         .video-wrap video{width:100%;height:auto;display:block;background:#111}
+        .video-wrap .open{display:inline-block;margin-top:6px}
 
         .ancestors{margin:0 0 10px 0}
         .node.ancestor{border-left: 2px solid rgba(255,255,255,0.12)}
         .node.ancestor .card{background:#090909}
 
-        .reply{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius: var(--bsky-radius, 0px); padding:4px 10px; cursor:pointer}
-        .reply:hover{border-color:#3b5a8f}
+        .reply,.repost{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius: var(--bsky-radius, 0px); padding:4px 10px; cursor:pointer}
+        .reply:hover,.repost:hover{border-color:#3b5a8f}
+        .reply:disabled,.repost:disabled{opacity:.6; cursor:not-allowed}
 
         .replies{margin-top:8px}
       </style>
