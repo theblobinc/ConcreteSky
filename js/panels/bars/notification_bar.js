@@ -98,9 +98,48 @@ class BskyNotificationBar extends HTMLElement {
     this._listAnchor = null;
     this._listScrollTop = 0;
 
+    this._syncRecentTimer = null;
+    this._syncRecentNextAt = 0;
+    this._syncRecentQueuedMinutes = 0;
+    this._syncRecentThrottleMs = 8000;
+    this._suppressNextRefreshRecent = false;
+
     this._refreshRecentHandler = (e) => {
+      if (this._suppressNextRefreshRecent) {
+        this._suppressNextRefreshRecent = false;
+        return;
+      }
       const mins = Number(e?.detail?.minutes ?? this._lookbackMinutes);
       this.refreshRecent(mins);
+    };
+
+    this._syncRecentHandler = (e) => {
+      const mins = Math.max(1, Number(e?.detail?.minutes ?? this._lookbackMinutes));
+      this._syncRecentQueuedMinutes = Math.max(this._syncRecentQueuedMinutes || 0, mins);
+
+      if (this._syncRecentTimer) return;
+
+      const now = Date.now();
+      const wait = Math.max(300, this._syncRecentNextAt ? (this._syncRecentNextAt - now) : 0);
+
+      this._syncRecentTimer = setTimeout(async () => {
+        const minutes = Math.max(1, Number(this._syncRecentQueuedMinutes || this._lookbackMinutes));
+        this._syncRecentQueuedMinutes = 0;
+        this._syncRecentTimer = null;
+        this._syncRecentNextAt = Date.now() + this._syncRecentThrottleMs;
+
+        try {
+          await this.syncRecentThenRefresh(minutes);
+        } catch (err) {
+          console.warn('notif bar syncRecentThenRefresh failed', err);
+        }
+
+        // Tell other panels to pull in the newly-synced cached rows.
+        try {
+          this._suppressNextRefreshRecent = true;
+          window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes } }));
+        } catch {}
+      }, Math.max(0, wait));
     };
 
     this._authChangedHandler = (e) => {
@@ -156,6 +195,7 @@ class BskyNotificationBar extends HTMLElement {
     this.shadowRoot.addEventListener('change', (e) => this.onChange(e));
 
     window.addEventListener('bsky-refresh-recent', this._refreshRecentHandler);
+    window.addEventListener('bsky-sync-recent', this._syncRecentHandler);
     window.addEventListener('bsky-auth-changed', this._authChangedHandler);
     window.addEventListener('bsky-cache-unavailable', this._cacheUnavailableHandler);
     window.addEventListener('bsky-open-settings', this._openSettingsHandler);
@@ -170,6 +210,7 @@ class BskyNotificationBar extends HTMLElement {
 
   disconnectedCallback() {
     window.removeEventListener('bsky-refresh-recent', this._refreshRecentHandler);
+    window.removeEventListener('bsky-sync-recent', this._syncRecentHandler);
     window.removeEventListener('bsky-auth-changed', this._authChangedHandler);
     window.removeEventListener('bsky-cache-unavailable', this._cacheUnavailableHandler);
     window.removeEventListener('bsky-open-settings', this._openSettingsHandler);

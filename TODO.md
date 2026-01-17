@@ -1,6 +1,6 @@
 # TODO (ConcreteSky)
 
-This is the top-level TODO for the package (GitHub-facing). A more detailed/legacy planning doc exists at `single_pages/concretesky/TODO.md`.
+This is the top-level TODO for the package (GitHub-facing).
 
 ## Already done (implemented)
 
@@ -46,6 +46,7 @@ This is the top-level TODO for the package (GitHub-facing). A more detailed/lega
 - Persist DB Manager settings (calendar selections, pagesMax, notifications window, posts filter) optionally in localStorage. (Implemented: `bsky.dbManager.prefs`.)
 - Add staleness threshold configuration (what counts as “stale” for cached rows and UI warnings). (Implemented in DB Manager; can be propagated to other panels if desired.)
 - Improve rate-limit errors (surface retry-after / backoff hints; reduce spammy retries). (Implemented: Retry-After surfaced + UI backoff in long-running loops.)
+- Add a compact, themeable style system (CSS variables) to keep colors/spacing consistent across panels.
 
 ### 5) Notifications UX (bar + panel)
 
@@ -56,6 +57,7 @@ This is the top-level TODO for the package (GitHub-facing). A more detailed/lega
 
 - Optional FTS search for cached profiles/posts (SQLite FTS5), with a clean fallback to LIKE when unavailable. (Posts FTS implemented; falls back to LIKE if FTS5 isn't available.)
 - Export tools (CSV/JSON) for cached datasets (followers/following/notifications/posts) for AI workflows. (Posts/notifications/followers/following export implemented via `cacheExport`.)
+- Add “signals” / analyst views for suspicious or unusual activity patterns (e.g. account age buckets, follower/following ratio, sudden spikes, top interactors).
 
 ### 7) Posts / Threads UI (feed + content)
 
@@ -75,6 +77,20 @@ This is the top-level TODO for the package (GitHub-facing). A more detailed/lega
 - Reposting:
 	- Repost/unrepost actions in cards and thread view.
 	- Keep UI state in sync (optimistic update + refresh).
+
+### 8) People monitoring (watchlist + activity)
+
+- Add a “Watchlist” / People Monitoring panel:
+	- Add/remove Bluesky users by handle/DID.
+	- Persist watchlist in SQLite (and expose via API).
+- Cache watched users’ profile + recent posts on-demand and on a schedule.
+- Activity stats for watched users:
+	- Posting frequency, active hours/days, recent streaks.
+	- Interaction stats: replies/likes/reposts involving you and/or other watched users.
+	- “New since last check” summaries.
+- Notifications for watched users:
+	- In-app notifications when they post (and optionally when they are replied to / quoted / reposted).
+	- Optional: email notifications and web push notifications (future).
 
 ## Maintenance
 

@@ -19,6 +19,8 @@ export class BskyContentPanel extends HTMLElement {
     this._thread = null; // getPostThread().thread
     this._replyTo = null; // { uri, cid, author }
     this._posting = false;
+
+    this._replyPostedHandler = null;
   }
 
   pickThreadRootRef(thread) {
@@ -57,6 +59,25 @@ export class BskyContentPanel extends HTMLElement {
     this.shadowRoot.addEventListener('bsky-submit-comment', (e) => {
       this.submitComment(e?.detail || null);
     });
+
+    // If a reply is posted elsewhere into the currently open thread, refresh this view.
+    if (!this._replyPostedHandler) {
+      this._replyPostedHandler = (e) => {
+        if (this._loading || this._posting) return;
+        const d = e?.detail || {};
+        const rootUri = String(d?.rootUri || '');
+        if (!rootUri || !this._thread) return;
+        const currentRoot = this.pickThreadRootRef(this._thread);
+        if (!currentRoot?.uri) return;
+        if (String(currentRoot.uri) !== rootUri) return;
+        this.load();
+      };
+    }
+    window.addEventListener('bsky-reply-posted', this._replyPostedHandler);
+  }
+
+  disconnectedCallback() {
+    if (this._replyPostedHandler) window.removeEventListener('bsky-reply-posted', this._replyPostedHandler);
   }
 
   async submitComment(detail) {
@@ -110,6 +131,30 @@ export class BskyContentPanel extends HTMLElement {
         },
         ...(embed ? { embed } : {}),
       });
+
+      // Ensure cached feeds can see the new reply.
+      // Prefer the throttled global sync (handled centrally), but fall back to a direct sync if the
+      // notification bar isn't present/connected.
+      try {
+        if (window.BSKY?.cacheAvailable !== false) {
+          const notifBar = document.querySelector('bsky-notification-bar');
+          const canUseThrottledSync = !!(notifBar && notifBar.isConnected);
+
+          if (canUseThrottledSync) {
+            window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 10 } }));
+          } else {
+            await call('cacheSyncRecent', { minutes: 10 });
+            window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes: 30 } }));
+          }
+        }
+      } catch {}
+
+      // Notify other panels (Posts) to update reply counts / refresh.
+      try {
+        window.dispatchEvent(new CustomEvent('bsky-reply-posted', {
+          detail: { uri: parentUri, rootUri: rootRef.uri },
+        }));
+      } catch {}
 
       // Clear reply target and refresh thread.
       this._replyTo = null;

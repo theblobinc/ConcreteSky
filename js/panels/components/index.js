@@ -12,6 +12,7 @@ import './connections/connections.js';
 import './notifications/notifications.js';
 import './notifications/notifications_panel.js';
 import './content/content_panel.js';
+import './people/people_panel.js';
 import './thread/thread_tree.js';
 import './comment/comment_composer.js';
 

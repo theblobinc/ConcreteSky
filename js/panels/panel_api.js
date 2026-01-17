@@ -556,5 +556,6 @@ import posts from './templates/posts.js';
 import connections from './templates/connections.js';
 import notifications from './templates/notifications.js';
 import content from './templates/content.js';
+import people from './templates/people.js';
 
-[posts, connections, notifications, content].forEach(registerPanelTemplate);
+[posts, connections, notifications, content, people].forEach(registerPanelTemplate);

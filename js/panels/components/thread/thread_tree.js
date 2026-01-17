@@ -75,11 +75,13 @@ function renderVideo(video, openUrl = '') {
   const poster = video.thumb ? ` poster="${esc(video.thumb)}"` : '';
   // NOTE: Many Bluesky videos are HLS (m3u8). Some browsers can’t play HLS without hls.js.
   const type = src.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp4';
+  const isHls = src.endsWith('.m3u8');
   return `
     <div class="video-wrap">
       <video controls playsinline preload="metadata"${poster}>
         <source src="${esc(src)}" type="${esc(type)}" />
       </video>
+      ${isHls ? `<div class="hint">HLS video: if it won’t play here, use Open on Bluesky.</div>` : ''}
       ${openUrl ? `<a class="open" href="${esc(openUrl)}" target="_blank" rel="noopener">Open on Bluesky</a>` : ''}
     </div>
   `;
@@ -92,6 +94,36 @@ export class BskyThreadTree extends HTMLElement {
     this._thread = null; // getPostThread().thread
     this._replyTo = null; // { uri, author }
     this._toggleBusy = new Set(); // uri
+
+    this._likeChangedHandler = null;
+    this._repostChangedHandler = null;
+  }
+
+  applyEngagementPatch(patch) {
+    const uri = String(patch?.uri || '');
+    if (!uri) return;
+
+    const post = this._findPostByUriInThread(uri);
+    if (!post) return;
+
+    post.viewer = post.viewer || {};
+
+    if (typeof patch?.liked === 'boolean') {
+      if (patch.liked) post.viewer.like = post.viewer.like || { uri: 'local' };
+      else {
+        try { delete post.viewer.like; } catch { post.viewer.like = null; }
+      }
+    }
+    if (typeof patch?.reposted === 'boolean') {
+      if (patch.reposted) post.viewer.repost = post.viewer.repost || { uri: 'local' };
+      else {
+        try { delete post.viewer.repost; } catch { post.viewer.repost = null; }
+      }
+    }
+    if (typeof patch?.likeCount === 'number') post.likeCount = Math.max(0, patch.likeCount);
+    if (typeof patch?.repostCount === 'number') post.repostCount = Math.max(0, patch.repostCount);
+
+    this.render();
   }
 
   _findPostByUriInThread(uri) {
@@ -153,6 +185,36 @@ export class BskyThreadTree extends HTMLElement {
   connectedCallback() {
     this.render();
     this.shadowRoot.addEventListener('click', (e) => this.onClick(e));
+
+    // Keep this thread view in sync with actions taken elsewhere (Posts panel, modals, etc).
+    if (!this._likeChangedHandler) {
+      this._likeChangedHandler = (e) => {
+        const d = e?.detail || {};
+        const uri = String(d?.uri || '');
+        if (!uri) return;
+        const liked = (typeof d?.liked === 'boolean') ? d.liked : undefined;
+        const likeCount = (typeof d?.likeCount === 'number') ? d.likeCount : undefined;
+        this.applyEngagementPatch({ uri, liked, likeCount });
+      };
+    }
+    if (!this._repostChangedHandler) {
+      this._repostChangedHandler = (e) => {
+        const d = e?.detail || {};
+        const uri = String(d?.uri || '');
+        if (!uri) return;
+        const reposted = (typeof d?.reposted === 'boolean') ? d.reposted : undefined;
+        const repostCount = (typeof d?.repostCount === 'number') ? d.repostCount : undefined;
+        this.applyEngagementPatch({ uri, reposted, repostCount });
+      };
+    }
+
+    window.addEventListener('bsky-like-changed', this._likeChangedHandler);
+    window.addEventListener('bsky-repost-changed', this._repostChangedHandler);
+  }
+
+  disconnectedCallback() {
+    if (this._likeChangedHandler) window.removeEventListener('bsky-like-changed', this._likeChangedHandler);
+    if (this._repostChangedHandler) window.removeEventListener('bsky-repost-changed', this._repostChangedHandler);
   }
 
   async onClick(e) {
@@ -194,12 +256,77 @@ export class BskyThreadTree extends HTMLElement {
           }
         }
 
+        this.dispatchEvent(new CustomEvent('bsky-repost-changed', {
+          detail: {
+            uri,
+            cid,
+            reposted: !reposted,
+            repostCount: (typeof post?.repostCount === 'number') ? post.repostCount : null,
+          },
+          bubbles: true,
+          composed: true,
+        }));
+
+        try {
+          window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 5 } }));
+        } catch {}
+
         this.render();
       } catch (err) {
         console.warn('repost toggle failed', err);
       } finally {
         this._toggleBusy.delete(uri);
         try { rep.removeAttribute('disabled'); } catch {}
+      }
+      return;
+    }
+
+    const likeBtn = e.target?.closest?.('[data-like-uri]');
+    if (likeBtn) {
+      const uri = likeBtn.getAttribute('data-like-uri') || '';
+      const cid = likeBtn.getAttribute('data-like-cid') || '';
+      const liked = likeBtn.getAttribute('data-liked') === '1';
+      if (!uri || !cid) return;
+      if (this._toggleBusy.has(uri)) return;
+
+      this._toggleBusy.add(uri);
+      try {
+        likeBtn.setAttribute('disabled', '');
+        await call(liked ? 'unlike' : 'like', { uri, cid });
+
+        const post = this._findPostByUriInThread(uri);
+        if (post) {
+          post.viewer = post.viewer || {};
+          if (liked) {
+            try { delete post.viewer.like; } catch { post.viewer.like = null; }
+            if (typeof post.likeCount === 'number') post.likeCount = Math.max(0, post.likeCount - 1);
+          } else {
+            post.viewer.like = post.viewer.like || { uri: 'local' };
+            if (typeof post.likeCount === 'number') post.likeCount = post.likeCount + 1;
+          }
+        }
+
+        this.dispatchEvent(new CustomEvent('bsky-like-changed', {
+          detail: {
+            uri,
+            cid,
+            liked: !liked,
+            likeCount: (typeof post?.likeCount === 'number') ? post.likeCount : null,
+          },
+          bubbles: true,
+          composed: true,
+        }));
+
+        try {
+          window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 5 } }));
+        } catch {}
+
+        this.render();
+      } catch (err) {
+        console.warn('like toggle failed', err);
+      } finally {
+        this._toggleBusy.delete(uri);
+        try { likeBtn.removeAttribute('disabled'); } catch {}
       }
       return;
     }
@@ -215,6 +342,7 @@ export class BskyThreadTree extends HTMLElement {
 
     const open = atUriToWebPost(uri);
     const reposted = !!(post?.viewer && post.viewer.repost);
+    const liked = !!(post?.viewer && post.viewer.like);
 
     const embed = post?.embed || null;
     const images = extractImagesFromEmbed(embed);
@@ -235,6 +363,7 @@ export class BskyThreadTree extends HTMLElement {
             ${(open) ? `<a class="open" href="${esc(open)}" target="_blank" rel="noopener">Open</a>` : ''}
             ${(variant !== 'ancestor' && uri) ? `<button class="reply" type="button" data-reply-uri="${esc(uri)}" data-reply-cid="${esc(cid)}" data-reply-author="${esc(who)}">Reply</button>` : ''}
             ${(variant !== 'ancestor' && uri) ? `<button class="repost" type="button" data-repost-uri="${esc(uri)}" data-repost-cid="${esc(cid)}" data-reposted="${reposted ? '1' : '0'}">${reposted ? 'Undo repost' : 'Repost'}</button>` : ''}
+            ${(variant !== 'ancestor' && uri) ? `<button class="like" type="button" data-like-uri="${esc(uri)}" data-like-cid="${esc(cid)}" data-liked="${liked ? '1' : '0'}">${liked ? 'Unlike' : 'Like'}</button>` : ''}
           </div>
           ${text ? `<div class="text">${esc(text)}</div>` : '<div class="text muted">(no text)</div>'}
           ${embedsHtml ? `<div class="embeds">${embedsHtml}</div>` : ''}
@@ -273,14 +402,15 @@ export class BskyThreadTree extends HTMLElement {
         .img-wrap img{width:100%;height:auto;display:block}
         .video-wrap video{width:100%;height:auto;display:block;background:#111}
         .video-wrap .open{display:inline-block;margin-top:6px}
+        .video-wrap .hint{margin-top:6px;color:#aaa;font-size:0.9rem}
 
         .ancestors{margin:0 0 10px 0}
         .node.ancestor{border-left: 2px solid rgba(255,255,255,0.12)}
         .node.ancestor .card{background:#090909}
 
-        .reply,.repost{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius: var(--bsky-radius, 0px); padding:4px 10px; cursor:pointer}
-        .reply:hover,.repost:hover{border-color:#3b5a8f}
-        .reply:disabled,.repost:disabled{opacity:.6; cursor:not-allowed}
+        .reply,.repost,.like{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius: var(--bsky-radius, 0px); padding:4px 10px; cursor:pointer}
+        .reply:hover,.repost:hover,.like:hover{border-color:#3b5a8f}
+        .reply:disabled,.repost:disabled,.like:disabled{opacity:.6; cursor:not-allowed}
 
         .replies{margin-top:8px}
       </style>
@@ -289,4 +419,6 @@ export class BskyThreadTree extends HTMLElement {
   }
 }
 
-customElements.define('bsky-thread-tree', BskyThreadTree);
+if (!customElements.get('bsky-thread-tree')) {
+  customElements.define('bsky-thread-tree', BskyThreadTree);
+}

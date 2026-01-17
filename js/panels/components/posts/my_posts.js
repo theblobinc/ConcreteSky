@@ -133,6 +133,7 @@ function renderVideoPoster(video, openUrl) {
   const src = String(video?.playlist || '');
   const poster = String(video?.thumb || '');
   const type = src.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp4';
+  const isHls = src.endsWith('.m3u8');
 
   if (src) {
     return `
@@ -140,6 +141,7 @@ function renderVideoPoster(video, openUrl) {
         <video controls playsinline preload="metadata" ${poster ? `poster="${esc(poster)}"` : ''}>
           <source src="${esc(src)}" type="${esc(type)}" />
         </video>
+        ${isHls ? `<div class="hint" style="margin-top:6px;color:#aaa;font-size:0.9rem">HLS video: if it won’t play here, use Open on Bluesky.</div>` : ''}
         ${openUrl ? `<a class="open" href="${esc(openUrl)}" target="_blank" rel="noopener" style="display:inline-block;margin-top:6px">Open on Bluesky</a>` : ''}
       </div>
     `;
@@ -220,6 +222,10 @@ class BskyMyPosts extends HTMLElement {
     this._expandedThreadMode = new Map(); // rootUri -> 'preview' | 'full'
     this._threadCache = new Map(); // rootUri -> { preview: out|null, full: out|null }
     this._postingRoots = new Set(); // rootUri (prevent double posts)
+
+    this._likeChangedHandler = null;
+    this._repostChangedHandler = null;
+    this._replyPostedHandler = null;
 
     this._refreshRecentHandler = (e) => {
       const mins = Number(e?.detail?.minutes ?? 2);
@@ -367,6 +373,18 @@ class BskyMyPosts extends HTMLElement {
     }
   }
 
+  _findCachedPostByUri(uri) {
+    const target = String(uri || '');
+    if (!target) return null;
+    try {
+      for (const it of this._allItems()) {
+        const p = it?.post || null;
+        if (p && String(p.uri || '') === target) return p;
+      }
+    } catch {}
+    return null;
+  }
+
   connectedCallback(){
     this.render();
     this.load(true);
@@ -395,6 +413,93 @@ class BskyMyPosts extends HTMLElement {
       if (!entry) return;
       this._submitInlineComment(entry, detail);
     });
+
+    // Keep feed card counts/buttons in sync when interactions happen anywhere (inline thread or Content panel).
+    if (!this._likeChangedHandler) {
+      this._likeChangedHandler = (e) => {
+        const d = e?.detail || {};
+        const uri = String(d?.uri || '');
+        if (!uri) return;
+        const liked = (typeof d?.liked === 'boolean') ? d.liked : null;
+
+        const p = this._findCachedPostByUri(uri);
+        if (p) {
+          p.viewer = p.viewer || {};
+          if (typeof liked === 'boolean') {
+            if (liked) p.viewer.like = p.viewer.like || { uri: 'local' };
+            else {
+              try { delete p.viewer.like; } catch { p.viewer.like = null; }
+            }
+          }
+          if (typeof d?.likeCount === 'number') p.likeCount = Math.max(0, d.likeCount);
+        }
+
+        try {
+          const postEl = this.shadowRoot.querySelector(`.post[data-uri="${this._cssEscape(uri)}"]`);
+          const likeBtn = postEl?.querySelector?.('[data-like]');
+          if (likeBtn && typeof liked === 'boolean') {
+            likeBtn.setAttribute('data-liked', liked ? '1' : '0');
+            likeBtn.textContent = liked ? 'Unlike' : 'Like';
+          }
+          const cnt = postEl?.querySelector?.('[data-open-interactions][data-kind="likes"]');
+          if (cnt && p && typeof p.likeCount === 'number') cnt.textContent = `♥ ${p.likeCount}`;
+        } catch {}
+      };
+    }
+
+    if (!this._repostChangedHandler) {
+      this._repostChangedHandler = (e) => {
+        const d = e?.detail || {};
+        const uri = String(d?.uri || '');
+        if (!uri) return;
+        const reposted = (typeof d?.reposted === 'boolean') ? d.reposted : null;
+
+        const p = this._findCachedPostByUri(uri);
+        if (p) {
+          p.viewer = p.viewer || {};
+          if (typeof reposted === 'boolean') {
+            if (reposted) p.viewer.repost = p.viewer.repost || { uri: 'local' };
+            else {
+              try { delete p.viewer.repost; } catch { p.viewer.repost = null; }
+            }
+          }
+          if (typeof d?.repostCount === 'number') p.repostCount = Math.max(0, d.repostCount);
+        }
+
+        try {
+          const postEl = this.shadowRoot.querySelector(`.post[data-uri="${this._cssEscape(uri)}"]`);
+          const btn = postEl?.querySelector?.('[data-repost]');
+          if (btn && typeof reposted === 'boolean') {
+            btn.setAttribute('data-reposted', reposted ? '1' : '0');
+            btn.textContent = reposted ? 'Undo repost' : 'Repost';
+          }
+          const cnt = postEl?.querySelector?.('[data-open-interactions][data-kind="reposts"]');
+          if (cnt && p && typeof p.repostCount === 'number') cnt.textContent = `🔁 ${p.repostCount}`;
+        } catch {}
+      };
+    }
+
+    window.addEventListener('bsky-like-changed', this._likeChangedHandler);
+    window.addEventListener('bsky-repost-changed', this._repostChangedHandler);
+
+    if (!this._replyPostedHandler) {
+      this._replyPostedHandler = (e) => {
+        const d = e?.detail || {};
+        const uri = String(d?.uri || '');
+        if (!uri) return;
+
+        const p = this._findCachedPostByUri(uri);
+        if (p && typeof p.replyCount === 'number') {
+          p.replyCount = p.replyCount + 1;
+          try {
+            const postEl = this.shadowRoot.querySelector(`.post[data-uri="${this._cssEscape(uri)}"]`);
+            const cnt = postEl?.querySelector?.('[data-open-interactions][data-kind="replies"]');
+            if (cnt) cnt.textContent = `💬 ${p.replyCount}`;
+          } catch {}
+        }
+      };
+    }
+    window.addEventListener('bsky-reply-posted', this._replyPostedHandler);
 
     window.addEventListener('bsky-refresh-recent', this._refreshRecentHandler);
 
@@ -467,6 +572,9 @@ class BskyMyPosts extends HTMLElement {
 
   disconnectedCallback(){
     window.removeEventListener('bsky-refresh-recent', this._refreshRecentHandler);
+    if (this._likeChangedHandler) window.removeEventListener('bsky-like-changed', this._likeChangedHandler);
+    if (this._repostChangedHandler) window.removeEventListener('bsky-repost-changed', this._repostChangedHandler);
+    if (this._replyPostedHandler) window.removeEventListener('bsky-reply-posted', this._replyPostedHandler);
     if (this._authChangedHandler) window.removeEventListener('bsky-auth-changed', this._authChangedHandler);
     if (this._onSearchChanged) {
       try { window.removeEventListener(BSKY_SEARCH_EVENT, this._onSearchChanged); } catch {}
@@ -797,12 +905,119 @@ class BskyMyPosts extends HTMLElement {
       repostBtn.setAttribute('disabled', '');
       try {
         await call(reposted ? 'unrepost' : 'repost', { uri, cid });
+
+        const p = this._findCachedPostByUri(uri);
+        if (p) {
+          p.viewer = p.viewer || {};
+          if (reposted) {
+            try { delete p.viewer.repost; } catch { p.viewer.repost = null; }
+            if (typeof p.repostCount === 'number') p.repostCount = Math.max(0, p.repostCount - 1);
+          } else {
+            p.viewer.repost = p.viewer.repost || { uri: 'local' };
+            if (typeof p.repostCount === 'number') p.repostCount = p.repostCount + 1;
+          }
+        }
+
         repostBtn.setAttribute('data-reposted', reposted ? '0' : '1');
         repostBtn.textContent = reposted ? 'Repost' : 'Undo repost';
+
+        // If an inline thread is open, sync the thread tree root node too.
+        try {
+          const entry = repostBtn.closest?.('.entry');
+          const tree = entry?.querySelector?.('bsky-thread-tree');
+          tree?.applyEngagementPatch?.({ uri, reposted: !reposted, repostCount: (p && typeof p.repostCount === 'number') ? p.repostCount : undefined });
+        } catch {}
+
+        // Update visible count (if present).
+        try {
+          const postEl = repostBtn.closest?.('.post');
+          const cnt = postEl?.querySelector?.('[data-open-interactions][data-kind="reposts"]');
+          if (cnt && p && typeof p.repostCount === 'number') cnt.textContent = `🔁 ${p.repostCount}`;
+        } catch {}
+
+        // Broadcast for other panels (Content / modals / other feeds).
+        try {
+          window.dispatchEvent(new CustomEvent('bsky-repost-changed', {
+            detail: {
+              uri,
+              cid,
+              reposted: !reposted,
+              repostCount: (p && typeof p.repostCount === 'number') ? p.repostCount : null,
+            },
+          }));
+        } catch {}
+
+        try {
+          window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 5 } }));
+        } catch {}
       } catch (err) {
         console.warn('repost toggle failed', err);
       } finally {
         try { repostBtn.removeAttribute('disabled'); } catch {}
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    // Like/unlike
+    const likeBtn = e.target.closest?.('[data-like]');
+    if (likeBtn) {
+      const uri = likeBtn.getAttribute('data-uri') || '';
+      const cid = likeBtn.getAttribute('data-cid') || '';
+      if (!uri || !cid) return;
+      const liked = likeBtn.getAttribute('data-liked') === '1';
+      likeBtn.setAttribute('disabled', '');
+      try {
+        await call(liked ? 'unlike' : 'like', { uri, cid });
+
+        const p = this._findCachedPostByUri(uri);
+        if (p) {
+          p.viewer = p.viewer || {};
+          if (liked) {
+            try { delete p.viewer.like; } catch { p.viewer.like = null; }
+            if (typeof p.likeCount === 'number') p.likeCount = Math.max(0, p.likeCount - 1);
+          } else {
+            p.viewer.like = p.viewer.like || { uri: 'local' };
+            if (typeof p.likeCount === 'number') p.likeCount = p.likeCount + 1;
+          }
+        }
+
+        likeBtn.setAttribute('data-liked', liked ? '0' : '1');
+        likeBtn.textContent = liked ? 'Like' : 'Unlike';
+
+        // If an inline thread is open, sync the thread tree root node too.
+        try {
+          const entry = likeBtn.closest?.('.entry');
+          const tree = entry?.querySelector?.('bsky-thread-tree');
+          tree?.applyEngagementPatch?.({ uri, liked: !liked, likeCount: (p && typeof p.likeCount === 'number') ? p.likeCount : undefined });
+        } catch {}
+
+        try {
+          const postEl = likeBtn.closest?.('.post');
+          const cnt = postEl?.querySelector?.('[data-open-interactions][data-kind="likes"]');
+          if (cnt && p && typeof p.likeCount === 'number') cnt.textContent = `♥ ${p.likeCount}`;
+        } catch {}
+
+        // Broadcast for other panels (Content / modals / other feeds).
+        try {
+          window.dispatchEvent(new CustomEvent('bsky-like-changed', {
+            detail: {
+              uri,
+              cid,
+              liked: !liked,
+              likeCount: (p && typeof p.likeCount === 'number') ? p.likeCount : null,
+            },
+          }));
+        } catch {}
+
+        try {
+          window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 5 } }));
+        } catch {}
+      } catch (err) {
+        console.warn('like toggle failed', err);
+      } finally {
+        try { likeBtn.removeAttribute('disabled'); } catch {}
       }
       e.preventDefault();
       e.stopPropagation();
@@ -1082,6 +1297,38 @@ class BskyMyPosts extends HTMLElement {
         },
         ...(embed ? { embed } : {}),
       });
+
+      // Optimistically bump reply count on the parent post.
+      try {
+        const p = this._findCachedPostByUri(parentUri);
+        if (p && typeof p.replyCount === 'number') {
+          p.replyCount = p.replyCount + 1;
+          try {
+            const postEl = this.shadowRoot.querySelector(`.post[data-uri="${this._cssEscape(parentUri)}"]`);
+            const cnt = postEl?.querySelector?.('[data-open-interactions][data-kind="replies"]');
+            if (cnt) cnt.textContent = `💬 ${p.replyCount}`;
+          } catch {}
+        }
+      } catch {}
+
+      // Let other panels (e.g. Content) sync their own copies.
+      try {
+        window.dispatchEvent(new CustomEvent('bsky-reply-posted', { detail: { uri: parentUri, rootUri } }));
+      } catch {}
+
+      // Ensure cached feeds can see the new reply.
+      try {
+        if (window.BSKY?.cacheAvailable !== false) {
+          const notifBar = document.querySelector('bsky-notification-bar');
+          const canUseThrottledSync = !!(notifBar && notifBar.isConnected);
+          if (canUseThrottledSync) {
+            window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 10 } }));
+          } else {
+            await call('cacheSyncRecent', { minutes: 10 });
+            window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes: 30 } }));
+          }
+        }
+      } catch {}
 
       // Refresh thread cache and rerender expanded thread.
       try {
@@ -1500,6 +1747,9 @@ class BskyMyPosts extends HTMLElement {
       const reposted = !!(p?.viewer && p.viewer.repost);
       const repostLabel = reposted ? 'Undo repost' : 'Repost';
 
+      const liked = !!(p?.viewer && p.viewer.like);
+      const likeLabel = liked ? 'Unlike' : 'Like';
+
       return `
         <div class="post" style="--depth:${esc(depth)}" data-ord="${esc(ord)}" data-uri="${esc(uri)}" data-cid="${esc(cid)}">
           <header class="meta">
@@ -1520,6 +1770,7 @@ class BskyMyPosts extends HTMLElement {
           <footer class="actions">
             <button class="act" type="button" data-reply data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-author="${esc(handle ? `@${handle}` : '')}">Reply</button>
             <button class="act" type="button" data-repost data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-reposted="${reposted ? '1' : '0'}">${esc(repostLabel)}</button>
+            <button class="act" type="button" data-like data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-liked="${liked ? '1' : '0'}">${esc(likeLabel)}</button>
           </footer>
         </div>
       `;

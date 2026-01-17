@@ -172,6 +172,33 @@ export class BskyInteractionsModal extends HTMLElement {
       if (action === 'repost')  await call('repost',  { uri, cid });
       if (action === 'unrepost')await call('unrepost',{ uri, cid });
       await this.refreshOnePost(uri);
+
+      // Broadcast engagement changes so other panels (Posts / thread tree) can update.
+      try {
+        const p = postCache.get(uri) || this.state?.subject;
+        if (p && String(p?.uri || '') === String(uri || '')) {
+          const liked = !!(p?.viewer && p.viewer.like);
+          const reposted = !!(p?.viewer && p.viewer.repost);
+          const likeCount = (typeof p?.likeCount === 'number') ? p.likeCount : null;
+          const repostCount = (typeof p?.repostCount === 'number') ? p.repostCount : null;
+
+          if (action === 'like' || action === 'unlike') {
+            window.dispatchEvent(new CustomEvent('bsky-like-changed', {
+              detail: { uri, cid, liked, likeCount },
+            }));
+          }
+          if (action === 'repost' || action === 'unrepost') {
+            window.dispatchEvent(new CustomEvent('bsky-repost-changed', {
+              detail: { uri, cid, reposted, repostCount },
+            }));
+          }
+        }
+      } catch {}
+
+      // Ask the throttled cache sync to run so cache-based panels can refresh.
+      try {
+        window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 5 } }));
+      } catch {}
     } catch (e) {
       alert(`Action failed: ${e.message}`);
     }

@@ -27,7 +27,7 @@ class Api extends ParentController
      * Bump this when the cache schema/migration logic changes.
      * Stored in meta as __global__:schema_version so we can skip costly PRAGMA checks on every request.
      */
-    protected const CACHE_SCHEMA_VERSION = '2026-01-14-1';
+    protected const CACHE_SCHEMA_VERSION = '2026-01-17-1';
 
     protected static bool $envLoaded = false;
 
@@ -589,6 +589,34 @@ class Api extends ParentController
         } catch (\Throwable $e) {
             return '';
         }
+    }
+
+    protected function normalizeActorInput(string $actor): string
+    {
+        $actor = trim($actor);
+        if ($actor === '') return '';
+        if (str_starts_with($actor, '@')) $actor = substr($actor, 1);
+        return trim($actor);
+    }
+
+    protected function resolveActorDid(array &$session, string $actorOrDid): string
+    {
+        $actorOrDid = $this->normalizeActorInput($actorOrDid);
+        if ($actorOrDid === '') {
+            throw new \RuntimeException('Missing actor', 400);
+        }
+        if (str_starts_with($actorOrDid, 'did:')) {
+            return $actorOrDid;
+        }
+
+        $resp = $this->xrpcSession('GET', 'com.atproto.identity.resolveHandle', $session, [
+            'handle' => $actorOrDid,
+        ]);
+        $did = (string)($resp['did'] ?? '');
+        if ($did === '') {
+            throw new \RuntimeException('Could not resolve handle to DID', 400);
+        }
+        return $did;
     }
 
     public function view()
@@ -1792,6 +1820,309 @@ class Api extends ParentController
                     ];
 
                     return $this->json($status);
+                }
+
+                /* ===================== people monitoring (watchlist) ===================== */
+
+                case 'watchListList': {
+                    $ownerDid = $session['did'] ?? null;
+                    if (!$ownerDid) return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $includeStats = (bool)($params['includeStats'] ?? true);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $st = $pdo->prepare('SELECT watched_did AS watchedDid, watched_handle AS watchedHandle, created_at AS createdAt, updated_at AS updatedAt, last_checked_at AS lastCheckedAt, last_seen_post_created_at AS lastSeenPostCreatedAt, last_seen_post_uri AS lastSeenPostUri FROM watchlist WHERE owner_did = :o ORDER BY COALESCE(updated_at, created_at) DESC');
+                    $st->execute([':o' => $ownerDid]);
+                    $rows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+
+                    $dids = [];
+                    foreach ($rows as $r) {
+                        if (!empty($r['watchedDid'])) $dids[] = (string)$r['watchedDid'];
+                    }
+
+                    $profiles = $dids ? $this->cacheLoadProfiles($pdo, $dids) : [];
+
+                    if ($includeStats && $dids) {
+                        foreach ($rows as &$r) {
+                            $did = (string)($r['watchedDid'] ?? '');
+                            if ($did === '') continue;
+                            $r['stats'] = [
+                                'cachedTotalPosts' => $this->cachePostsCount($pdo, $did),
+                                'cachedPosts24h' => $this->cachePostsCountSince($pdo, $did, 24),
+                                'cachedPosts7d' => $this->cachePostsCountSince($pdo, $did, 24 * 7),
+                            ];
+                        }
+                        unset($r);
+                    }
+
+                    return $this->json([
+                        'ok' => true,
+                        'ownerDid' => $ownerDid,
+                        'watchlist' => $rows,
+                        'profiles' => $profiles,
+                    ]);
+                }
+
+                case 'watchListAdd': {
+                    $ownerDid = $session['did'] ?? null;
+                    if (!$ownerDid) return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $actor = (string)($params['actor'] ?? '');
+                    if ($actor === '') return $this->json(['error' => 'Missing actor'], 400);
+
+                    $did = $this->resolveActorDid($session, $actor);
+
+                    // Hydrate profile (best-effort) so UI can render name/avatar immediately.
+                    $prof = null;
+                    try {
+                        $prof = $this->xrpcSession('GET', 'app.bsky.actor.getProfile', $session, ['actor' => $did]);
+                    } catch (\Throwable $e) {
+                        $prof = null;
+                    }
+
+                    $watchedHandle = null;
+                    if (is_array($prof) && !empty($prof['handle'])) $watchedHandle = (string)$prof['handle'];
+
+                    $prime = isset($params['prime']) ? (bool)$params['prime'] : true;
+                    $primeSeenIso = null;
+                    $primeSeenUri = null;
+                    if ($prime) {
+                        try {
+                            $resp = $this->xrpcSession('GET', 'app.bsky.feed.getAuthorFeed', $session, [
+                                'actor' => $did,
+                                'limit' => 1,
+                                'cursor' => null,
+                                'filter' => isset($params['filter']) ? (string)$params['filter'] : null,
+                            ]);
+                            $item = $resp['feed'][0] ?? null;
+                            if (is_array($item)) {
+                                $primeSeenIso = $item['post']['record']['createdAt'] ?? null;
+                                $primeSeenUri = $item['post']['uri'] ?? null;
+                            }
+                        } catch (\Throwable $e) {
+                            // ignore
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (is_array($prof) && !empty($prof['did'])) {
+                        try { $this->cacheUpsertProfile($pdo, $prof); } catch (\Throwable $e) { /* ignore */ }
+                    }
+
+                    $now = gmdate('c');
+                    $st = $pdo->prepare('INSERT INTO watchlist(owner_did, watched_did, watched_handle, created_at, updated_at, last_checked_at, last_seen_post_created_at, last_seen_post_uri)
+                        VALUES(:o,:d,:h,:c,:u,NULL,:s,:su)
+                        ON CONFLICT(owner_did, watched_did) DO UPDATE SET
+                          watched_handle=excluded.watched_handle,
+                          updated_at=excluded.updated_at,
+                          last_seen_post_created_at=CASE WHEN watchlist.last_seen_post_created_at IS NULL OR watchlist.last_seen_post_created_at = "" THEN excluded.last_seen_post_created_at ELSE watchlist.last_seen_post_created_at END,
+                          last_seen_post_uri=CASE WHEN watchlist.last_seen_post_uri IS NULL OR watchlist.last_seen_post_uri = "" THEN excluded.last_seen_post_uri ELSE watchlist.last_seen_post_uri END');
+                    $st->execute([
+                        ':o' => $ownerDid,
+                        ':d' => $did,
+                        ':h' => $watchedHandle,
+                        ':c' => $now,
+                        ':u' => $now,
+                        ':s' => $primeSeenIso,
+                        ':su' => $primeSeenUri,
+                    ]);
+
+                    return $this->json([
+                        'ok' => true,
+                        'ownerDid' => $ownerDid,
+                        'watchedDid' => $did,
+                        'profile' => $prof,
+                        'primedLastSeenAt' => $primeSeenIso,
+                        'primedLastSeenUri' => $primeSeenUri,
+                    ]);
+                }
+
+                case 'watchListRemove': {
+                    $ownerDid = $session['did'] ?? null;
+                    if (!$ownerDid) return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $did = (string)($params['did'] ?? '');
+                    if ($did === '') return $this->json(['error' => 'Missing did'], 400);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $st = $pdo->prepare('DELETE FROM watchlist WHERE owner_did = :o AND watched_did = :d');
+                    $st->execute([':o' => $ownerDid, ':d' => $did]);
+                    $removed = (int)$st->rowCount();
+
+                    try {
+                        $st2 = $pdo->prepare('DELETE FROM watch_events WHERE owner_did = :o AND watched_did = :d');
+                        $st2->execute([':o' => $ownerDid, ':d' => $did]);
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+
+                    return $this->json(['ok' => true, 'removed' => $removed > 0]);
+                }
+
+                case 'watchCheck': {
+                    $ownerDid = $session['did'] ?? null;
+                    if (!$ownerDid) return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $hours = min(24 * 30, max(1, (int)($params['hours'] ?? 72)));
+                    $pagesMax = min(10, max(1, (int)($params['pagesMax'] ?? 2)));
+                    $maxUsers = min(200, max(1, (int)($params['maxUsers'] ?? 50)));
+                    $scanLimit = min(500, max(25, (int)($params['scanLimit'] ?? 200)));
+                    $perUserMaxReturn = min(50, max(0, (int)($params['perUserMaxReturn'] ?? 15)));
+                    $storeEvents = isset($params['storeEvents']) ? (bool)$params['storeEvents'] : true;
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $st = $pdo->prepare('SELECT watched_did, watched_handle, last_seen_post_created_at, last_seen_post_uri FROM watchlist WHERE owner_did = :o ORDER BY COALESCE(updated_at, created_at) DESC LIMIT :lim');
+                    $st->bindValue(':o', $ownerDid);
+                    $st->bindValue(':lim', $maxUsers, \PDO::PARAM_INT);
+                    $st->execute();
+                    $watchRows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+
+                    $now = gmdate('c');
+                    $filter = isset($params['filter']) ? (string)$params['filter'] : null;
+                    $out = [];
+
+                    $stUpdate = $pdo->prepare('UPDATE watchlist SET last_checked_at = :t, last_seen_post_created_at = :s, last_seen_post_uri = :u, updated_at = :t WHERE owner_did = :o AND watched_did = :d');
+                    $stUpdateChecked = $pdo->prepare('UPDATE watchlist SET last_checked_at = :t, updated_at = :t WHERE owner_did = :o AND watched_did = :d');
+
+                    $stEvents = null;
+                    if ($storeEvents) {
+                        $stEvents = $pdo->prepare('INSERT OR IGNORE INTO watch_events(owner_did, watched_did, post_uri, post_created_at, detected_at, raw_json)
+                            VALUES(:o,:d,:u,:c,:t,:j)');
+                    }
+
+                    foreach ($watchRows as $w) {
+                        $watchedDid = (string)($w['watched_did'] ?? '');
+                        if ($watchedDid === '') continue;
+
+                        $lastSeenIso = (string)($w['last_seen_post_created_at'] ?? '');
+                        $lastSeenTs = $lastSeenIso !== '' ? strtotime($lastSeenIso) : null;
+
+                        $sync = null;
+                        try {
+                            $sync = $this->cacheSyncMyPosts($pdo, $session, $watchedDid, $hours, $pagesMax, $filter);
+                        } catch (\Throwable $e) {
+                            $out[] = [
+                                'watchedDid' => $watchedDid,
+                                'watchedHandle' => $w['watched_handle'] ?? null,
+                                'ok' => false,
+                                'error' => $e->getMessage(),
+                            ];
+                            continue;
+                        }
+
+                        // Scan newest cached posts and compute new items since last seen.
+                        $stPosts = $pdo->prepare('SELECT uri, created_at, raw_json FROM posts WHERE actor_did = :a ORDER BY created_at DESC LIMIT :lim');
+                        $stPosts->bindValue(':a', $watchedDid);
+                        $stPosts->bindValue(':lim', $scanLimit, \PDO::PARAM_INT);
+                        $stPosts->execute();
+                        $rows = $stPosts->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+
+                        $newItemsDesc = [];
+                        $newUris = [];
+                        $newMaxTs = $lastSeenTs;
+                        $newMaxIso = $lastSeenIso !== '' ? $lastSeenIso : null;
+                        $newMaxUri = $w['last_seen_post_uri'] ?? null;
+
+                        foreach ($rows as $r) {
+                            $iso = (string)($r['created_at'] ?? '');
+                            $ts = $iso !== '' ? strtotime($iso) : null;
+                            if ($ts === null) continue;
+
+                            // If not initialized yet, prime last-seen without emitting notifications.
+                            if ($lastSeenTs === null) {
+                                $newMaxTs = $ts;
+                                $newMaxIso = $iso;
+                                $newMaxUri = (string)($r['uri'] ?? '') ?: null;
+                                break;
+                            }
+
+                            if ($ts <= $lastSeenTs) {
+                                break; // sorted DESC
+                            }
+
+                            $uri = (string)($r['uri'] ?? '');
+                            if ($uri !== '') $newUris[] = $uri;
+
+                            if ($perUserMaxReturn > 0 && count($newItemsDesc) < $perUserMaxReturn) {
+                                $raw = $r['raw_json'] ? json_decode((string)$r['raw_json'], true) : null;
+                                if (is_array($raw)) {
+                                    $newItemsDesc[] = $raw;
+                                }
+                            }
+
+                            if ($newMaxTs === null || $ts > $newMaxTs) {
+                                $newMaxTs = $ts;
+                                $newMaxIso = $iso;
+                                $newMaxUri = $uri ?: $newMaxUri;
+                            }
+                        }
+
+                        // Persist event rows (best-effort).
+                        if ($storeEvents && $stEvents && $newUris) {
+                            foreach ($newUris as $uri) {
+                                try {
+                                    $stEvents->execute([
+                                        ':o' => $ownerDid,
+                                        ':d' => $watchedDid,
+                                        ':u' => $uri,
+                                        ':c' => null,
+                                        ':t' => $now,
+                                        ':j' => null,
+                                    ]);
+                                } catch (\Throwable $e) {
+                                    // ignore
+                                }
+                            }
+                        }
+
+                        // Update watchlist last-checked and last-seen.
+                        if ($newMaxIso) {
+                            $stUpdate->execute([
+                                ':t' => $now,
+                                ':s' => $newMaxIso,
+                                ':u' => $newMaxUri,
+                                ':o' => $ownerDid,
+                                ':d' => $watchedDid,
+                            ]);
+                        } else {
+                            $stUpdateChecked->execute([
+                                ':t' => $now,
+                                ':o' => $ownerDid,
+                                ':d' => $watchedDid,
+                            ]);
+                        }
+
+                        $newItems = array_reverse($newItemsDesc);
+
+                        $out[] = [
+                            'watchedDid' => $watchedDid,
+                            'watchedHandle' => $w['watched_handle'] ?? null,
+                            'ok' => true,
+                            'sync' => $sync,
+                            'newCount' => count($newUris),
+                            'newPosts' => $newItems,
+                            'lastSeenPostCreatedAt' => $newMaxIso,
+                            'lastSeenPostUri' => $newMaxUri,
+                            'checkedAt' => $now,
+                            'initialized' => ($lastSeenTs === null),
+                        ];
+                    }
+
+                    return $this->json([
+                        'ok' => true,
+                        'ownerDid' => $ownerDid,
+                        'checkedAt' => $now,
+                        'hours' => $hours,
+                        'results' => $out,
+                    ]);
                 }
 
                 case 'cacheCalendarMonth': {
@@ -3415,6 +3746,32 @@ class Api extends ParentController
 
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_snapshots_actor_kind ON snapshots(actor_did, kind, taken_at)');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_edges_actor_kind ON edges(actor_did, kind)');
+
+        // People monitoring (watchlist) per owner DID.
+        $pdo->exec('CREATE TABLE IF NOT EXISTS watchlist (
+            owner_did TEXT NOT NULL,
+            watched_did TEXT NOT NULL,
+            watched_handle TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            last_checked_at TEXT,
+            last_seen_post_created_at TEXT,
+            last_seen_post_uri TEXT,
+            PRIMARY KEY(owner_did, watched_did)
+        )');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_watchlist_owner ON watchlist(owner_did)');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_watchlist_watched ON watchlist(watched_did)');
+
+        $pdo->exec('CREATE TABLE IF NOT EXISTS watch_events (
+            owner_did TEXT NOT NULL,
+            watched_did TEXT NOT NULL,
+            post_uri TEXT NOT NULL,
+            post_created_at TEXT,
+            detected_at TEXT NOT NULL,
+            raw_json TEXT,
+            PRIMARY KEY(owner_did, watched_did, post_uri)
+        )');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_watch_events_owner_detected ON watch_events(owner_did, detected_at)');
 
         // Mark schema current.
         $this->cacheMetaSet($pdo, null, 'schema_version', self::CACHE_SCHEMA_VERSION);
