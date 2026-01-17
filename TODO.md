@@ -78,6 +78,78 @@ This is the top-level TODO for the package (GitHub-facing).
 	- Repost/unrepost actions in cards and thread view.
 	- Keep UI state in sync (optimistic update + refresh).
 
+### 9) Bluesky feature parity (expansive)
+
+#### Composer / Posting
+- [x] Bluesky-like composer lightbox (Posts panel).
+- [x] 300-char counter + over-limit enforcement.
+- [x] Thread composer "+" (multi-part posts) with sequential root/parent chaining.
+- [x] Emoji picker.
+- [x] GIF link insertion (URL into text).
+- [x] Multi-image attachments (up to 4) + alt text.
+- [x] Language tagging on posts via `record.langs` (uses browser languages).
+- [x] Drafts: local drafts per context + autosave (text + interaction settings; incl. thread parts).
+- [ ] Drafts: persist media selections across reloads (likely needs IndexedDB; not localStorage).
+- [ ] Scheduled posts (client-side scheduler + server job to publish).
+- [ ] Edit post (Bluesky supports record update semantics; confirm UX + history).
+- [ ] Post deletion UX improvements (undo window, optimistic removal).
+
+#### Facets (mentions, links, hashtags)
+- [x] Auto-link URLs into facets (`app.bsky.richtext.facet#link`).
+- [x] @mention parsing + DID resolution into facets (`#mention`).
+- [x] Hashtag parsing into facets (`#tag`).
+- [x] Unicode-safe facet indexing (UTF-8 byte indices).
+
+#### Interaction settings (gates)
+- [x] Reply controls (threadgate) for new root posts:
+	- Everyone (no gate)
+	- Nobody (`allow: []`)
+	- Custom: mentioned users / followers / following / list
+- [x] List picker support for reply gates (loads lists via `app.bsky.graph.getLists`, fallback to paste AT-URI).
+- [x] Quote/embedding control (postgate): disable embedding/quotes.
+- [ ] Expose additional postgate rules if/when supported (future lexicon expansion).
+- [ ] UI copy parity (Bluesky wording + per-setting explanations).
+
+#### Media
+- [x] Images upload + embed.images.
+- [ ] Video upload + embed.video support (upload flow + transcoding constraints).
+- [ ] Media processing UX: progress bar, cancel, retry.
+- [ ] Content accessibility: alt-text required toggle + warnings when missing.
+
+#### Embeds
+- [x] Render quoted posts (record embeds) in feed/thread view.
+- [x] Render external link cards where available.
+- [ ] Better embed fallback: fetch external cards when only a URL is present.
+- [ ] Record-with-media embeds (quote + images/video) full parity.
+
+#### Threading / Conversation UX
+- [x] True nested replies across all surfaces.
+- [x] Hide-root behavior where duplicate root cards would appear.
+- [x] Inline reply composer inserted under clicked post; second click closes.
+- [ ] Better “reply-to” UX like Bluesky: show the parent snippet above composer.
+- [ ] “Detach thread” / “Continue thread” UX for composing follow-ups.
+
+#### Content labels / Safety
+- [ ] Self-labeling UI (e.g. “Adult content”) and attach labels per post.
+- [ ] Content warnings UI (toggle + reason) and render in timeline.
+- [ ] Respect viewer moderation preferences (hide/blur sensitive media).
+- [ ] Report post/account flows (if supported via endpoints).
+
+#### Lists / Feeds
+- [ ] Browse + manage lists (create, delete, add/remove members).
+- [ ] Timeline view for a list feed.
+- [ ] Custom feed browsing (app.bsky.feed.getActorFeeds / getFeedSkeleton).
+
+#### Notifications + Activity
+- [ ] Full parity notification rendering (reason strings, grouped actions).
+- [ ] Inline actions in notifications (like/repost/follow) without context switch.
+- [ ] Background polling with backoff + “unread” badge counts.
+
+#### Accessibility / Polish
+- [ ] Keyboard navigation for composer parts + pickers.
+- [ ] Proper focus management when opening/closing dialogs.
+- [ ] Screenreader labels for all icon buttons.
+
 ### 8) People monitoring (watchlist + activity)
 
 - Add a “Watchlist” / People Monitoring panel:

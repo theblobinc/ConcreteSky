@@ -563,11 +563,14 @@ class Concretesky extends PageController
         return $this->oauthXrpc($verb, $url, $session, $json);
     }
 
-    protected function createRecord($session, $collection, array $record)
+    protected function createRecord($session, $collection, array $record, $rkey = null)
     {
         $repo = $session['did'] ?? ($session['handle'] ?? null);
         if (!$repo) throw new \RuntimeException('Missing repo DID for createRecord');
         $payload = ['repo' => $repo, 'collection' => $collection, 'record' => $record];
+        if ($rkey !== null && $rkey !== '') {
+            $payload['rkey'] = (string)$rkey;
+        }
         if (($session['authType'] ?? 'password') === 'oauth') {
             return $this->oauthXrpc('POST', "{$this->pds}/xrpc/com.atproto.repo.createRecord", $session, $payload);
         }

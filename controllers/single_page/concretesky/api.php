@@ -1378,6 +1378,69 @@ class Api extends ParentController
                     return $this->json($this->createRecord($session, 'app.bsky.feed.post', $record));
                 }
 
+                case 'createThreadGate': {
+                    // Create a threadgate record for a post (reply controls).
+                    // NOTE: per lexicon, rkey of threadgate must match the post rkey.
+                    $postUri = (string)($params['postUri'] ?? '');
+                    if ($postUri === '') return $this->json(['error' => 'Missing postUri'], 400);
+                    $rkey = $this->rkeyFromAtUri($postUri);
+                    if (!$rkey) return $this->json(['error' => 'Could not determine rkey'], 400);
+
+                    $allowIn = $params['allow'] ?? null;
+                    $allow = null;
+                    if (is_array($allowIn)) {
+                        $allow = [];
+                        foreach ($allowIn as $rule) {
+                            $t = strtolower(trim((string)$rule));
+                            if ($t === 'mention' || $t === 'mentions' || $t === 'mentionrule') {
+                                $allow[] = ['$type' => 'app.bsky.feed.threadgate#mentionRule'];
+                            } elseif ($t === 'follower' || $t === 'followers' || $t === 'followerrule') {
+                                $allow[] = ['$type' => 'app.bsky.feed.threadgate#followerRule'];
+                            } elseif ($t === 'following' || $t === 'followingrule') {
+                                $allow[] = ['$type' => 'app.bsky.feed.threadgate#followingRule'];
+                            } elseif ($t === 'list' || $t === 'listrule') {
+                                $listUri = (string)($params['listUri'] ?? '');
+                                if ($listUri === '') return $this->json(['error' => 'Missing listUri for list rule'], 400);
+                                $allow[] = ['$type' => 'app.bsky.feed.threadgate#listRule', 'list' => $listUri];
+                            }
+                        }
+                    }
+
+                    $record = [
+                        '$type'     => 'app.bsky.feed.threadgate',
+                        'post'      => $postUri,
+                        'createdAt' => gmdate('c'),
+                    ];
+                    if ($allow !== null) {
+                        // If allow is an empty array, no one can reply.
+                        $record['allow'] = array_values($allow);
+                    }
+                    return $this->json($this->createRecord($session, 'app.bsky.feed.threadgate', $record, $rkey));
+                }
+
+                case 'createPostGate': {
+                    // Create a postgate record for a post (quote/embedding controls).
+                    // NOTE: per lexicon, rkey of postgate must match the post rkey.
+                    $postUri = (string)($params['postUri'] ?? '');
+                    if ($postUri === '') return $this->json(['error' => 'Missing postUri'], 400);
+                    $rkey = $this->rkeyFromAtUri($postUri);
+                    if (!$rkey) return $this->json(['error' => 'Could not determine rkey'], 400);
+
+                    $disableEmbedding = (bool)($params['disableEmbedding'] ?? false);
+                    $record = [
+                        '$type'     => 'app.bsky.feed.postgate',
+                        'post'      => $postUri,
+                        'createdAt' => gmdate('c'),
+                    ];
+                    if ($disableEmbedding) {
+                        $record['embeddingRules'] = [
+                            ['$type' => 'app.bsky.feed.postgate#disableRule'],
+                        ];
+                    }
+
+                    return $this->json($this->createRecord($session, 'app.bsky.feed.postgate', $record, $rkey));
+                }
+
                 case 'deletePost': {
                     $rkey = (string)($params['rkey'] ?? '');
                     $uri  = (string)($params['uri'] ?? '');
@@ -1483,6 +1546,218 @@ class Api extends ParentController
                             'limit'  => (int)($params['limit'] ?? 50),
                             'cursor' => $params['cursor'] ?? null,
                         ]));
+
+                case 'getLists':
+                    return $this->json($this->xrpcSession('GET', 'app.bsky.graph.getLists',
+                        $session, [
+                            'actor'  => $params['actor'] ?? ($session['did'] ?? null),
+                            'limit'  => (int)($params['limit'] ?? 50),
+                            'cursor' => $params['cursor'] ?? null,
+                        ]));
+
+                case 'resolveHandles': {
+                    // Batch resolve @handles to DIDs for richtext mention facets.
+                    $handlesIn = $params['handles'] ?? null;
+                    if (!is_array($handlesIn)) return $this->json(['error' => 'Missing handles'], 400);
+
+                    $handles = [];
+                    foreach ($handlesIn as $h) {
+                        $s = trim((string)$h);
+                        $s = ltrim($s, '@');
+                        if ($s === '') continue;
+                        $handles[] = $s;
+                    }
+                    $handles = array_values(array_unique($handles));
+                    if (count($handles) > 50) $handles = array_slice($handles, 0, 50);
+
+                    $dids = [];
+                    $errors = [];
+                    foreach ($handles as $h) {
+                        $key = (string)$h;
+                        try {
+                            $did = $this->resolveActorDid($key, $session);
+                            if ($did) $dids[$key] = $did;
+                            else $errors[$key] = 'Unable to resolve';
+                        } catch (\Throwable $e) {
+                            $errors[$key] = $e->getMessage();
+                        }
+                    }
+
+                    return $this->json(['dids' => (object)$dids, 'errors' => (object)$errors]);
+                }
+
+                case 'unfurlUrl': {
+                    // Server-side unfurl for link cards (embed.external) to avoid browser CORS.
+                    // Returns { embed: { $type:'app.bsky.embed.external', external:{ uri,title,description,thumb? } } }
+                    $urlIn = trim((string)($params['url'] ?? ''));
+                    if ($urlIn === '') return $this->json(['error' => 'Missing url'], 400);
+                    if (!preg_match('#^https?://#i', $urlIn)) return $this->json(['error' => 'Only http/https URLs supported'], 400);
+
+                    // Guard length.
+                    if (strlen($urlIn) > 2048) return $this->json(['error' => 'URL too long'], 400);
+
+                    $wantThumb = !isset($params['thumb']) ? true : (bool)$params['thumb'];
+
+                    $fetch = function (string $url, int $timeoutSec = 6, int $maxBytes = 262144, array $headers = []) : array {
+                        $respHeaders = [];
+                        $ch = curl_init($url);
+                        curl_setopt_array($ch, [
+                            CURLOPT_RETURNTRANSFER => true,
+                            CURLOPT_FOLLOWLOCATION => true,
+                            CURLOPT_MAXREDIRS      => 4,
+                            CURLOPT_CUSTOMREQUEST  => 'GET',
+                            CURLOPT_TIMEOUT        => $timeoutSec,
+                            CURLOPT_HTTPHEADER     => $headers,
+                            CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$respHeaders) {
+                                $len = strlen($line);
+                                try {
+                                    $t = trim($line);
+                                    if ($t === '' || stripos($t, 'HTTP/') === 0) return $len;
+                                    $p = strpos($t, ':');
+                                    if ($p === false) return $len;
+                                    $k = strtolower(trim(substr($t, 0, $p)));
+                                    $v = trim(substr($t, $p + 1));
+                                    if ($k !== '') $respHeaders[$k] = $v;
+                                } catch (\Throwable $e) {}
+                                return $len;
+                            },
+                        ]);
+                        $raw = curl_exec($ch);
+                        if ($raw === false) {
+                            $err = curl_error($ch);
+                            curl_close($ch);
+                            throw new \RuntimeException('Unfurl fetch failed: ' . $err);
+                        }
+                        $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                        curl_close($ch);
+
+                        if (is_string($raw) && strlen($raw) > $maxBytes) {
+                            $raw = substr($raw, 0, $maxBytes);
+                        }
+
+                        return ['status' => $code, 'headers' => $respHeaders, 'body' => $raw];
+                    };
+
+                    $normalizeWs = function (string $s) : string {
+                        $s = trim(preg_replace('/\s+/', ' ', $s));
+                        return $s;
+                    };
+
+                    $absUrl = function (string $base, string $maybe) : string {
+                        $maybe = trim($maybe);
+                        if ($maybe === '') return '';
+                        if (preg_match('#^https?://#i', $maybe)) return $maybe;
+                        if (str_starts_with($maybe, '//')) {
+                            try {
+                                $b = parse_url($base);
+                                $scheme = isset($b['scheme']) ? (string)$b['scheme'] : 'https';
+                                return $scheme . ':' . $maybe;
+                            } catch (\Throwable $e) {
+                                return '';
+                            }
+                        }
+                        try {
+                            $b = parse_url($base);
+                            $scheme = isset($b['scheme']) ? (string)$b['scheme'] : 'https';
+                            $host = isset($b['host']) ? (string)$b['host'] : '';
+                            if ($host === '') return '';
+                            $port = isset($b['port']) ? (':' . (int)$b['port']) : '';
+                            $origin = $scheme . '://' . $host . $port;
+                            if (str_starts_with($maybe, '/')) return $origin . $maybe;
+                            // relative path
+                            $path = isset($b['path']) ? (string)$b['path'] : '/';
+                            $dir = rtrim(str_replace('\\', '/', dirname($path)), '/');
+                            return $origin . ($dir ? $dir . '/' : '/') . $maybe;
+                        } catch (\Throwable $e) {
+                            return '';
+                        }
+                    };
+
+                    $r = $fetch($urlIn, 6, 262144, [
+                        'Accept: text/html,application/xhtml+xml',
+                        'User-Agent: ConcreteSky/1.0 (+https://theblobinc.com)',
+                    ]);
+                    if (($r['status'] ?? 500) >= 400) return $this->json(['error' => 'Unfurl HTTP ' . (int)($r['status'] ?? 500)], 400);
+                    $html = (string)($r['body'] ?? '');
+                    if ($html === '') return $this->json(['error' => 'Empty response'], 400);
+
+                    // Extract <title> and OG tags.
+                    $getMeta = function (string $html, array $keys) : string {
+                        foreach ($keys as $k) {
+                            $k = preg_quote($k, '/');
+                            if (preg_match('/<meta[^>]+(?:property|name)=["\']' . $k . '["\'][^>]*content=["\']([^"\']+)["\'][^>]*>/i', $html, $m)) {
+                                return (string)html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5);
+                            }
+                            if (preg_match('/<meta[^>]+content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\']' . $k . '["\'][^>]*>/i', $html, $m)) {
+                                return (string)html_entity_decode($m[1], ENT_QUOTES | ENT_HTML5);
+                            }
+                        }
+                        return '';
+                    };
+
+                    $title = $normalizeWs($getMeta($html, ['og:title', 'twitter:title']));
+                    if ($title === '' && preg_match('/<title[^>]*>(.*?)<\/title>/is', $html, $m)) {
+                        $title = $normalizeWs((string)html_entity_decode(strip_tags($m[1]), ENT_QUOTES | ENT_HTML5));
+                    }
+                    $desc = $normalizeWs($getMeta($html, ['og:description', 'twitter:description', 'description']));
+                    $img = $normalizeWs($getMeta($html, ['og:image', 'twitter:image']));
+                    $img = $absUrl($urlIn, $img);
+
+                    if ($title === '') $title = $urlIn;
+                    if (strlen($title) > 300) $title = substr($title, 0, 300);
+                    if (strlen($desc) > 1000) $desc = substr($desc, 0, 1000);
+
+                    $thumbBlob = null;
+                    if ($wantThumb && $img !== '') {
+                        try {
+                            $imgResp = $fetch($img, 6, 1048576, [
+                                'Accept: image/*',
+                                'User-Agent: ConcreteSky/1.0 (+https://theblobinc.com)',
+                            ]);
+                            if (($imgResp['status'] ?? 500) < 400) {
+                                $ct = strtolower((string)($imgResp['headers']['content-type'] ?? ''));
+                                $mime = (str_contains($ct, 'image/')) ? trim(explode(';', $ct)[0]) : '';
+                                $bin = $imgResp['body'] ?? '';
+                                if ($mime !== '' && is_string($bin) && strlen($bin) > 0 && strlen($bin) <= 1048576) {
+                                    $upUrl = rtrim((string)$this->pds, '/') . '/xrpc/com.atproto.repo.uploadBlob';
+                                    $authType = (string)($session['authType'] ?? 'password');
+                                    if ($authType === 'oauth') {
+                                        $out = $this->oauthXrpcRaw('POST', $upUrl, $session, $bin, $mime);
+                                        $thumbBlob = $out['blob'] ?? ($out['data']['blob'] ?? null);
+                                    } else {
+                                        $headers = [
+                                            'Authorization: Bearer ' . (string)($session['accessJwt'] ?? ''),
+                                            'Accept: application/json',
+                                        ];
+                                        $up = $this->httpRaw('POST', $upUrl, $bin, $headers, $mime);
+                                        if (($up['status'] ?? 500) < 400) {
+                                            $thumbBlob = $up['json']['blob'] ?? ($up['json']['data']['blob'] ?? null);
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (\Throwable $e) {
+                            // best-effort
+                        }
+                    }
+
+                    $external = [
+                        'uri' => $urlIn,
+                        'title' => $title,
+                        'description' => $desc,
+                    ];
+                    if ($thumbBlob) $external['thumb'] = $thumbBlob;
+
+                    return $this->json([
+                        'embed' => [
+                            '$type' => 'app.bsky.embed.external',
+                            'external' => $external,
+                        ],
+                        'meta' => [
+                            'image' => $img,
+                        ],
+                    ]);
+                }
 
                 case 'getRelationships': { // batch with chunking + fallback (fixes >25 actor errors)
                     $actors = $params['actors'] ?? [];

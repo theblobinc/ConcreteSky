@@ -5,6 +5,7 @@ import './conversation-tree.js';
 import './other-replies.js';
 import './engagement-lightbox.js';
 import { identityCss, bindCopyClicks } from '../../lib/identity.js';
+import { resolveMentionDidsFromTexts, buildFacetsSafe, defaultLangs } from '../../controllers/compose_controller.js';
 
 const postCache   = new Map(); // uri -> post
 const threadCache = new Map(); // uri -> thread
@@ -365,9 +366,15 @@ export class BskyInteractionsModal extends HTMLElement {
           const rootUri = String(subj?.record?.reply?.root?.uri || subjUri);
           const rootCid = String(subj?.record?.reply?.root?.cid || subjCid);
 
+          const langs = defaultLangs();
+          const didByHandle = await resolveMentionDidsFromTexts([txt]);
+          const facets = buildFacetsSafe(txt, didByHandle);
+
           await call('createPost', {
             text: txt,
-            reply: { root:{ uri: rootUri, cid: rootCid }, parent:{ uri: subjUri, cid: subjCid } }
+            langs,
+            reply: { root:{ uri: rootUri, cid: rootCid }, parent:{ uri: subjUri, cid: subjCid } },
+            ...(facets ? { facets } : {}),
           });
           if (ta) ta.value = '';
           // refresh

@@ -388,6 +388,8 @@ class BskyApp extends HTMLElement {
     const root = this.shadowRoot.querySelector('[data-bsky-tabs]');
     const api = root?.__bskyTabsApi;
 
+    const basePanel = String(this._contentSplitBasePanel || '');
+
     const cp = this.shadowRoot.querySelector('bsky-content-panel');
     cp?.setSelection?.(null);
 
@@ -404,6 +406,15 @@ class BskyApp extends HTMLElement {
     this.clearFixedCols(['posts', 'content']);
     api?.deactivate?.('content');
     requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
+
+    // Allow other panels (e.g. Posts) to restore any pre-content layout/scroll state.
+    try {
+      window.dispatchEvent(new CustomEvent('bsky-content-closed', {
+        detail: { basePanel },
+      }));
+    } catch {
+      // ignore
+    }
   }
 
   async initGate() {

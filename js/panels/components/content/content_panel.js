@@ -1,6 +1,7 @@
 import { call } from '../../../api.js';
 import { identityCss, identityHtml, bindCopyClicks } from '../../../lib/identity.js';
 import { renderPostCard } from '../../../components/interactions/utils.js';
+import { resolveMentionDidsFromTexts, buildFacetsSafe, defaultLangs, selectEmbed, applyInteractionGates } from '../../../controllers/compose_controller.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
 
@@ -85,6 +86,25 @@ export class BskyContentPanel extends HTMLElement {
       this.submitComment(e?.detail || null);
     });
 
+    this.shadowRoot.addEventListener('bsky-submit-thread', (e) => {
+      this.submitThread(e?.detail || null);
+    });
+
+    // List picker support for reply-gating (threadgate listRule).
+    this.shadowRoot.addEventListener('bsky-request-lists', async (e) => {
+      const composer = (e?.target && String(e.target.tagName || '').toLowerCase() === 'bsky-comment-composer') ? e.target : null;
+      if (!composer) return;
+      try { composer.setListsLoading?.(true); } catch {}
+      try {
+        const res = await call('getLists', { limit: 100 });
+        const lists = Array.isArray(res?.lists) ? res.lists : (Array.isArray(res?.data?.lists) ? res.data.lists : []);
+        const shaped = lists.map((l) => ({ uri: l?.uri, name: l?.name }));
+        try { composer.setLists?.(shaped); } catch {}
+      } catch (err) {
+        try { composer.setListsError?.(err?.message || String(err || 'Failed to load lists')); } catch {}
+      }
+    });
+
     // If a reply is posted elsewhere into the currently open thread, refresh this view.
     if (!this._replyPostedHandler) {
       this._replyPostedHandler = (e) => {
@@ -99,6 +119,10 @@ export class BskyContentPanel extends HTMLElement {
       };
     }
     window.addEventListener('bsky-reply-posted', this._replyPostedHandler);
+  }
+
+  _defaultLangs() {
+    return defaultLangs();
   }
 
   disconnectedCallback() {
@@ -122,40 +146,29 @@ export class BskyContentPanel extends HTMLElement {
     const rootRef = this.pickThreadRootRef(this._thread) || { uri: parentUri, cid: parentCid };
 
     const images = Array.isArray(detail?.media?.images) ? detail.media.images : [];
-    const uploaded = [];
 
     this._posting = true;
     this._error = null;
     this.render();
 
     try {
-      for (const img of images) {
-        const mime = String(img?.mime || '');
-        const dataBase64 = String(img?.dataBase64 || '');
-        if (!mime || !dataBase64) continue;
-        const res = await call('uploadBlob', { mime, dataBase64 });
-        const blob = res?.blob || res?.data?.blob || res?.data || null;
-        if (blob) {
-          uploaded.push({
-            alt: String(img?.alt || ''),
-            image: blob,
-          });
-        }
-      }
+      const didByHandle = await resolveMentionDidsFromTexts([text]);
+      const facets = buildFacetsSafe(text, didByHandle);
+      const embed = await selectEmbed({ text, images, quote: null });
 
-      const embed = uploaded.length ? {
-        $type: 'app.bsky.embed.images',
-        images: uploaded,
-      } : null;
-
-      await call('createPost', {
+	  const out = await call('createPost', {
         text,
+        langs: this._defaultLangs(),
         reply: {
           root: { uri: rootRef.uri, cid: rootRef.cid },
           parent: { uri: parentUri, cid: parentCid },
         },
+      ...(facets ? { facets } : {}),
         ...(embed ? { embed } : {}),
       });
+
+    const created = this._extractCreatedRef(out);
+    await this._applyInteractionGates(created?.uri, detail?.interactions, { isRootPost: false });
 
       // Ensure cached feeds can see the new reply.
       // Prefer the throttled global sync (handled centrally), but fall back to a direct sync if the
@@ -182,6 +195,102 @@ export class BskyContentPanel extends HTMLElement {
       } catch {}
 
       // Clear reply target and refresh thread.
+      this._replyTo = null;
+      await this.load();
+    } catch (e) {
+      this._error = e?.message || String(e || 'Failed to post reply');
+      this.render();
+    } finally {
+      this._posting = false;
+      this.render();
+    }
+  }
+
+  _extractCreatedRef(out) {
+    try {
+      const uri = String(out?.uri || out?.data?.uri || out?.record?.uri || out?.value?.uri || '');
+      const cid = String(out?.cid || out?.data?.cid || out?.record?.cid || out?.value?.cid || '');
+      return (uri && cid) ? { uri, cid } : (uri ? { uri, cid: '' } : null);
+    } catch {
+      return null;
+    }
+  }
+
+  async _applyInteractionGates(createdUri, interactions, { isRootPost = false } = {}) {
+    await applyInteractionGates(createdUri, interactions, { isRootPost });
+  }
+
+  async submitThread(detail) {
+    if (this._posting) return;
+    const parts = Array.isArray(detail?.parts) ? detail.parts : [];
+    const clean = parts.map((p) => ({
+      text: String(p?.text || '').trim(),
+      images: Array.isArray(p?.media?.images) ? p.media.images : [],
+    })).filter((p) => p.text);
+    if (!clean.length) return;
+
+    const replyTo = detail?.replyTo || null;
+    const parentUri = String(replyTo?.uri || '');
+    const parentCid = String(replyTo?.cid || '');
+    if (!parentUri || !parentCid) {
+      this._error = 'Missing reply target (uri/cid). Click Reply on a post first.';
+      this.render();
+      return;
+    }
+
+    const rootRef = this.pickThreadRootRef(this._thread) || { uri: parentUri, cid: parentCid };
+
+    this._posting = true;
+    this._error = null;
+    this.render();
+
+    try {
+      let prevRef = { uri: parentUri, cid: parentCid };
+      const interactions = detail?.interactions || null;
+
+    const didByHandle = await resolveMentionDidsFromTexts(clean.map((p) => p.text));
+
+      for (const p of clean) {
+        const images = Array.isArray(p.images) ? p.images : [];
+        const facets = buildFacetsSafe(p.text, didByHandle);
+        const embed = await selectEmbed({ text: p.text, images, quote: null });
+        const out = await call('createPost', {
+          text: p.text,
+          langs: this._defaultLangs(),
+          reply: {
+            root: { uri: rootRef.uri, cid: rootRef.cid },
+            parent: { uri: prevRef.uri, cid: prevRef.cid },
+          },
+          ...(facets ? { facets } : {}),
+          ...(embed ? { embed } : {}),
+        });
+        const created = this._extractCreatedRef(out);
+		await this._applyInteractionGates(created?.uri, interactions, { isRootPost: false });
+        if (created?.uri) prevRef = { uri: created.uri, cid: String(created.cid || prevRef.cid) };
+      }
+
+      // Ensure cached feeds can see the new replies.
+      try {
+        if (window.BSKY?.cacheAvailable !== false) {
+          const notifBar = document.querySelector('bsky-notification-bar');
+          const canUseThrottledSync = !!(notifBar && notifBar.isConnected);
+
+          if (canUseThrottledSync) {
+            window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 10 } }));
+          } else {
+            await call('cacheSyncRecent', { minutes: 10 });
+            window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes: 30 } }));
+          }
+        }
+      } catch {}
+
+      // Notify other panels (Posts) to update reply counts / refresh.
+      try {
+        window.dispatchEvent(new CustomEvent('bsky-reply-posted', {
+          detail: { uri: parentUri, rootUri: rootRef.uri },
+        }));
+      } catch {}
+
       this._replyTo = null;
       await this.load();
     } catch (e) {
@@ -454,7 +563,7 @@ export class BskyContentPanel extends HTMLElement {
 
         ${view === 'replies' ? `
           <div class="section">
-            <bsky-comment-composer></bsky-comment-composer>
+            <bsky-comment-composer maxchars="300" thread="1"></bsky-comment-composer>
           </div>
         ` : ''}
       </bsky-panel-shell>

@@ -8,6 +8,7 @@ import { compileSearchMatcher } from '../../../search/query.js';
 
 import '../../../components/thread_tree.js';
 import '../../../comment/comment_composer.js';
+import { resolveMentionDidsFromTexts, buildFacetsSafe, defaultLangs, uploadImagesToEmbed, unfurlEmbedFromText, selectEmbed, applyInteractionGates } from '../../../controllers/compose_controller.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
   ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[m])
@@ -231,6 +232,11 @@ class BskyMyPosts extends HTMLElement {
     this.layout = 'pack';
     this.loading = false;
     this.error = null;
+
+    // Compose/new-thread state.
+    this._composePosting = false;
+    this._composeQuote = null; // { uri, cid }
+
     this.cursor = null;
     this.filters = { from: '', to: '', types: new Set(TYPES) };
 
@@ -240,13 +246,14 @@ class BskyMyPosts extends HTMLElement {
     this._pagesMax = 15;
     this._offset = 0;
 
+    // Incremental paging + backfill.
     this._latestIso = '';
-
     this._unbindInfiniteScroll = null;
     this._infiniteScrollEl = null;
     this._backfillInFlight = false;
     this._backfillDone = false;
 
+    // Scroll/restore state.
     this._scrollTop = 0;
     this._restoreScrollNext = false;
     this._scrollAnchor = null; // { key, offsetY, scrollTop }
@@ -254,7 +261,13 @@ class BskyMyPosts extends HTMLElement {
     // Used to ignore stale delayed restore attempts (e.g. multiple rapid load-more renders).
     this._scrollRestoreToken = 0;
 
-    // Incremental batch rendering (keep existing batch DOM stable).
+    // Content-open anchor (used to restore position when Content closes).
+    this._contentOpenAnchor = null;
+    this._contentOpenFocusUri = '';
+    this._focusRevealNext = false;
+
+    this._lastObservedScrollerW = 0;
+
     this._renderedBatchOrder = [];
     this._autoFillPending = true;
     this._autoFillTries = 0;
@@ -293,11 +306,285 @@ class BskyMyPosts extends HTMLElement {
     this._replyPostedHandler = null;
 
     this._panelsResizedHandler = null;
+    this._contentClosedHandler = null;
 
     this._refreshRecentHandler = (e) => {
       const mins = Number(e?.detail?.minutes ?? 2);
       this.refreshRecent(mins);
     };
+  }
+
+  _defaultLangs() {
+    try {
+      return defaultLangs();
+  }
+
+  async _unfurlEmbedFromText(text) {
+      return await unfurlEmbedFromText(text, { thumb: true });
+  }
+
+  _setComposeQuote(quote) {
+      return await uploadImagesToEmbed(images);
+    }
+
+    const holder = dlg.querySelector('#compose-quote');
+      await applyInteractionGates(createdUri, interactions, { isRootPost });
+  }
+
+  _extractCreatedRef(out) {
+    try {
+      const uri = String(out?.uri || out?.data?.uri || out?.record?.uri || out?.value?.uri || '');
+      const cid = String(out?.cid || out?.data?.cid || out?.record?.cid || out?.value?.cid || '');
+      return (uri && cid) ? { uri, cid } : (uri ? { uri, cid: '' } : null);
+    } catch {
+      return null;
+    }
+  }
+
+  async _applyInteractionGates(createdUri, interactions, { isRootPost = false } = {}) {
+    const uri = String(createdUri || '').trim();
+    if (!uri) return;
+    const it = interactions || null;
+    if (!it) return;
+
+    // Postgate: disable embedding/quotes.
+    try {
+      const quotesAllowed = it?.quotes?.allow;
+      if (quotesAllowed === false) {
+        await call('createPostGate', { postUri: uri, disableEmbedding: true });
+      }
+    } catch {}
+
+    // Threadgate: reply controls apply to the root post only.
+    if (!isRootPost) return;
+    try {
+      const mode = String(it?.reply?.mode || 'everyone');
+      if (mode === 'everyone') return;
+
+      let allow = null;
+      if (mode === 'nobody') allow = [];
+      if (mode === 'custom') allow = Array.isArray(it?.reply?.allow) ? it.reply.allow : [];
+      if (allow === null) return;
+
+      const listUri = String(it?.reply?.listUri || '').trim();
+      if (allow.includes('list') && !listUri) return;
+
+      const payload = { postUri: uri, allow };
+      if (allow.includes('list')) payload.listUri = listUri;
+      await call('createThreadGate', payload);
+    } catch {}
+  }
+
+  async _uploadImagesToEmbed(images) {
+    const uploaded = [];
+    try {
+      const imgs = Array.isArray(images) ? images : [];
+      for (const img of imgs) {
+        const mime = String(img?.mime || '');
+        const dataBase64 = String(img?.dataBase64 || '');
+        if (!mime || !dataBase64) continue;
+        const res = await call('uploadBlob', { mime, dataBase64 });
+        const blob = res?.blob || res?.data?.blob || res?.data || null;
+        if (blob) uploaded.push({ alt: String(img?.alt || ''), image: blob });
+      }
+    } catch {}
+    return uploaded.length ? { $type: 'app.bsky.embed.images', images: uploaded } : null;
+  }
+
+  async _submitNewPost(detail) {
+    if (this._composePosting) return;
+    const text = String(detail?.text || '').trim();
+    if (!text) return;
+    this._composePosting = true;
+    try {
+      const didByHandle = await resolveMentionDidsFromTexts([text]);
+      const facets = buildFacetsSafe(text, didByHandle);
+      const embed = await selectEmbed({ text, images: detail?.media?.images, quote: this._composeQuote });
+
+      const out = await call('createPost', { text, langs: this._defaultLangs(), ...(facets ? { facets } : {}), ...(embed ? { embed } : {}) });
+      const created = this._extractCreatedRef(out);
+      await this._applyInteractionGates(created?.uri, detail?.interactions, { isRootPost: true });
+      try {
+        if (window.BSKY?.cacheAvailable !== false) {
+          const notifBar = document.querySelector('bsky-notification-bar');
+          const canUseThrottledSync = !!(notifBar && notifBar.isConnected);
+          if (canUseThrottledSync) {
+            window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 10 } }));
+          } else {
+            await call('cacheSyncRecent', { minutes: 10 });
+            window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes: 30 } }));
+          }
+        }
+      } catch {}
+      this.load(true);
+    } finally {
+      this._composePosting = false;
+      this._setComposeQuote(null);
+      try {
+        const dlg = this.shadowRoot.getElementById('compose-dlg');
+        if (dlg?.open) dlg.close();
+      } catch {}
+    }
+  }
+
+  async _submitNewThread(detail) {
+    if (this._composePosting) return;
+    const parts = Array.isArray(detail?.parts) ? detail.parts : [];
+    const clean = parts.map((p) => ({
+      text: String(p?.text || '').trim(),
+      images: Array.isArray(p?.media?.images) ? p.media.images : [],
+    })).filter((p) => p.text);
+    if (!clean.length) return;
+    this._composePosting = true;
+    try {
+      const interactions = detail?.interactions || null;
+
+      let didByHandle = {};
+      didByHandle = await resolveMentionDidsFromTexts(clean.map((p) => p.text));
+
+      let rootRef = null;
+      let parentRef = null;
+      for (let i = 0; i < clean.length; i++) {
+        const p = clean[i];
+        const facets = buildFacetsSafe(p.text, didByHandle);
+        const embed = await selectEmbed({ text: p.text, images: p.images, quote: (i === 0) ? this._composeQuote : null });
+
+        const payload = { text: p.text, langs: this._defaultLangs(), ...(facets ? { facets } : {}), ...(embed ? { embed } : {}) };
+        if (i > 0 && rootRef && parentRef?.uri) {
+          payload.reply = {
+            root: { uri: rootRef.uri, cid: String(rootRef.cid || '') },
+            parent: { uri: parentRef.uri, cid: String(parentRef.cid || '') },
+          };
+        }
+        const out = await call('createPost', payload);
+        const created = this._extractCreatedRef(out);
+        if (i === 0) rootRef = created || rootRef;
+        parentRef = created || parentRef;
+
+        await this._applyInteractionGates(created?.uri, interactions, { isRootPost: i === 0 });
+      }
+      try {
+        if (window.BSKY?.cacheAvailable !== false) {
+          const notifBar = document.querySelector('bsky-notification-bar');
+          const canUseThrottledSync = !!(notifBar && notifBar.isConnected);
+          if (canUseThrottledSync) {
+            window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 10 } }));
+          } else {
+            await call('cacheSyncRecent', { minutes: 10 });
+            window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes: 30 } }));
+          }
+        }
+      } catch {}
+      this.load(true);
+    } finally {
+      this._composePosting = false;
+      this._setComposeQuote(null);
+      try {
+        const dlg = this.shadowRoot.getElementById('compose-dlg');
+        if (dlg?.open) dlg.close();
+      } catch {}
+    }
+  }
+
+  async _submitInlineThread(entryEl, detail) {
+    const entryUri = String(entryEl?.getAttribute?.('data-uri') || '');
+    const entryCid = String(entryEl?.getAttribute?.('data-cid') || '');
+    if (!entryUri) return;
+
+    const entryPost = this._findCachedPostByUri(entryUri);
+    const entryRec = entryPost?.record || {};
+    const replyInfo = entryRec?.reply || null;
+    const cacheKey = String(replyInfo?.root?.uri || entryUri);
+
+    if (this._postingRoots.has(entryUri)) return;
+    const parts = Array.isArray(detail?.parts) ? detail.parts : [];
+    const clean = parts.map((p) => ({
+      text: String(p?.text || '').trim(),
+      images: Array.isArray(p?.media?.images) ? p.media.images : [],
+    })).filter((p) => p.text);
+    if (!clean.length) return;
+
+    const replyTo = detail?.replyTo || null;
+    let parentUri = String(replyTo?.uri || '');
+    let parentCid = String(replyTo?.cid || '');
+    if (!parentUri || !parentCid) return;
+
+    const outNow = this._threadCache.get(cacheKey) || { preview: null, full: null };
+    const threadOut = outNow.full || outNow.preview || null;
+    const thread = threadOut?.thread || null;
+    const rootPost = thread?.post || null;
+    const rootRef = {
+      uri: String(rootPost?.uri || cacheKey || entryUri),
+      cid: String(rootPost?.cid || entryCid || parentCid),
+    };
+
+    this._postingRoots.add(entryUri);
+    try {
+      let prevRef = { uri: parentUri, cid: parentCid };
+      const interactions = detail?.interactions || null;
+
+      let didByHandle = {};
+      didByHandle = await resolveMentionDidsFromTexts(clean.map((p) => p.text));
+
+      for (let i = 0; i < clean.length; i++) {
+        const p = clean[i];
+        const facets = buildFacetsSafe(p.text, didByHandle);
+        const embed = await selectEmbed({ text: p.text, images: p.images, quote: null });
+        const out = await call('createPost', {
+          text: p.text,
+          langs: this._defaultLangs(),
+          reply: {
+            root: { uri: rootRef.uri, cid: rootRef.cid },
+            parent: { uri: prevRef.uri, cid: prevRef.cid },
+          },
+          ...(facets ? { facets } : {}),
+          ...(embed ? { embed } : {}),
+        });
+        const created = this._extractCreatedRef(out);
+        await this._applyInteractionGates(created?.uri, interactions, { isRootPost: false });
+        if (created?.uri) prevRef = { uri: created.uri, cid: String(created.cid || prevRef.cid) };
+      }
+
+      // Optimistically bump reply count on the first parent post.
+      try {
+        const p0 = this._findCachedPostByUri(parentUri);
+        if (p0 && typeof p0.replyCount === 'number') {
+          p0.replyCount = p0.replyCount + 1;
+          try {
+            const postEl = this.shadowRoot.querySelector(`.post[data-uri="${this._cssEscape(parentUri)}"]`);
+            const cnt = postEl?.querySelector?.('[data-open-interactions][data-kind="replies"]');
+            if (cnt) cnt.textContent = `💬 ${p0.replyCount}`;
+          } catch {}
+        }
+      } catch {}
+
+      try {
+        window.dispatchEvent(new CustomEvent('bsky-reply-posted', { detail: { uri: parentUri, rootUri: rootRef.uri } }));
+      } catch {}
+
+      try {
+        if (window.BSKY?.cacheAvailable !== false) {
+          const notifBar = document.querySelector('bsky-notification-bar');
+          const canUseThrottledSync = !!(notifBar && notifBar.isConnected);
+          if (canUseThrottledSync) {
+            window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 10 } }));
+          } else {
+            await call('cacheSyncRecent', { minutes: 10 });
+            window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes: 30 } }));
+          }
+        }
+      } catch {}
+
+      try {
+        const outFull = await call('getPostThread', { uri: cacheKey, depth: 10, parentHeight: 6 });
+        const next = this._threadCache.get(cacheKey) || { preview: null, full: null };
+        next.full = outFull || null;
+        this._threadCache.set(cacheKey, next);
+      } catch {}
+      await this._toggleInlineThread(entryEl, { uri: entryUri, cid: entryCid }, { ensureOpen: true, mode: this._expandedThreadMode.get(entryUri) || 'full' });
+    } finally {
+      this._postingRoots.delete(entryUri);
+    }
   }
 
   async _prefetchReplyRoots(items = []) {
@@ -507,16 +794,119 @@ class BskyMyPosts extends HTMLElement {
       const entry = this._entryFromComposedPath(e);
       if (!entry) return;
 
-      const composer = entry.querySelector('bsky-comment-composer');
+      // Prefer the nearest composer in the composed path (so nested thread actions
+      // target the correct inline composer), else fall back to any composer in entry.
+      let composer = null;
+      try {
+        const path = (typeof e?.composedPath === 'function') ? e.composedPath() : [];
+        for (const n of path) {
+          if (n && String(n.tagName || '').toLowerCase() === 'bsky-comment-composer') {
+            composer = n;
+            break;
+          }
+        }
+      } catch {}
+      if (!composer) composer = entry.querySelector('bsky-comment-composer');
       composer?.setReplyTo?.({ uri, cid, author });
     });
 
     this.shadowRoot.addEventListener('bsky-submit-comment', (e) => {
       const detail = e?.detail || null;
       const entry = this._entryFromComposedPath(e);
-      if (!entry) return;
-      this._submitInlineComment(entry, detail);
+      if (entry) {
+        this._submitInlineComment(entry, detail);
+        return;
+      }
+
+      // Top-level composer inside the Posts panel (compose dialog).
+      const composer = (e?.target && String(e.target.tagName || '').toLowerCase() === 'bsky-comment-composer') ? e.target : null;
+      const dlg = composer?.closest?.('#compose-dlg');
+      if (dlg) this._submitNewPost(detail);
     });
+
+    this.shadowRoot.addEventListener('bsky-submit-thread', (e) => {
+      const detail = e?.detail || null;
+      const entry = this._entryFromComposedPath(e);
+      if (entry) {
+        this._submitInlineThread(entry, detail);
+        return;
+      }
+
+      // Top-level composer inside the Posts panel (compose dialog).
+      const composer = (e?.target && String(e.target.tagName || '').toLowerCase() === 'bsky-comment-composer') ? e.target : null;
+      const dlg = composer?.closest?.('#compose-dlg');
+      if (dlg) this._submitNewThread(detail);
+    });
+
+    // List picker support for reply-gating (threadgate listRule).
+    this.shadowRoot.addEventListener('bsky-request-lists', async (e) => {
+      const composer = (e?.target && String(e.target.tagName || '').toLowerCase() === 'bsky-comment-composer') ? e.target : null;
+      if (!composer) return;
+      try { composer.setListsLoading?.(true); } catch {}
+      try {
+        const res = await call('getLists', { limit: 100 });
+        const lists = Array.isArray(res?.lists) ? res.lists : (Array.isArray(res?.data?.lists) ? res.data.lists : []);
+        const shaped = lists.map((l) => ({ uri: l?.uri, name: l?.name }));
+        try { composer.setLists?.(shaped); } catch {}
+      } catch (err) {
+        try { composer.setListsError?.(err?.message || String(err || 'Failed to load lists')); } catch {}
+      }
+    });
+
+    // Restore packed layout + scroll position when the Content panel closes.
+    if (!this._contentClosedHandler) {
+      this._contentClosedHandler = () => {
+        if (!this.isConnected) return;
+
+        const a = this._contentOpenAnchor;
+        const u = String(this._contentOpenFocusUri || this._focusUri || '');
+        this._contentOpenAnchor = null;
+        this._contentOpenFocusUri = '';
+
+        if (a) {
+          this._scrollAnchor = a;
+          this._restoreScrollNext = true;
+        }
+        if (u) {
+          this._focusUri = u;
+          this._focusRevealNext = true;
+        }
+
+        // Force a repack render; ResizeObserver will fire again once widths settle.
+        this._restoreScrollNext = true;
+        this.render();
+      };
+      window.addEventListener('bsky-content-closed', this._contentClosedHandler);
+    }
+
+    // If the scroller width changes after a layout transition (e.g. Content close),
+    // repack on the *settled* width so we don't get stuck in a 1-col pack.
+    if (!this._layoutRO && typeof ResizeObserver !== 'undefined') {
+      try {
+        const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+        const scroller = shell?.getScroller?.() || resolvePanelScroller(this);
+        if (scroller) {
+          this._lastObservedScrollerW = Math.round(scroller.getBoundingClientRect().width || scroller.clientWidth || 0);
+          this._layoutRO = new ResizeObserver(() => {
+            if (!this.isConnected) return;
+            if (String(this.layout || 'pack') !== 'pack') return;
+            const w = Math.round(scroller.getBoundingClientRect().width || scroller.clientWidth || 0);
+            if (!w || Math.abs(w - (this._lastObservedScrollerW || 0)) < 2) return;
+            this._lastObservedScrollerW = w;
+
+            if (this._layoutRaf) return;
+            this._layoutRaf = requestAnimationFrame(() => {
+              this._layoutRaf = null;
+              this._restoreScrollNext = true;
+              this.render();
+            });
+          });
+          this._layoutRO.observe(scroller);
+        }
+      } catch {
+        // ignore
+      }
+    }
 
     // Keep feed card counts/buttons in sync when interactions happen anywhere (inline thread or Content panel).
     if (!this._likeChangedHandler) {
@@ -750,9 +1140,14 @@ class BskyMyPosts extends HTMLElement {
     }
     if (this._searchApiTimer) { try { clearTimeout(this._searchApiTimer); } catch {} this._searchApiTimer = null; }
     if (this._layoutRO) { try { this._layoutRO.disconnect(); } catch {} this._layoutRO = null; }
+    if (this._layoutRaf) { try { cancelAnimationFrame(this._layoutRaf); } catch {} this._layoutRaf = null; }
     if (this._panelsResizedHandler) {
       try { window.removeEventListener('bsky-panels-resized', this._panelsResizedHandler); } catch {}
       this._panelsResizedHandler = null;
+    }
+    if (this._contentClosedHandler) {
+      try { window.removeEventListener('bsky-content-closed', this._contentClosedHandler); } catch {}
+      this._contentClosedHandler = null;
     }
     if (this._unbindInfiniteScroll) { try { this._unbindInfiniteScroll(); } catch {} this._unbindInfiniteScroll = null; }
     this._infiniteScrollEl = null;
@@ -865,6 +1260,54 @@ class BskyMyPosts extends HTMLElement {
     }
   }
 
+  _captureContentOpenAnchor(){
+    try {
+      const scroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.()
+        || resolvePanelScroller(this);
+      if (!scroller) return;
+      this._contentOpenAnchor = captureScrollAnchor({
+        scroller,
+        root: this.shadowRoot,
+        itemSelector: '.entry[data-k]',
+        keyAttr: 'data-k',
+      });
+    } catch {
+      // ignore
+    }
+  }
+
+  _maybeRevealFocusedEntry(){
+    if (!this._focusRevealNext) return;
+    const uri = String(this._focusUri || '');
+    if (!uri) { this._focusRevealNext = false; return; }
+
+    try {
+      const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+      const scroller = shell?.getScroller?.() || resolvePanelScroller(this);
+      if (!scroller) return;
+
+      const escUri = this._cssEscape(uri);
+      const el = this.shadowRoot.querySelector(`.entry[data-uri="${escUri}"]`) || this.shadowRoot.querySelector(`.post[data-uri="${escUri}"]`);
+      if (!el) { this._focusRevealNext = false; return; }
+
+      const r0 = scroller.getBoundingClientRect();
+      const r1 = el.getBoundingClientRect();
+
+      const topOk = r1.top >= (r0.top + 12);
+      const botOk = r1.bottom <= (r0.bottom - 12);
+      if (topOk && botOk) {
+        this._focusRevealNext = false;
+        return;
+      }
+
+      const delta = (r1.top - r0.top);
+      const target = Math.max(0, (scroller.scrollTop + delta) - 24);
+      scroller.scrollTop = target;
+    } finally {
+      this._focusRevealNext = false;
+    }
+  }
+
   async refreshRecent(minutes=2){
     if (this.loading) return;
     const mins = Math.max(1, Number(minutes || 2));
@@ -934,6 +1377,29 @@ class BskyMyPosts extends HTMLElement {
   }
 
   async onClick(e){
+    if (e.target.id === 'compose') {
+      const dlg = this.shadowRoot.querySelector('#compose-dlg');
+      if (dlg) {
+        this._setComposeQuote(null);
+        try { dlg.showModal(); } catch { dlg.setAttribute('open', ''); }
+        try { dlg.querySelector('bsky-comment-composer')?.focus?.(); } catch {}
+      }
+      return;
+    }
+    if (e.target.id === 'compose-close') {
+      const dlg = this.shadowRoot.querySelector('#compose-dlg');
+      if (dlg) {
+        this._setComposeQuote(null);
+        try { dlg.close(); } catch { dlg.removeAttribute('open'); }
+      }
+      return;
+    }
+
+    if (e.target?.closest?.('[data-compose-remove-quote]')) {
+      this._setComposeQuote(null);
+      return;
+    }
+
     if (e.target.id === 'reload') { this.load(true); return; }
     if (e.target.id === 'more') {
       if (this.loading) return;
@@ -1061,7 +1527,26 @@ class BskyMyPosts extends HTMLElement {
       const cid = replyBtn.getAttribute('data-cid') || rootCid;
       const author = replyBtn.getAttribute('data-author') || '';
       if (!rootUri) return;
-      await this._toggleInlineThread(entry, { uri: rootUri, cid: rootCid }, { ensureOpen: true, focus: true, replyTo: { uri, cid, author } });
+
+      const postEl = replyBtn.closest?.('.post[data-uri]') || entry.querySelector?.('.post[data-uri]') || null;
+      this._openInlineReplyComposer(entry, postEl, { uri, cid, author });
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    // Quote (opens compose dialog with quote target)
+    const quoteBtn = e.target.closest?.('[data-quote]');
+    if (quoteBtn) {
+      const uri = String(quoteBtn.getAttribute('data-uri') || '').trim();
+      const cid = String(quoteBtn.getAttribute('data-cid') || '').trim();
+      if (!uri) return;
+
+      const dlg = this.shadowRoot.querySelector('#compose-dlg');
+      if (!dlg) return;
+      this._setComposeQuote({ uri, cid });
+      try { dlg.showModal(); } catch { dlg.setAttribute('open', ''); }
+      try { dlg.querySelector('bsky-comment-composer')?.focus?.(); } catch {}
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -1210,6 +1695,8 @@ class BskyMyPosts extends HTMLElement {
         return;
       }
       if (uri) {
+        this._captureContentOpenAnchor();
+        this._contentOpenFocusUri = String(uri);
         this._focusUri = String(uri);
         this._focusCenterNext = true;
         const view = (kind === 'replies') ? 'replies' : (kind === 'reposts') ? 'reposts' : (kind === 'likes') ? 'likes' : '';
@@ -1229,6 +1716,8 @@ class BskyMyPosts extends HTMLElement {
       const uri = nestedPost.getAttribute('data-uri') || '';
       const cid = nestedPost.getAttribute('data-cid') || '';
       if (!uri) return;
+      this._captureContentOpenAnchor();
+      this._contentOpenFocusUri = String(uri);
       this._focusUri = String(uri);
       this._focusCenterNext = true;
       this.dispatchEvent(new CustomEvent('bsky-open-content', {
@@ -1246,6 +1735,8 @@ class BskyMyPosts extends HTMLElement {
       const uri = entry.getAttribute('data-uri') || '';
       const cid = entry.getAttribute('data-cid') || '';
       if (!uri) return;
+      this._captureContentOpenAnchor();
+      this._contentOpenFocusUri = String(uri);
       this._focusUri = String(uri);
       this._focusCenterNext = true;
       this.dispatchEvent(new CustomEvent('bsky-open-content', {
@@ -1254,6 +1745,74 @@ class BskyMyPosts extends HTMLElement {
         composed: true,
       }));
     }
+  }
+
+  _openInlineReplyComposer(entryEl, postEl, replyTo){
+    if (!entryEl) return;
+
+    // If a thread preview/full view is open for this entry, close it to keep the card clean.
+    try {
+      const entryUri = String(entryEl.getAttribute('data-uri') || '');
+      const host = entryEl.querySelector('[data-inline-thread]');
+      const open = !!(host && !host.hidden && (host.textContent || host.childNodes.length));
+      if (entryUri && open) {
+        this._expandedThreads.delete(entryUri);
+        this._expandedThreadMode.delete(entryUri);
+        try { host.hidden = true; } catch {}
+        try { host.textContent = ''; } catch {}
+        try {
+          const toggleBtn = entryEl.querySelector('[data-toggle-thread]');
+          if (toggleBtn) toggleBtn.textContent = '+';
+        } catch {}
+      }
+    } catch {}
+
+    // Remove any other inline reply boxes in this entry.
+    try {
+      for (const h of Array.from(entryEl.querySelectorAll('[data-inline-reply]'))) {
+        if (postEl && (h === postEl.nextElementSibling)) continue;
+        try { h.remove(); } catch { try { entryEl.removeChild(h); } catch {} }
+      }
+    } catch {}
+
+    if (!postEl) return;
+
+    let host = (postEl.nextElementSibling && postEl.nextElementSibling.matches?.('[data-inline-reply]'))
+      ? postEl.nextElementSibling
+      : null;
+
+    // Toggle behavior: clicking Reply again on the same post closes the inline composer.
+    if (host) {
+      const curUri = String(host.getAttribute('data-reply-uri') || '');
+      const curCid = String(host.getAttribute('data-reply-cid') || '');
+      const nextUri = String(replyTo?.uri || '');
+      const nextCid = String(replyTo?.cid || '');
+      if (curUri && curCid && nextUri && nextCid && curUri === nextUri && curCid === nextCid) {
+        try { host.remove(); } catch { try { entryEl.removeChild(host); } catch {} }
+        return;
+      }
+    }
+
+    if (!host) {
+      host = document.createElement('div');
+      host.className = 'inline-reply';
+      host.setAttribute('data-inline-reply', '');
+      host.innerHTML = '<bsky-comment-composer maxchars="300" thread="1"></bsky-comment-composer>';
+      try { postEl.insertAdjacentElement('afterend', host); } catch { entryEl.appendChild(host); }
+    }
+
+    try {
+      host.setAttribute('data-reply-uri', String(replyTo?.uri || ''));
+      host.setAttribute('data-reply-cid', String(replyTo?.cid || ''));
+    } catch {}
+
+    const composer = host.querySelector('bsky-comment-composer');
+    try {
+      if (replyTo && composer?.setReplyTo) composer.setReplyTo(replyTo);
+    } catch {}
+
+    try { composer?.focus?.(); } catch {}
+    try { composer?.shadowRoot?.querySelector?.('textarea')?.focus?.(); } catch {}
   }
 
   _entryFromComposedPath(e) {
@@ -1512,29 +2071,26 @@ class BskyMyPosts extends HTMLElement {
     };
 
     const images = Array.isArray(detail?.media?.images) ? detail.media.images : [];
-    const uploaded = [];
 
     this._postingRoots.add(entryUri);
     try {
-      for (const img of images) {
-        const mime = String(img?.mime || '');
-        const dataBase64 = String(img?.dataBase64 || '');
-        if (!mime || !dataBase64) continue;
-        const res = await call('uploadBlob', { mime, dataBase64 });
-        const blob = res?.blob || res?.data?.blob || res?.data || null;
-        if (blob) uploaded.push({ alt: String(img?.alt || ''), image: blob });
-      }
+      const didByHandle = await resolveMentionDidsFromTexts([text]);
+      const facets = buildFacetsSafe(text, didByHandle);
+      const embed = await selectEmbed({ text, images, quote: null });
 
-      const embed = uploaded.length ? { $type: 'app.bsky.embed.images', images: uploaded } : null;
-
-      await call('createPost', {
+      const out = await call('createPost', {
         text,
+        langs: this._defaultLangs(),
         reply: {
           root: { uri: rootRef.uri, cid: rootRef.cid },
           parent: { uri: parentUri, cid: parentCid },
         },
+        ...(facets ? { facets } : {}),
         ...(embed ? { embed } : {}),
       });
+
+      const created = this._extractCreatedRef(out);
+      await this._applyInteractionGates(created?.uri, detail?.interactions, { isRootPost: false });
 
       // Optimistically bump reply count on the parent post.
       try {
@@ -1551,7 +2107,7 @@ class BskyMyPosts extends HTMLElement {
 
       // Let other panels (e.g. Content) sync their own copies.
       try {
-        window.dispatchEvent(new CustomEvent('bsky-reply-posted', { detail: { uri: parentUri, rootUri } }));
+        window.dispatchEvent(new CustomEvent('bsky-reply-posted', { detail: { uri: parentUri, rootUri: rootRef.uri } }));
       } catch {}
 
       // Ensure cached feeds can see the new reply.
@@ -1902,6 +2458,7 @@ class BskyMyPosts extends HTMLElement {
           `).join('')}
         </div>
         <div class="actions">
+          <button id="compose" title="Compose a new post">Compose</button>
           <button id="reload" ${this.loading?'disabled':''}>Reload</button>
         </div>
       </div>
@@ -2032,6 +2589,7 @@ class BskyMyPosts extends HTMLElement {
           </footer>
           <footer class="actions">
             <button class="act" type="button" data-reply data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-author="${esc(handle ? `@${handle}` : '')}">Reply</button>
+            <button class="act" type="button" data-quote data-uri="${esc(uri)}" data-cid="${esc(cid)}">Quote</button>
             <button class="act" type="button" data-repost data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-reposted="${reposted ? '1' : '0'}">${esc(repostLabel)}</button>
             <button class="act" type="button" data-like data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-liked="${liked ? '1' : '0'}">${esc(likeLabel)}</button>
           </footer>
@@ -2039,31 +2597,65 @@ class BskyMyPosts extends HTMLElement {
       `;
     };
 
-    const groupIntoThreads = (items = []) => {
-      // Group by true thread root when known (reply.root), otherwise by post URI.
-      // This avoids duplicate cards when multiple items in the feed refer to the
-      // same original post (e.g. you replied to a post, and also have another row
-      // tied to that same root).
-      const groups = [];
-      const byRoot = new Map();
+    const groupIntoThreadsAcrossBatches = (batchViews = []) => {
+      // Group by true thread root across *all* rendered batches.
+      // Key idea: a newly-created reply often lands in the newest batch, while the root
+      // post might be in an older batch. We still want a single root card with sub-posts.
+      const byRoot = new Map(); // rootUri -> { key, rootUri, hostBatchId, items: [{it, ord}] }
+      const hostBatchByRoot = new Map();
+      let seq = 0;
 
-      for (let ord = 0; ord < items.length; ord++) {
-        const it = items[ord];
-        const uri = String(it?.post?.uri || '');
-        const rec = it?.post?.record || {};
-        const r = rec?.reply || null;
-        const rootUri = String(r?.root?.uri || uri || String(ord));
-        const key = rootUri || String(ord);
+      // First pass: collect all items by root; decide host batch as the first batch in
+      // display order where we see that root (newest wins).
+      for (let bi = 0; bi < batchViews.length; bi++) {
+        const b = batchViews[bi];
+        const bid = String(b?.id || '');
+        const items = Array.isArray(b?.items) ? b.items : [];
+        for (let oi = 0; oi < items.length; oi++) {
+          const it = items[oi];
+          const uri = String(it?.post?.uri || '');
+          const rec = it?.post?.record || {};
+          const r = rec?.reply || null;
+          const rootUri = String(r?.root?.uri || uri || `${bid}:${oi}`);
+          if (!rootUri) continue;
 
-        if (!byRoot.has(key)) {
-          const g = { key, rootUri: rootUri || uri, items: [] };
-          byRoot.set(key, g);
-          groups.push(g);
+          if (!hostBatchByRoot.has(rootUri)) hostBatchByRoot.set(rootUri, bid);
+
+          let g = byRoot.get(rootUri) || null;
+          if (!g) {
+            g = { key: rootUri, rootUri, hostBatchId: hostBatchByRoot.get(rootUri) || bid, items: [] };
+            byRoot.set(rootUri, g);
+          }
+          g.hostBatchId = hostBatchByRoot.get(rootUri) || g.hostBatchId || bid;
+          g.items.push({ it, ord: ++seq });
         }
-        byRoot.get(key).items.push({ it, ord });
       }
 
-      return groups;
+      // Second pass: stable order of groups per batch by first occurrence within that batch.
+      const groupsByBatch = new Map();
+      for (let bi = 0; bi < batchViews.length; bi++) {
+        const b = batchViews[bi];
+        const bid = String(b?.id || '');
+        const items = Array.isArray(b?.items) ? b.items : [];
+        const seen = new Set();
+        for (let oi = 0; oi < items.length; oi++) {
+          const it = items[oi];
+          const uri = String(it?.post?.uri || '');
+          const rec = it?.post?.record || {};
+          const r = rec?.reply || null;
+          const rootUri = String(r?.root?.uri || uri || `${bid}:${oi}`);
+          if (!rootUri) continue;
+          const g = byRoot.get(rootUri);
+          if (!g) continue;
+          if (String(g.hostBatchId || '') !== bid) continue;
+          if (seen.has(rootUri)) continue;
+          seen.add(rootUri);
+          if (!groupsByBatch.has(bid)) groupsByBatch.set(bid, []);
+          groupsByBatch.get(bid).push(g);
+        }
+      }
+
+      return { byRoot, groupsByBatch };
     };
 
     const renderThreadEntry = (group, batchId, chron = null) => {
@@ -2217,8 +2809,10 @@ class BskyMyPosts extends HTMLElement {
     };
 
     let chron = 0;
+    const grouped = groupIntoThreadsAcrossBatches(batchViews);
     const batchRenders = batchViews.map((b) => {
-      const groupsAll = groupIntoThreads(b.items || []);
+      const bid = String(b?.id || '');
+      const groupsAll = Array.isArray(grouped?.groupsByBatch?.get(bid)) ? grouped.groupsByBatch.get(bid) : [];
       const groups = searchActive
         ? groupsAll.filter((g) => {
             try {
@@ -2230,10 +2824,9 @@ class BskyMyPosts extends HTMLElement {
           })
         : groupsAll;
 
-      const cards = groups.map((g) => renderThreadEntry(g, b.id, ++chron));
+      const cards = groups.map((g) => renderThreadEntry(g, bid, ++chron));
       const entriesHtml = cards.map((c) => c.html).join('');
-
-      return { id: String(b.id || ''), entriesHtml };
+      return { id: bid, entriesHtml };
     });
 
     const ensureStaticDom = () => {
@@ -2275,6 +2868,7 @@ class BskyMyPosts extends HTMLElement {
 
         /* Inline thread expansion */
         .inline-thread{margin-top:10px; padding:10px; border-top:1px solid #222}
+        .inline-reply{margin-top:10px; padding:10px; border-top:1px solid #222}
         .inline-actions{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
         .meta{display:flex; align-items:center; gap:10px; color:#bbb; font-size:.9rem; margin-bottom:6px}
         .meta .icon{appearance:none;background:#111;border:1px solid #444;color:#fff;padding:0 8px;height:26px;line-height:24px}
@@ -2313,6 +2907,14 @@ class BskyMyPosts extends HTMLElement {
         .q-when{margin-left:auto;white-space:nowrap}
         .q-text{white-space:pre-wrap;line-height:1.3;color:#ddd}
         .q-media{margin-top:2px}
+
+        /* Compose quote preview */
+        #compose-quote[hidden]{display:none}
+        .qbox{border:1px solid #222;background:#0a0a0a;padding:8px}
+        .qhead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px}
+        .qrm{background:#111;border:1px solid #444;color:#fff;padding:4px 8px;border-radius:0;cursor:pointer}
+        .qmeta{color:#bbb;font-size:.9rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .qtext{white-space:pre-wrap;line-height:1.3;color:#ddd;margin-top:6px}
 
         /* YouTube preview */
         .ext-card.yt{cursor:pointer}
@@ -2390,6 +2992,19 @@ class BskyMyPosts extends HTMLElement {
             <button id="dlg-apply" type="button">Apply</button>
           </div>
         </form>
+      </dialog>
+
+      <dialog id="compose-dlg">
+        <div class="dlg">
+          <div class="dlg-head" style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+            <strong>Compose</strong>
+            <button id="compose-close" type="button">Close</button>
+          </div>
+          <div class="dlg-body">
+            <div id="compose-quote" hidden></div>
+            <bsky-comment-composer mode="post" thread="1" maxchars="300"></bsky-comment-composer>
+          </div>
+        </div>
       </dialog>
     `;
 
@@ -2582,7 +3197,11 @@ class BskyMyPosts extends HTMLElement {
 
         if (this._restoreScrollNext) {
           this._applyScrollAnchor(restoreToken);
-          setTimeout(() => this._applyScrollAnchor(restoreToken), 160);
+          try { this._maybeRevealFocusedEntry(); } catch {}
+          setTimeout(() => {
+            this._applyScrollAnchor(restoreToken);
+            try { this._maybeRevealFocusedEntry(); } catch {}
+          }, 160);
           return;
         }
 
