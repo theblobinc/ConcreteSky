@@ -1,4 +1,6 @@
 import { call } from '../../../api.js';
+import { identityCss, identityHtml, bindCopyClicks } from '../../../lib/identity.js';
+import { renderPostCard } from '../../../components/interactions/utils.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
 
@@ -20,6 +22,16 @@ export class BskyContentPanel extends HTMLElement {
     this._replyTo = null; // { uri, cid, author }
     this._posting = false;
 
+    this._view = 'replies'; // replies|reposts|quotes|likes
+    this._eng = {
+      loading: false,
+      error: null,
+      likes: null,
+      reposts: null,
+      quotes: null,
+      followMap: {},
+    };
+
     this._replyPostedHandler = null;
   }
 
@@ -39,17 +51,30 @@ export class BskyContentPanel extends HTMLElement {
   setSelection(sel) {
     const uri = String(sel?.uri || '');
     const cid = String(sel?.cid || '');
+    const view = String(sel?.view || sel?.tab || '');
     this._selection = uri ? { uri, cid } : null;
     this._replyTo = null;
     this._thread = null;
     this._error = null;
+    this._view = (view === 'reposts' || view === 'quotes' || view === 'likes' || view === 'replies') ? view : 'replies';
+    this._eng = { ...this._eng, loading: false, error: null, likes: null, reposts: null, quotes: null, followMap: {} };
     this.render();
     if (this._selection) this.load();
+  }
+
+  setView(view) {
+    const v = String(view || '');
+    const next = (v === 'reposts' || v === 'quotes' || v === 'likes' || v === 'replies') ? v : 'replies';
+    if (this._view === next) return;
+    this._view = next;
+    this.render();
+    this._maybeLoadEngagement();
   }
 
   connectedCallback() {
     this.render();
     this.shadowRoot.addEventListener('click', (e) => this.onClick(e));
+    bindCopyClicks(this.shadowRoot);
     this.shadowRoot.addEventListener('bsky-reply-to', (e) => {
       const d = e?.detail || null;
       this._replyTo = d?.uri ? { uri: String(d.uri), cid: String(d.cid || ''), author: String(d.author || '') } : null;
@@ -173,6 +198,22 @@ export class BskyContentPanel extends HTMLElement {
       this.dispatchEvent(new CustomEvent('bsky-close-content', { bubbles: true, composed: true }));
       return;
     }
+
+    const tab = e.target?.closest?.('[data-tab]')?.getAttribute?.('data-tab');
+    if (tab) {
+      this.setView(tab);
+      return;
+    }
+
+    const followDid = e.target?.closest?.('[data-follow-did]')?.getAttribute?.('data-follow-did');
+    if (followDid) {
+      this.followOne(followDid);
+      return;
+    }
+    if (e.target?.closest?.('[data-follow-all]')) {
+      this.followAll();
+      return;
+    }
   }
 
   async load() {
@@ -190,12 +231,163 @@ export class BskyContentPanel extends HTMLElement {
     } finally {
       this._loading = false;
       this.render();
+      this._maybeLoadEngagement();
+    }
+  }
+
+  async _maybeLoadEngagement() {
+    if (!this._selection?.uri) return;
+    if (this._eng.loading) return;
+
+    const uri = String(this._selection.uri || '');
+    const view = String(this._view || 'replies');
+    if (view === 'replies') return;
+
+    if (view === 'likes' && Array.isArray(this._eng.likes)) return;
+    if (view === 'reposts' && Array.isArray(this._eng.reposts)) return;
+    if (view === 'quotes' && Array.isArray(this._eng.quotes)) return;
+
+    this._eng = { ...this._eng, loading: true, error: null };
+    this.render();
+
+    try {
+      if (view === 'likes') {
+        const res = await call('getLikes', { uri, limit: 100 });
+        const items = (res?.likes || []).map((l) => ({
+          did: l.actor?.did,
+          handle: l.actor?.handle,
+          displayName: l.actor?.displayName,
+          avatar: l.actor?.avatar,
+          when: l.indexedAt || l.createdAt,
+        }));
+        const followMap = await this._loadFollowMap(items.map((i) => i.did));
+        this._eng = { ...this._eng, likes: items, followMap };
+      } else if (view === 'reposts') {
+        const res = await call('getRepostedBy', { uri, limit: 100 });
+        const items = (res?.repostedBy || []).map((a) => ({
+          did: a?.did,
+          handle: a?.handle,
+          displayName: a?.displayName,
+          avatar: a?.avatar,
+          when: a.indexedAt,
+        }));
+        const followMap = await this._loadFollowMap(items.map((i) => i.did));
+        this._eng = { ...this._eng, reposts: items, followMap };
+      } else if (view === 'quotes') {
+        const res = await call('getQuotes', { uri, limit: 50 });
+        const posts = Array.isArray(res?.posts) ? res.posts : [];
+        // Follow-map for quote authors (best-effort).
+        const dids = posts.map((p) => p?.author?.did).filter(Boolean);
+        const followMap = await this._loadFollowMap(dids);
+        this._eng = { ...this._eng, quotes: posts, followMap };
+      }
+    } catch (e) {
+      this._eng = { ...this._eng, error: e?.message || String(e || 'Failed to load engagement') };
+    } finally {
+      this._eng = { ...this._eng, loading: false };
+      this.render();
+    }
+  }
+
+  async _loadFollowMap(dids = []) {
+    const uniq = Array.from(new Set((dids || []).filter(Boolean)));
+    if (!uniq.length) return {};
+    try {
+      const rel = await call('getRelationships', { actors: uniq });
+      const map = {};
+      (rel?.relationships || []).forEach((r) => { if (r?.did) map[r.did] = { following: !!r.following }; });
+      return map;
+    } catch {
+      return {};
+    }
+  }
+
+  async followOne(did) {
+    const d = String(did || '');
+    if (!d) return;
+    try {
+      await call('follow', { did: d });
+      this._eng.followMap = { ...(this._eng.followMap || {}), [d]: { following: true } };
+      this.render();
+    } catch (e) {
+      // Keep it simple; Content panel isn't a modal.
+      this._eng.error = 'Follow failed: ' + (e?.message || String(e || 'unknown'));
+      this.render();
+    }
+  }
+
+  async followAll() {
+    const view = String(this._view || 'replies');
+    const followMap = this._eng.followMap || {};
+    let dids = [];
+    if (view === 'likes') dids = (this._eng.likes || []).map((i) => i.did);
+    else if (view === 'reposts') dids = (this._eng.reposts || []).map((i) => i.did);
+    else if (view === 'quotes') dids = (this._eng.quotes || []).map((p) => p?.author?.did);
+    dids = Array.from(new Set(dids.filter(Boolean))).filter((d) => !followMap[d]?.following);
+    if (!dids.length) return;
+    try {
+      await call('followMany', { dids });
+      const next = { ...(followMap || {}) };
+      dids.forEach((d) => { next[d] = { following: true }; });
+      this._eng.followMap = next;
+      this.render();
+    } catch (e) {
+      this._eng.error = 'Bulk follow failed: ' + (e?.message || String(e || 'unknown'));
+      this.render();
     }
   }
 
   render() {
     const uri = this._selection?.uri || '';
     const open = uri ? atUriToWebPost(uri) : '';
+    const view = String(this._view || 'replies');
+
+    const tabs = [
+      { id: 'replies', label: 'Replies', icon: '💬' },
+      { id: 'reposts', label: 'Reposts', icon: '🔁' },
+      { id: 'quotes', label: 'Quotes', icon: '❝❞' },
+      { id: 'likes', label: 'Likes', icon: '♥' },
+    ];
+
+    const followAllDisabled = (() => {
+      const m = this._eng.followMap || {};
+      if (view === 'likes') return (this._eng.likes || []).every((i) => !i?.did || m[i.did]?.following);
+      if (view === 'reposts') return (this._eng.reposts || []).every((i) => !i?.did || m[i.did]?.following);
+      if (view === 'quotes') return (this._eng.quotes || []).every((p) => !p?.author?.did || m[p.author.did]?.following);
+      return true;
+    })();
+
+    const renderActorRows = (items = []) => {
+      const m = this._eng.followMap || {};
+      return (items || []).map((i) => {
+        const did = String(i?.did || '');
+        const following = !!m?.[did]?.following;
+        return `
+          <div class="row">
+            ${i?.avatar ? `<img class="avatar" src="${esc(i.avatar)}" alt="">` : ''}
+            <div class="who">
+              <div class="name">${identityHtml({ did, handle: i?.handle, displayName: i?.displayName }, { showHandle: true, showCopyDid: true })}</div>
+              <div class="sub">@${esc(i?.handle || '')}</div>
+            </div>
+            ${following ? `<span class="sub">Following</span>` : `<button class="btn" type="button" data-follow-did="${esc(did)}" title="Follow" aria-label="Follow">➕</button>`}
+          </div>
+        `;
+      }).join('') || '<div class="muted">No entries.</div>';
+    };
+
+    const renderQuotes = (posts = []) => {
+      if (!posts || !posts.length) return '<div class="muted">No quotes.</div>';
+      return posts.map((p) => `<div class="quote">${renderPostCard(p)}</div>`).join('');
+    };
+
+    const engagementBody = (() => {
+      if (this._eng.loading) return '<div class="muted">Loading…</div>';
+      if (this._eng.error) return `<div class="err">${esc(this._eng.error)}</div>`;
+      if (view === 'likes') return `<div class="list">${renderActorRows(this._eng.likes || [])}</div>`;
+      if (view === 'reposts') return `<div class="list">${renderActorRows(this._eng.reposts || [])}</div>`;
+      if (view === 'quotes') return `<div class="quotes">${renderQuotes(this._eng.quotes || [])}</div>`;
+      return '';
+    })();
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -208,12 +400,38 @@ export class BskyContentPanel extends HTMLElement {
         .muted{color:#aaa}
         .err{color:#f88}
         .section{margin-bottom:10px}
+
+        .tabs{display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:10px}
+        .tab{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius: var(--bsky-radius, 0px); padding:6px 10px; cursor:pointer}
+        .tab[aria-selected="true"]{border-color:#3b5a8f}
+
+        .actionsRow{display:flex; gap:8px; align-items:center; justify-content:flex-end; margin:10px 0}
+
+        .list{display:grid; gap:6px}
+        .row{display:flex; align-items:center; gap:10px; border:1px solid #222; background:#0b0b0b; padding:6px}
+        .avatar{width:40px; height:40px; object-fit:cover; flex:0 0 auto; border-radius: var(--bsky-radius, 0px)}
+        .who{flex:1 1 auto; min-width:0}
+        .name{font-weight:700}
+        .sub{color:#bbb; font-size:.9rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+
+        .quotes{display:grid; gap:8px}
+        .quote{border:1px solid #222; padding:6px; background:#0a0a0a}
+
+        ${identityCss}
       </style>
 
       <bsky-panel-shell dense title="Content">
         <div slot="head-right" class="topRight">
-          ${open ? `<a class="btn link" href="${esc(open)}" target="_blank" rel="noopener">Open</a>` : ''}
-          <button class="btn" type="button" data-close>Close</button>
+          ${open ? `<a class="btn link" href="${esc(open)}" target="_blank" rel="noopener" title="Open on Bluesky" aria-label="Open on Bluesky">↗</a>` : ''}
+          <button class="btn" type="button" data-close title="Close" aria-label="Close">✕</button>
+        </div>
+
+        <div class="tabs" role="tablist" aria-label="Content tabs">
+          ${tabs.map((t) => `
+            <button class="tab" type="button" role="tab" data-tab="${esc(t.id)}" aria-selected="${t.id === view ? 'true' : 'false'}" title="${esc(t.label)}">
+              ${esc(t.icon)}
+            </button>
+          `).join('')}
         </div>
 
         <div class="section">
@@ -223,12 +441,22 @@ export class BskyContentPanel extends HTMLElement {
         </div>
 
         <div class="section">
-          <bsky-thread-tree></bsky-thread-tree>
+          ${view === 'replies'
+            ? '<bsky-thread-tree></bsky-thread-tree>'
+            : `
+              <div class="actionsRow">
+                <button class="btn" type="button" data-follow-all ${followAllDisabled ? 'disabled' : ''} title="Follow all" aria-label="Follow all">➕</button>
+              </div>
+              ${engagementBody}
+            `
+          }
         </div>
 
-        <div class="section">
-          <bsky-comment-composer></bsky-comment-composer>
-        </div>
+        ${view === 'replies' ? `
+          <div class="section">
+            <bsky-comment-composer></bsky-comment-composer>
+          </div>
+        ` : ''}
       </bsky-panel-shell>
     `;
 

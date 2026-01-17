@@ -12,10 +12,19 @@ function pickText(post) {
   return String(rec.text || '');
 }
 
-function pickAuthor(post) {
+function pickAuthorParts(post) {
   const a = post?.author || {};
-  const handle = a?.handle ? `@${a.handle}` : '';
-  return a?.displayName ? `${a.displayName} ${handle}`.trim() : (handle || '');
+  return {
+    displayName: String(a?.displayName || ''),
+    handle: String(a?.handle || ''),
+  };
+}
+
+function formatAuthor(parts) {
+  const displayName = String(parts?.displayName || '');
+  const handle = String(parts?.handle || '');
+  const at = handle ? `@${handle}` : '';
+  return displayName ? `${displayName} ${at}`.trim() : (at || '');
 }
 
 function pickTime(post) {
@@ -75,13 +84,11 @@ function renderVideo(video, openUrl = '') {
   const poster = video.thumb ? ` poster="${esc(video.thumb)}"` : '';
   // NOTE: Many Bluesky videos are HLS (m3u8). Some browsers can’t play HLS without hls.js.
   const type = src.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp4';
-  const isHls = src.endsWith('.m3u8');
   return `
     <div class="video-wrap">
       <video controls playsinline preload="metadata"${poster}>
         <source src="${esc(src)}" type="${esc(type)}" />
       </video>
-      ${isHls ? `<div class="hint">HLS video: if it won’t play here, use Open on Bluesky.</div>` : ''}
       ${openUrl ? `<a class="open" href="${esc(openUrl)}" target="_blank" rel="noopener">Open on Bluesky</a>` : ''}
     </div>
   `;
@@ -94,6 +101,8 @@ export class BskyThreadTree extends HTMLElement {
     this._thread = null; // getPostThread().thread
     this._replyTo = null; // { uri, author }
     this._toggleBusy = new Set(); // uri
+
+    this._hideRoot = false;
 
     this._likeChangedHandler = null;
     this._repostChangedHandler = null;
@@ -172,8 +181,16 @@ export class BskyThreadTree extends HTMLElement {
     return out.reverse();
   }
 
-  setThread(thread) {
+  setThread(thread, opts = null) {
     this._thread = thread || null;
+    try {
+      const o = (opts && typeof opts === 'object') ? opts : null;
+      if (o && typeof o.hideRoot === 'boolean') this._hideRoot = o.hideRoot;
+      // Attribute can override as well.
+      if (this.hasAttribute('hide-root') || this.hasAttribute('data-hide-root')) this._hideRoot = true;
+    } catch {
+      // ignore
+    }
     this.render();
   }
 
@@ -336,7 +353,8 @@ export class BskyThreadTree extends HTMLElement {
     const post = node?.post || null;
     const uri = post?.uri || '';
     const cid = post?.cid || '';
-    const who = pickAuthor(post);
+    const author = pickAuthorParts(post);
+    const who = formatAuthor(author);
     const when = pickTime(post);
     const text = pickText(post);
 
@@ -358,12 +376,20 @@ export class BskyThreadTree extends HTMLElement {
       <div class="node ${esc(variant)}" style="--depth:${depth}">
         <div class="card">
           <div class="meta">
-            <div class="who">${esc(who)}</div>
-            <div class="when">${esc(when)}</div>
-            ${(open) ? `<a class="open" href="${esc(open)}" target="_blank" rel="noopener">Open</a>` : ''}
-            ${(variant !== 'ancestor' && uri) ? `<button class="reply" type="button" data-reply-uri="${esc(uri)}" data-reply-cid="${esc(cid)}" data-reply-author="${esc(who)}">Reply</button>` : ''}
-            ${(variant !== 'ancestor' && uri) ? `<button class="repost" type="button" data-repost-uri="${esc(uri)}" data-repost-cid="${esc(cid)}" data-reposted="${reposted ? '1' : '0'}">${reposted ? 'Undo repost' : 'Repost'}</button>` : ''}
-            ${(variant !== 'ancestor' && uri) ? `<button class="like" type="button" data-like-uri="${esc(uri)}" data-like-cid="${esc(cid)}" data-liked="${liked ? '1' : '0'}">${liked ? 'Unlike' : 'Like'}</button>` : ''}
+            <div class="meta-top">
+              <div class="who">
+                ${author.displayName ? `<span class="name">${esc(author.displayName)}</span>` : ''}
+                ${author.handle ? `<span class="handle">@${esc(author.handle)}</span>` : ''}
+                ${(!author.displayName && !author.handle) ? '<span class="name muted">(unknown)</span>' : ''}
+              </div>
+            </div>
+            <div class="meta-bottom">
+              <div class="when">${esc(when)}</div>
+              ${(open) ? `<a class="open" href="${esc(open)}" target="_blank" rel="noopener">Open</a>` : ''}
+              ${(variant !== 'ancestor' && uri) ? `<button class="reply" type="button" data-reply-uri="${esc(uri)}" data-reply-cid="${esc(cid)}" data-reply-author="${esc(who)}">Reply</button>` : ''}
+              ${(variant !== 'ancestor' && uri) ? `<button class="repost" type="button" data-repost-uri="${esc(uri)}" data-repost-cid="${esc(cid)}" data-reposted="${reposted ? '1' : '0'}">${reposted ? 'Undo repost' : 'Repost'}</button>` : ''}
+              ${(variant !== 'ancestor' && uri) ? `<button class="like" type="button" data-like-uri="${esc(uri)}" data-like-cid="${esc(cid)}" data-liked="${liked ? '1' : '0'}">${liked ? 'Unlike' : 'Like'}</button>` : ''}
+            </div>
           </div>
           ${text ? `<div class="text">${esc(text)}</div>` : '<div class="text muted">(no text)</div>'}
           ${embedsHtml ? `<div class="embeds">${embedsHtml}</div>` : ''}
@@ -380,6 +406,12 @@ export class BskyThreadTree extends HTMLElement {
       ? `<div class="ancestors">${ancestors.map((n) => this.renderNode(n, 0, { variant: 'ancestor' })).join('')}</div>`
       : '';
 
+    const hideRoot = !!this._hideRoot;
+    const replies = Array.isArray(root?.replies) ? root.replies : [];
+    const repliesHtml = replies.length
+      ? `<div class="replies">${replies.map((r) => this.renderNode(r, 0)).join('')}</div>`
+      : '<div class="muted">No replies yet.</div>';
+
     this.shadowRoot.innerHTML = `
       <style>
         :host, *, *::before, *::after{box-sizing:border-box}
@@ -387,17 +419,21 @@ export class BskyThreadTree extends HTMLElement {
         .muted{color:#aaa}
 
         .node{margin: 0 0 8px 0; padding-left: calc(var(--depth, 0) * 12px); border-left: 2px solid rgba(255,255,255,0.06)}
-        .card{border:1px solid #222; border-radius: var(--bsky-radius, 0px); background:#0b0b0b; padding:8px}
-        .meta{display:flex; align-items:center; gap:10px; color:#bbb; font-size:0.9rem; margin-bottom:6px}
-        .who{font-weight:700; color:#eaeaea; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
-        .when{margin-left:auto; white-space:nowrap}
+        .card{border:2px dotted rgba(255,255,255,0.9); border-radius: var(--bsky-radius, 0px); background:#0b0b0b; padding:10px 8px}
+        .meta{display:flex; flex-direction:column; gap:6px; color:#bbb; font-size:0.9rem; margin-bottom:6px}
+        .meta-top{display:flex; align-items:center; min-width:0}
+        .who{display:flex; align-items:baseline; gap:8px; min-width:0}
+        .name{font-weight:700; color:#eaeaea; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+        .handle{color:#bbb; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+        .meta-bottom{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+        .when{margin-right:auto; white-space:nowrap}
         .text{white-space:pre-wrap; line-height:1.25}
 
         .open{color:#9cd3ff; text-decoration:none}
         .open:hover{text-decoration:underline}
 
         .embeds{margin-top:8px}
-        .images-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:6px}
+        .images-grid{display:grid;grid-template-columns:1fr;gap:6px;margin-top:6px}
         .img-wrap{margin:0;background:#111;overflow:hidden}
         .img-wrap img{width:100%;height:auto;display:block}
         .video-wrap video{width:100%;height:auto;display:block;background:#111}
@@ -414,7 +450,7 @@ export class BskyThreadTree extends HTMLElement {
 
         .replies{margin-top:8px}
       </style>
-      ${root ? `${ancestorsHtml}${this.renderNode(root, 0)}` : '<div class="muted">Select a post to view its thread.</div>'}
+      ${root ? (hideRoot ? repliesHtml : `${ancestorsHtml}${this.renderNode(root, 0)}`) : '<div class="muted">Select a post to view its thread.</div>'}
     `;
   }
 }

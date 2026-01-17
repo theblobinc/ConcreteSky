@@ -1443,6 +1443,15 @@ class Api extends ParentController
                             'cursor' => $params['cursor'] ?? null,
                         ]));
 
+                case 'getQuotes':
+                    if (empty($params['uri'])) return $this->json(['error' => 'Missing uri'], 400);
+                    return $this->json($this->xrpcSession('GET', 'app.bsky.feed.getQuotes',
+                        $session, [
+                            'uri'    => $params['uri'],
+                            'limit'  => (int)($params['limit'] ?? 25),
+                            'cursor' => $params['cursor'] ?? null,
+                        ]));
+
                 /* ===================== graph / follow & social state ===================== */
 
                 case 'getFollowers':

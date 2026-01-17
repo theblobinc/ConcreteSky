@@ -53,6 +53,9 @@ export class BskyConversationTree extends HTMLElement {
   set thread(v){ this._thread = v; this.render(); }
   get thread(){ return this._thread; }
 
+  set hideRoot(v){ this._hideRoot = !!v; this.render(); }
+  get hideRoot(){ return !!this._hideRoot; }
+
   connectedCallback(){
     this.attachShadow({mode:'open'});
     this.shadowRoot.addEventListener('click', (e) => this.onClick(e));
@@ -130,13 +133,23 @@ export class BskyConversationTree extends HTMLElement {
   render(){
     if (!this.shadowRoot) return;
     const t = this._thread;
+    const hideRoot = !!(this._hideRoot || this.hasAttribute('hide-root') || this.hasAttribute('data-hide-root'));
+
+    const renderThread = () => {
+      if (!t) return '<div class="muted">No conversation.</div>';
+      if (!hideRoot) return renderNode(t, 0);
+      const kids = Array.isArray(t?.replies) ? t.replies : [];
+      if (!kids.length) return '<div class="muted">No replies yet.</div>';
+      return kids.map((ch) => renderNode(ch, 0)).join('');
+    };
+
     this.shadowRoot.innerHTML = `
       <style>
         :host{display:block}
         a{ color:#fff; text-decoration:underline }
         a:hover{ color:#aaa }
         .thread-node{ margin-top:8px; }
-        .thread-node .post{ border:1px solid #333; border-radius:10px; padding:10px; background:#0b0b0b; margin-left: calc(var(--indent, 0) * 12px); }
+        .thread-node .post{ border:2px dotted rgba(255,255,255,0.9); border-radius:10px; padding:10px; background:#0b0b0b; margin-left: calc(var(--indent, 0) * 12px); }
         .thread-children{ margin-left: 12px; }
 
         /* media inside cards should fill container width */
@@ -173,7 +186,7 @@ export class BskyConversationTree extends HTMLElement {
         .post header.meta{ display:flex; align-items:center; gap:10px }
         .post .text{ white-space:pre-wrap; line-height:1.35; margin-top:6px }
       </style>
-      ${t ? renderNode(t, 0) : '<div class="muted">No conversation.</div>'}
+      ${renderThread()}
     `;
   }
 }

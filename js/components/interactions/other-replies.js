@@ -126,7 +126,8 @@ export class BskyOtherReplies extends HTMLElement {
           background:#0e0e0e; color:#fff; border:1px solid #444; border-radius:8px; padding:6px 8px;
         }
         .thread-node{ margin-top:8px; }
-        .post{ border:1px solid #333; border-radius:10px; padding:10px; background:#0b0b0b; }
+        .thread-node .post{ border:2px dotted rgba(255,255,255,0.9); border-radius:10px; padding:10px; background:#0b0b0b; margin-left: calc(var(--indent, 0) * 12px); }
+        .thread-children{ margin-left: 12px; }
         .post img:not(.av), .post video, .post .embed, .post .thumb{
           width:100%; height:auto; max-width:100%;
           display:block;
@@ -208,17 +209,57 @@ export class BskyOtherReplies extends HTMLElement {
     let children = Array.isArray(thread.replies) ? thread.replies.slice() : [];
     children = children.filter(n => (n?.post?.uri || '') !== (subject?.uri || ''));
 
-    if (cutoff) {
-      children = children.filter(n => {
-        const iso = n?.post?.record?.createdAt || n?.post?.indexedAt || '';
+    const postTimeMs = (p) => {
+      try {
+        const iso = p?.record?.createdAt || p?.indexedAt || '';
         const ts = new Date(iso).getTime();
-        return !Number.isNaN(ts) && ts >= cutoff;
-      });
-    }
-    if (search) {
-      const parentMatches = nodeHasKeyword(thread, search);
-      if (!parentMatches) children = children.filter(n => nodeHasKeyword(n, search));
-    }
+        return Number.isNaN(ts) ? 0 : ts;
+      } catch {
+        return 0;
+      }
+    };
+
+    const textOf = (n) => {
+      try {
+        return String(n?.post?.record?.text || n?.record?.text || '').toLowerCase();
+      } catch {
+        return '';
+      }
+    };
+
+    const matchSelf = (n, q) => {
+      if (!q) return true;
+      const needle = String(q || '').toLowerCase();
+      if (!needle) return true;
+      return textOf(n).includes(needle);
+    };
+
+    const pruneNode = (node, depth = 0) => {
+      if (!node || !node.post) return null;
+      const kids = Array.isArray(node.replies) ? node.replies : [];
+      const prunedKids = [];
+      for (const k of kids) {
+        const pk = pruneNode(k, depth + 1);
+        if (pk) prunedKids.push(pk);
+      }
+
+      const ts = postTimeMs(node.post);
+      const timeOk = !cutoff || (ts >= cutoff);
+      const kwOkSelf = !search || matchSelf(node, search);
+      const kwOk = !search || kwOkSelf || prunedKids.length > 0;
+
+      // Keep context nodes if they lead to kept descendants.
+      const keep = kwOk && (timeOk || prunedKids.length > 0);
+      if (!keep) return null;
+
+      return {
+        post: node.post,
+        replies: prunedKids,
+      };
+    };
+
+    // Prune each top-level reply subtree based on time/search.
+    children = children.map((n) => pruneNode(n, 0)).filter(Boolean);
 
     const withMeta = children.map(n => {
       const p = n?.post || {};
@@ -236,8 +277,14 @@ export class BskyOtherReplies extends HTMLElement {
     mine.sort(sortFn); others.sort(sortFn);
     const ordered = [...mine, ...others].map(x => x.node);
 
-    const html = ordered.map(n => {
-      const p = n?.post || {};
+    const sortKidsChronoAsc = (kids) => {
+      return kids.slice().sort((a, b) => postTimeMs(a?.post) - postTimeMs(b?.post));
+    };
+
+    const renderNode = (n, depth = 0) => {
+      if (!n || !n.post) return '';
+      const p = n.post;
+      const indent = Math.min(depth, 6);
       const uri = esc(p?.uri || '');
       const cid = esc(p?.cid || '');
       const liked = !!p?.viewer?.like;
@@ -246,9 +293,11 @@ export class BskyOtherReplies extends HTMLElement {
       const repostRec = esc(p?.viewer?.repost || '');
 
       const c = countsOf(p);
+      const kids = Array.isArray(n.replies) ? sortKidsChronoAsc(n.replies) : [];
+      const kidsHtml = kids.map((k) => renderNode(k, depth + 1)).join('');
 
       return `
-        <div class="thread-node">
+        <div class="thread-node" style="--indent:${indent}">
           ${renderPostCard(p)}
 
           <div class="counts">
@@ -261,15 +310,17 @@ export class BskyOtherReplies extends HTMLElement {
             <button class="act-btn" data-action="${liked?'unlike':'like'}" data-uri="${uri}" data-cid="${cid}" ${likeRec?`data-like-rec="${likeRec}"`:''}>
               ${liked ? 'Liked ❤️' : 'Like'}
             </button>
-            <button class="act-btn" data-action="${reposted?'unrepost':'repost'}" data-uri="${uri}" data-cid="${cid}" ${reposted?`data-repost-rec="${repostRec}"`:''}>
+            <button class="act-btn" data-action="${reposted?'unrepost':'repost'}" data-uri="${uri}" data-cid="${cid}" ${repostRec?`data-repost-rec="${repostRec}"`:''}>
               ${reposted ? 'Reposted 🔁' : 'Repost'}
             </button>
           </div>
 
-          ${Array.isArray(n.replies) && n.replies.length ? '<div class="thread-children"></div>' : ''}
+          ${kidsHtml ? `<div class="thread-children">${kidsHtml}</div>` : ''}
         </div>
       `;
-    }).join('');
+    };
+
+    const html = ordered.map((n) => renderNode(n, 0)).join('');
 
     list.innerHTML = html || '<div class="muted">No matching replies in this range.</div>';
 

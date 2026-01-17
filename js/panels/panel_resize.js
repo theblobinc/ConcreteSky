@@ -15,7 +15,8 @@ export function enablePanelResize(root) {
     // sm>=576, md>=768, lg>=992, xl>=1200, xxl>=1400.
     // We keep 2 as the minimum so panels never go below 2 grid units.
     if (ww >= 1400) return 12; // xxl
-    if (ww >= 1200) return 10; // xl
+    // Keep a 12-col grid at xl so each panel can target span=3 (4 panels across).
+    if (ww >= 1200) return 12; // xl
     if (ww >= 992) return 8;   // lg
     if (ww >= 768) return 6;   // md
     if (ww >= 576) return 4;   // sm
@@ -93,7 +94,9 @@ export function enablePanelResize(root) {
     return spanWidthPx(span, unit, gutter);
   };
 
-  const isCardPanel = (name) => (name === 'posts' || name === 'connections');
+  // Panels that should snap to "card columns" widths when data-bsky-fixed-cols is set.
+  // Content behaves like a Posts subpanel and should size to the same column rhythm.
+  const isCardPanel = (name) => (name === 'posts' || name === 'connections' || name === 'content');
 
   const getDenseExtra = (panelEl, opts = {}) => {
     const densePad = cssPx(panelsWrap || document.documentElement, '--bsky-panel-pad-dense', 4);

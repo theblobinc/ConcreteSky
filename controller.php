@@ -11,7 +11,7 @@ class Controller extends Package
 {
     protected $pkgHandle = 'concretesky';
     protected $appVersionRequired = '9.0.0';
-    protected $pkgVersion = '0.1.122';
+    protected $pkgVersion = '0.1.123';
 
     public function on_start()
     {

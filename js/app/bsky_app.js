@@ -1,6 +1,7 @@
 import { call } from '../api.js';
 import { bootTabs } from '../tabs.js';
 import { getPanelTemplates, getDefaultActiveTabs } from '../panels/panel_api.js';
+import { isMobilePanelsViewport } from '../panels/panel_api.js';
 
 // Side-effect imports: define custom elements used in the shell.
 import '../panels/components/index.js';
@@ -258,6 +259,28 @@ class BskyApp extends HTMLElement {
     const contentSection = this.shadowRoot.querySelector('.panel[data-panel="content"]');
     const contentWasVisibleAtCall = !!(contentSection && !contentSection.hasAttribute('hidden'));
 
+    // Mobile: show Content as an overlay subpanel, on top of the base panel.
+    // Keep primary panels swipeable underneath.
+    if (isMobilePanelsViewport()) {
+      try {
+        const base = (splitFrom || spawnAfter || 'posts');
+        api?.setActive?.([base]);
+      } catch {
+        // ignore
+      }
+      api?.activate?.('content');
+
+      requestAnimationFrame(() => {
+        try {
+          const cp = this.shadowRoot.querySelector('bsky-content-panel');
+          cp?.setSelection?.({ uri, cid });
+        } catch {
+          // ignore
+        }
+      });
+      return;
+    }
+
     if (spawnAfter) api?.placeAfter?.('content', spawnAfter);
 
     // Posts side-panel behavior: pin all other visible panels so Comments only
@@ -294,7 +317,8 @@ class BskyApp extends HTMLElement {
     // After the panel mounts, pass selection + (posts-only) size Posts + Comments as a split.
     requestAnimationFrame(() => {
       const cp = this.shadowRoot.querySelector('bsky-content-panel');
-      cp?.setSelection?.({ uri, cid });
+      const view = String(detail?.view || detail?.tab || '');
+      cp?.setSelection?.({ uri, cid, view });
 
       // Posts-only behavior: on desktop, shrink Posts by one *actual* column width
       // and allocate that column to the Comments panel.
@@ -311,108 +335,35 @@ class BskyApp extends HTMLElement {
         const contentPanel = this.shadowRoot.querySelector('.panel[data-panel="content"]');
         if (!postsPanel || !contentPanel) return;
 
-        const GRID_GUTTER = this._cssPx('--bsky-grid-gutter', this._cssPx('--bsky-card-gap', 8));
-
-        // Remove exactly one *current* column from Posts, so the remaining columns
-        // keep the same computed CARD width and fill correctly.
-        const postsW0 = postsPanel.getBoundingClientRect().width || 0;
-        const minPostsW = (() => {
-          try {
-            const v = window.getComputedStyle(postsPanel).minWidth;
-            const n = Number.parseFloat(String(v || ''));
-            return Number.isFinite(n) ? n : 0;
-          } catch { return 0; }
-        })();
-        const minContentW = (() => {
-          try {
-            const v = window.getComputedStyle(contentPanel).minWidth;
-            const n = Number.parseFloat(String(v || ''));
-            return Number.isFinite(n) ? n : 0;
-          } catch { return 0; }
-        })();
-
-        const contentExtra = (() => {
-          try {
-            const el = contentPanel.querySelector('bsky-content-panel');
-            const shell = el?.shadowRoot?.querySelector?.('bsky-panel-shell');
-            const scroller = shell?.getScroller?.();
-            const panelW = contentPanel.getBoundingClientRect().width || 0;
-            const scrollerW = scroller?.clientWidth || scroller?.getBoundingClientRect?.().width || 0;
-            const extra = panelW && scrollerW ? Math.max(0, panelW - scrollerW) : 0;
-            return extra;
-          } catch {
-            return 0;
-          }
-        })();
-
-        // Inserting a new panel increases the number of inter-panel gaps by 1.
-        // Charge that extra gap to Posts so Connections doesn't get squeezed.
-        const panelsGap = (() => {
-          try {
-            const wrap = this.shadowRoot.querySelector('.panels');
-            if (!wrap) return 0;
-            const cs = window.getComputedStyle(wrap);
-            const raw = cs.columnGap || cs.gap || '0';
-            const n = Number.parseFloat(String(raw || '0'));
-            return Number.isFinite(n) ? n : 0;
-          } catch {
-            return 0;
-          }
-        })();
-
-        // Bootstrap-like split: treat the *global* panels layout as the grid.
-        // posts span (eg 6) => comments span defaults to half (eg 3), leaving posts at 3.
-        const readCssNum = (el, prop) => {
+        // Size the split using "card columns" rather than global panel spans.
+        // This works even when Posts only has span=3 (xl default) and avoids the
+        // previous "baseSpan < 4" early-return that prevented any shrink.
+        const readCssNum = (el, prop, fallback = 0) => {
           try {
             const raw = window.getComputedStyle(el).getPropertyValue(prop);
             const n = Number.parseFloat(String(raw || ''));
-            return Number.isFinite(n) ? n : 0;
+            return Number.isFinite(n) ? n : fallback;
           } catch {
-            return 0;
+            return fallback;
           }
         };
 
-        const panelsWrap = this.shadowRoot.querySelector('.panels');
-        const unit = panelsWrap ? readCssNum(panelsWrap, '--bsky-grid-unit') : 0;
-        const baseSpan0 = readCssNum(postsPanel, '--bsky-panel-span');
-        const baseSpan = Math.max(0, Math.round(baseSpan0 || 0));
+        const CARD = this._cssPx('--bsky-card-min-w', 350);
+        const GAP = this._cssPx('--bsky-card-gap', this._cssPx('--bsky-grid-gutter', 12));
 
-        if (!Number.isFinite(unit) || unit <= 0) return;
-        if (!baseSpan || baseSpan < 4) {
-          // Not enough room for a sane 2+2 split; just open Comments without resizing.
-          return;
-        }
+        const postsW0 = postsPanel.getBoundingClientRect().width || 0;
+        if (!postsW0 || postsW0 < 50) return;
 
-        const clampSpan = (v) => {
-          const n = Number(v);
-          if (!Number.isFinite(n)) return null;
-          return Math.max(2, Math.min(baseSpan - 2, Math.round(n)));
-        };
+        const stride = Math.max(1, CARD + GAP);
+        // Approximate current columns using the panel width (good enough for split sizing).
+        const baseCols = Math.max(1, Math.floor((postsW0 + GAP) / stride));
+        // One-column split: Posts loses exactly 1 column; Content takes it.
+        const contentCols = Math.max(1, Number(detail?.subCols || 1));
+        const nextPostsCols = Math.max(1, baseCols - contentCols);
 
-        // Default: allocate half of the base panel span to Comments.
-        const subSpan = clampSpan(detail?.subSpan) || Math.max(2, Math.min(baseSpan - 2, Math.round(baseSpan / 2)));
+        this.setFixedCols('posts', nextPostsCols);
+        this.setFixedCols('content', contentCols);
 
-        // Target inner scroller width for Comments: span width includes internal gutters.
-        const contentInnerTarget = Math.max(1, Math.round((subSpan * unit) + ((subSpan - 1) * GRID_GUTTER)));
-        // Shrink Posts by the content span + the new inter-panel gutter.
-        const shrinkBy = contentInnerTarget + panelsGap;
-
-        // If we can't actually spare the subpanel (+ the new gap), don't force a shrink.
-        const canShrink = postsW0 > (minPostsW + shrinkBy + 8);
-        if (!canShrink) {
-          this.setFixedPx('content', Math.max(minContentW, contentExtra + contentInnerTarget));
-          requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
-          return;
-        }
-
-        const nextPostsW = Math.max(minPostsW, postsW0 - shrinkBy);
-        const nextContentW = Math.max(minContentW, contentExtra + contentInnerTarget);
-
-        // Apply explicit bases so the split is stable (panel_resize will respect these).
-        this.setFixedPx('posts', nextPostsW);
-        this.setFixedPx('content', nextContentW);
-
-        // Nudge panel_resize to reflow with fixed cols.
         requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
 
         // Keep base panel visually anchored on the left and place Comments into the freed space.
@@ -653,10 +604,12 @@ class BskyApp extends HTMLElement {
         }
         .panel:hover .resize-handle{opacity:0.6}
 
-        @media (max-width: 520px){
-          .tablist{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:8px;align-items:stretch}
-          .tab{width:100%;cursor:pointer}
-          .tabhint{grid-column:1/-1;margin-left:0;white-space:normal;display:block}
+        /* Mobile: keep tabs in a single row (scroll horizontally). */
+        @media (max-width: 767px){
+          .tabsbar{flex-wrap:nowrap; overflow-x:auto; -webkit-overflow-scrolling:touch}
+          .tablist{flex-wrap:nowrap; overflow-x:auto; gap:6px; scrollbar-width:thin}
+          .tab{white-space:nowrap; cursor:pointer; padding:8px 10px; flex:0 0 auto}
+          .tabhint{display:none}
         }
 
         /* Bootstrap-ish: below md, one panel per screen, swipe between them. */
@@ -668,9 +621,22 @@ class BskyApp extends HTMLElement {
             scroll-behavior: smooth;
             overscroll-behavior-x: contain;
             -webkit-overflow-scrolling: touch;
+            position:relative;
           }
           .panel{flex:0 0 100%; min-width:100%; border-left:0; border-right:0;}
           .panel .resize-handle{display:none;}
+
+          /* Subpanel overlay (e.g. content/comments) */
+          .panel[data-panel="content"]{
+            position:absolute;
+            inset:0;
+            z-index:50;
+            background:#000;
+            border-left:0;
+            border-right:0;
+            box-shadow:0 10px 40px rgba(0,0,0,.65);
+            scroll-snap-align:none;
+          }
         }
 
         /* Avoid wrapping panels into multiple rows; prefer swipe/scroll instead. */

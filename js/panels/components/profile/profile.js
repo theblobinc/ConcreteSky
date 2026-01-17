@@ -318,6 +318,12 @@ class BskyProfile extends HTMLElement {
             .auth-btn{appearance:none;background:#111;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:8px 12px;cursor:pointer;font-weight:700}
             .auth-btn:hover{background:#1b1b1b}
             .taskbar{flex:0 0 100%;width:100%;margin-top:10px}
+
+            @media (max-width: 767px){
+              .social-hud{align-items:flex-start}
+              .auth{gap:8px}
+              .auth-btn{padding:8px 10px}
+            }
           </style>
           <div class="social-hud">
             <div>
@@ -393,6 +399,7 @@ class BskyProfile extends HTMLElement {
           .hud-form button{appearance:none;background:#111;border:1px solid #555;color:#fff;padding:8px 10px;border-radius: var(--bsky-radius, 0px);cursor:pointer;font-weight:700}
           .hud-form button:hover{background:#1b1b1b}
           .hud-form select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:8px 10px}
+          .hud-form .icon{display:none}
           .hud-filter-menu{position:relative;align-self:flex-end;z-index:9999}
           .hud-filter-menu[open]{z-index:9999}
           details.hud-filter-menu > summary{list-style:none}
@@ -412,6 +419,23 @@ class BskyProfile extends HTMLElement {
           .gear{appearance:none;background:transparent;border:1px solid #333;color:#fff;border-radius: var(--bsky-radius, 0px);padding:6px 8px;cursor:pointer}
           .gear:hover{background:#1b1b1b}
           .taskbar{flex:0 0 100%;width:100%;margin-top:10px}
+
+          @media (max-width: 767px){
+            .social-hud{align-items:flex-start}
+            .avatar{width:40px;height:40px}
+            .left{flex:1 1 100%}
+            .right{margin-left:0;align-items:stretch;min-width:0;width:100%}
+            .hud-search{width:100%}
+            .hud-form{justify-content:flex-start}
+            .hud-form input{flex:1 1 100%}
+            .hud-form select{flex:1 1 auto}
+            .hud-form button{flex:0 0 auto}
+            .hud-form button{padding:8px 8px}
+            .hud-form .label{display:none}
+            .hud-form .icon{display:inline-block}
+            .hud-filter-menu{align-self:flex-start}
+            .hud-targets,.hud-filters{justify-content:flex-start}
+          }
           ${identityCss}
         </style>
         <div class="social-hud">
@@ -435,8 +459,8 @@ class BskyProfile extends HTMLElement {
                   <option value="cache" ${this._hudMode === 'cache' ? 'selected' : ''}>Cache</option>
                   <option value="network" ${this._hudMode === 'network' ? 'selected' : ''}>Bluesky</option>
                 </select>
-                <button type="submit">Search</button>
-                <button type="button" data-hud-clear>Clear</button>
+                <button type="submit" title="Search"><span class="icon" aria-hidden="true">🔎</span><span class="label">Search</span></button>
+                <button type="button" data-hud-clear title="Clear"><span class="icon" aria-hidden="true">✕</span><span class="label">Clear</span></button>
               </form>
               <details class="hud-filter-menu" data-hud-filter-menu>
                 <summary class="hud-filter-summary" title="Targets + filters">Filters</summary>

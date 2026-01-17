@@ -3,12 +3,18 @@ import { loadJson } from './storage.js';
 import { getTabOrder, applyTabOrder } from './tab_order.js';
 import { enableSortable } from './sortable.js';
 import { enablePanelResize } from './panel_resize.js';
+import { isMobilePanelsViewport } from './panel_api.js';
 
 function initTabs(root) {
   const buttons = Array.from(root.querySelectorAll('[data-tab]'));
   const panels = Array.from(root.querySelectorAll('[data-panel]'));
+  const panelsWrap = root.querySelector('.panels');
   const byName = new Map(panels.map((p) => [p.getAttribute('data-panel'), p]));
   const tabNames = new Set(buttons.map((b) => b.getAttribute('data-tab')).filter(Boolean));
+
+  const isSingleSelectViewport = () => {
+    try { return isMobilePanelsViewport(); } catch { return false; }
+  };
 
   // One-click escape hatch if a saved panel width locks you into 1-column layouts.
   const resetLayout = () => {
@@ -60,8 +66,13 @@ function initTabs(root) {
 
   const setActive = (names) => {
     // Only tab-backed panels are considered "active" for persistence/hash.
-    const activeTabs = normalize(names).filter((n) => tabNames.has(n));
+    let activeTabs = normalize(names).filter((n) => tabNames.has(n));
+    if (isSingleSelectViewport() && activeTabs.length > 1) {
+      activeTabs = [activeTabs[0]];
+    }
     if (!activeTabs.length) return;
+
+    const mobile = isSingleSelectViewport();
 
     // Preserve any currently-visible aux panels (panels without a tab button).
     const auxVisible = panels
@@ -69,7 +80,11 @@ function initTabs(root) {
       .map((p) => p.getAttribute('data-panel'))
       .filter((n) => n && !tabNames.has(n));
 
-    const visible = Array.from(new Set([...activeTabs, ...auxVisible]));
+    // Desktop: visible is the active set + any aux panels.
+    // Mobile: keep ALL primary panels visible so users can swipe between them.
+    const visible = mobile
+      ? Array.from(new Set([...Array.from(tabNames), ...auxVisible]))
+      : Array.from(new Set([...activeTabs, ...auxVisible]));
 
     for (const btn of buttons) {
       const on = activeTabs.includes(btn.getAttribute('data-tab'));
@@ -78,6 +93,12 @@ function initTabs(root) {
     }
     for (const p of panels) {
       const on = visible.includes(p.getAttribute('data-panel'));
+      const pn = p.getAttribute('data-panel');
+      // Mobile: never hide primary panels (keeps swipe navigation working).
+      if (mobile && pn && tabNames.has(pn)) {
+        p.removeAttribute('hidden');
+        continue;
+      }
       p.toggleAttribute('hidden', !on);
     }
 
@@ -96,6 +117,18 @@ function initTabs(root) {
       );
     } catch {
       // ignore
+    }
+
+    // Mobile: selecting a tab should bring that panel into the foreground.
+    if (mobile && panelsWrap) {
+      const target = byName.get(activeTabs[0]);
+      if (target) {
+        try {
+          panelsWrap.scrollTo({ left: target.offsetLeft, behavior: 'smooth' });
+        } catch {
+          try { panelsWrap.scrollLeft = target.offsetLeft; } catch {}
+        }
+      }
     }
   };
 
@@ -120,6 +153,20 @@ function initTabs(root) {
     }
 
     const current = getActive();
+
+    // Mobile: tabs are single-select (never toggle off; never multi-select).
+    if (isSingleSelectViewport()) {
+      if (current.length === 1 && current[0] === name) return;
+
+      // Switching primaries closes any aux subpanels (e.g. content overlay).
+      for (const p of panels) {
+        const pn = p.getAttribute('data-panel') || '';
+        if (pn && !tabNames.has(pn)) p.setAttribute('hidden', '');
+      }
+
+      setActive([name]);
+      return;
+    }
 
     const next = new Set(current);
     if (next.has(name)) {
@@ -148,6 +195,17 @@ function initTabs(root) {
       requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
       return;
     }
+
+    // Mobile: tabs are single-select.
+    if (isSingleSelectViewport()) {
+      for (const p of panels) {
+        const pn = p.getAttribute('data-panel') || '';
+        if (pn && !tabNames.has(pn)) p.setAttribute('hidden', '');
+      }
+      setActive([name]);
+      return;
+    }
+
     const current = new Set(getActive());
     current.add(name);
     setActive(Array.from(current));
@@ -239,6 +297,46 @@ function initTabs(root) {
     const t = getHashTabs();
     if (t && t.length) setActive(t);
   });
+
+  // Mobile: update active tab when user swipes between primary panels.
+  try {
+    if (panelsWrap) {
+      let swipeTimer = null;
+      const pickForeground = () => {
+        if (!isSingleSelectViewport()) return;
+        const wrapRect = panelsWrap.getBoundingClientRect();
+        const left0 = wrapRect.left;
+        let best = null;
+        let bestDx = Infinity;
+        for (const name of tabNames) {
+          const el = byName.get(name);
+          if (!el) continue;
+          const r = el.getBoundingClientRect();
+          const dx = Math.abs(r.left - left0);
+          if (dx < bestDx) { bestDx = dx; best = name; }
+        }
+        if (!best) return;
+        const cur = getActive();
+        if (cur.length === 1 && cur[0] === best) return;
+        // Swiping away closes any aux overlays.
+        for (const p of panels) {
+          const pn = p.getAttribute('data-panel') || '';
+          if (pn && !tabNames.has(pn)) p.setAttribute('hidden', '');
+        }
+        setActive([best]);
+      };
+      panelsWrap.addEventListener('scroll', () => {
+        if (!isSingleSelectViewport()) return;
+        if (swipeTimer) { try { clearTimeout(swipeTimer); } catch {} }
+        swipeTimer = setTimeout(() => {
+          swipeTimer = null;
+          pickForeground();
+        }, 120);
+      }, { passive: true });
+    }
+  } catch {
+    // ignore
+  }
 
   // Optional: sortable tab reorder + resizable panels
   enableSortable(root);

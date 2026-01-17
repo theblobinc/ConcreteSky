@@ -313,7 +313,20 @@ export class BskyInteractionsModal extends HTMLElement {
 
     // hydrate main conversation tree
     const conv = this.shadowRoot.querySelector('bsky-conversation-tree');
-    if (conv) conv.thread = subjectThread;
+    const threadRoot = (t) => {
+      try {
+        let cur = t;
+        while (cur?.parent?.post) cur = cur.parent;
+        return cur || t;
+      } catch {
+        return t;
+      }
+    };
+    if (conv) {
+      conv.thread = threadRoot(subjectThread);
+      // Root/subject/parent are rendered in the sections above; avoid duplicating root here.
+      try { conv.hideRoot = true; } catch { try { conv.setAttribute('hide-root', ''); } catch {} }
+    }
 
     // hydrate "other replies"
     const others = this.shadowRoot.querySelector('bsky-other-replies');
@@ -330,7 +343,8 @@ export class BskyInteractionsModal extends HTMLElement {
         const holders = wrap.querySelectorAll('.mine-item');
         holders.forEach((holder, i) => {
           const tree = document.createElement('bsky-conversation-tree');
-          tree.thread = mineNodes[i];
+          tree.thread = threadRoot(mineNodes[i]);
+          try { tree.hideRoot = true; } catch { try { tree.setAttribute('hide-root', ''); } catch {} }
           holder.replaceChildren(tree);
         });
       }
@@ -345,9 +359,15 @@ export class BskyInteractionsModal extends HTMLElement {
         if (!txt) return;
         replyBtn.setAttribute('disabled','disabled');
         try {
+          const subj = this.state.subject || null;
+          const subjUri = String(subj?.uri || this.state.uri || '');
+          const subjCid = String(subj?.cid || this.state.cid || '');
+          const rootUri = String(subj?.record?.reply?.root?.uri || subjUri);
+          const rootCid = String(subj?.record?.reply?.root?.cid || subjCid);
+
           await call('createPost', {
             text: txt,
-            reply: { root:{ uri:this.state.uri, cid:this.state.cid }, parent:{ uri:this.state.uri, cid:this.state.cid } }
+            reply: { root:{ uri: rootUri, cid: rootCid }, parent:{ uri: subjUri, cid: subjCid } }
           });
           if (ta) ta.value = '';
           // refresh

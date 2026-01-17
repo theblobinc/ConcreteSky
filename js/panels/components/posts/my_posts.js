@@ -117,6 +117,65 @@ function renderExternalCard(external) {
 }
 function safeHost(url) { try { return new URL(url).host; } catch { return ''; } }
 
+// Quoted post (app.bsky.embed.record) rendering
+function extractRecordEmbed(embed) {
+  if (!embed) return null;
+  const t = String(embed?.$type || '');
+  if (t.includes('embed.recordWithMedia')) {
+    return { record: embed.record || null, media: embed.media || null };
+  }
+  if (t.includes('embed.record')) {
+    return { record: embed.record || null, media: null };
+  }
+  return null;
+}
+
+function recordViewToPostView(rec) {
+  // Try to normalize the various view shapes into a PostView-ish object.
+  // We only need author + record text + uri/cid for a compact quote.
+  try {
+    const r = rec?.record || rec; // some shapes nest under .record
+    const uri = String(r?.uri || rec?.uri || '');
+    const cid = String(r?.cid || rec?.cid || '');
+    const author = r?.author || rec?.author || {};
+    const value = r?.value || r?.record || rec?.value || {};
+    const createdAt = value?.createdAt || value?.indexedAt || '';
+    const text = String(value?.text || '');
+    if (!uri || !author) return null;
+    return {
+      uri,
+      cid,
+      author,
+      record: { ...value, text, createdAt },
+      indexedAt: createdAt,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function renderQuotePostCard(postView) {
+  if (!postView) return '';
+  const a = postView.author || {};
+  const display = String(a?.displayName || '');
+  const handle = String(a?.handle || '');
+  const who = display && handle ? `${display} (@${handle})` : (display || (handle ? `@${handle}` : ''));
+  const rec = postView.record || {};
+  const text = esc(String(rec?.text || ''));
+  const when = fmtTime(String(rec?.createdAt || postView.indexedAt || ''));
+  const open = atUriToWebPost(postView.uri);
+  return `
+    <div class="quote-card">
+      <div class="q-top">
+        <div class="q-who" title="${esc(who)}">${esc(who)}</div>
+        <div class="q-when">${esc(when)}</div>
+        ${open ? `<a class="open" target="_blank" rel="noopener" href="${esc(open)}" title="Open quoted post">↗</a>` : ''}
+      </div>
+      ${text ? `<div class="q-text">${text}</div>` : ''}
+    </div>
+  `;
+}
+
 // Render images grid
 function renderImagesGrid(images) {
   const items = images.map(i => `
@@ -133,7 +192,6 @@ function renderVideoPoster(video, openUrl) {
   const src = String(video?.playlist || '');
   const poster = String(video?.thumb || '');
   const type = src.endsWith('.m3u8') ? 'application/vnd.apple.mpegurl' : 'video/mp4';
-  const isHls = src.endsWith('.m3u8');
 
   if (src) {
     return `
@@ -141,7 +199,6 @@ function renderVideoPoster(video, openUrl) {
         <video controls playsinline preload="metadata" ${poster ? `poster="${esc(poster)}"` : ''}>
           <source src="${esc(src)}" type="${esc(type)}" />
         </video>
-        ${isHls ? `<div class="hint" style="margin-top:6px;color:#aaa;font-size:0.9rem">HLS video: if it won’t play here, use Open on Bluesky.</div>` : ''}
         ${openUrl ? `<a class="open" href="${esc(openUrl)}" target="_blank" rel="noopener" style="display:inline-block;margin-top:6px">Open on Bluesky</a>` : ''}
       </div>
     `;
@@ -223,14 +280,61 @@ class BskyMyPosts extends HTMLElement {
     this._threadCache = new Map(); // rootUri -> { preview: out|null, full: out|null }
     this._postingRoots = new Set(); // rootUri (prevent double posts)
 
+    // Root post cache: used to show "root post first" for reply entries in the feed.
+    this._postCache = new Map(); // uri -> postView
+
+    // When Content opens and the panel reflows to fewer columns, keep the selected
+    // entry anchored and centered so the user doesn't lose context.
+    this._focusUri = '';
+    this._focusCenterNext = false;
+
     this._likeChangedHandler = null;
     this._repostChangedHandler = null;
     this._replyPostedHandler = null;
+
+    this._panelsResizedHandler = null;
 
     this._refreshRecentHandler = (e) => {
       const mins = Number(e?.detail?.minutes ?? 2);
       this.refreshRecent(mins);
     };
+  }
+
+  async _prefetchReplyRoots(items = []) {
+    try {
+      const roots = new Set();
+      for (const it of (Array.isArray(items) ? items : [])) {
+        try {
+          if (this.itemType(it) !== 'reply') continue;
+          const rec = it?.post?.record || {};
+          const r = rec?.reply || null;
+          const rootUri = String(r?.root?.uri || '');
+          const entryUri = String(it?.post?.uri || '');
+          if (!rootUri || rootUri === entryUri) continue;
+          if (this._postCache.has(rootUri)) continue;
+          roots.add(rootUri);
+        } catch {
+          // ignore
+        }
+      }
+
+      const all = Array.from(roots);
+      if (!all.length) return;
+
+      const CHUNK = 25;
+      for (let i = 0; i < all.length; i += CHUNK) {
+        const chunk = all.slice(i, i + CHUNK);
+        if (!chunk.length) continue;
+        const res = await call('getPosts', { uris: chunk });
+        const posts = Array.isArray(res?.posts) ? res.posts : [];
+        for (const p of posts) {
+          const uri = String(p?.uri || '');
+          if (uri) this._postCache.set(uri, p);
+        }
+      }
+    } catch {
+      // ignore
+    }
   }
 
   _nextScrollRestoreToken(){
@@ -568,6 +672,70 @@ class BskyMyPosts extends HTMLElement {
       };
       window.addEventListener(BSKY_SEARCH_EVENT, this._onSearchChanged);
     }
+
+    // When the app adds/removes/resizes panels, our available width changes.
+    // Rebuild the packed columns so the column count stays correct.
+    if (!this._panelsResizedHandler) {
+      this._panelsResizedHandler = () => {
+        if (!this.isConnected) return;
+        if (String(this.layout || 'pack') !== 'pack') return;
+        this._restoreScrollNext = true;
+        this.render();
+        // After the relayout, re-center on the entry that opened Content.
+        requestAnimationFrame(() => {
+          try { this._maybeCenterOnFocusedEntry(); } catch {}
+        });
+      };
+      window.addEventListener('bsky-panels-resized', this._panelsResizedHandler);
+    }
+  }
+
+  _maybeCenterOnFocusedEntry(){
+    if (!this._focusCenterNext) return;
+    const uri = String(this._focusUri || '');
+    if (!uri) { this._focusCenterNext = false; return; }
+    if (String(this.layout || 'pack') !== 'pack') { this._focusCenterNext = false; return; }
+
+    // Only do the "center" behavior when we are effectively 1 column.
+    const cols = (() => {
+      try {
+        const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+        const scroller = shell?.getScroller?.() || null;
+        const fallbackW = this.getBoundingClientRect?.().width || 0;
+        const w = scroller?.clientWidth || scroller?.getBoundingClientRect?.().width || fallbackW || 0;
+        const pxVar = (el, prop, fallback) => {
+          try {
+            const raw = window.getComputedStyle(el).getPropertyValue(prop);
+            const n = Number.parseFloat(String(raw || ''));
+            return Number.isFinite(n) ? n : fallback;
+          } catch { return fallback; }
+        };
+        const card = pxVar(this, '--bsky-card-min-w', 350);
+        const gap = pxVar(this, '--bsky-card-gap', pxVar(this, '--bsky-grid-gutter', 0));
+        if (!w || w < 2) return 1;
+        const stride = Math.max(1, card + gap);
+        return Math.max(1, Math.floor((w + gap) / stride));
+      } catch { return 1; }
+    })();
+    if (cols !== 1) return;
+
+    try {
+      const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+      const scroller = shell?.getScroller?.() || resolvePanelScroller(this);
+      if (!scroller) return;
+
+      const q = `.entry[data-uri="${this._cssEscape(uri)}"]`;
+      const el = this.shadowRoot.querySelector(q);
+      if (!el) { this._focusCenterNext = false; return; }
+
+      const r0 = scroller.getBoundingClientRect();
+      const r1 = el.getBoundingClientRect();
+      const delta = (r1.top - r0.top);
+      const target = Math.max(0, (scroller.scrollTop + delta) - (scroller.clientHeight / 2) + (r1.height / 2));
+      scroller.scrollTop = target;
+    } finally {
+      this._focusCenterNext = false;
+    }
   }
 
   disconnectedCallback(){
@@ -582,6 +750,10 @@ class BskyMyPosts extends HTMLElement {
     }
     if (this._searchApiTimer) { try { clearTimeout(this._searchApiTimer); } catch {} this._searchApiTimer = null; }
     if (this._layoutRO) { try { this._layoutRO.disconnect(); } catch {} this._layoutRO = null; }
+    if (this._panelsResizedHandler) {
+      try { window.removeEventListener('bsky-panels-resized', this._panelsResizedHandler); } catch {}
+      this._panelsResizedHandler = null;
+    }
     if (this._unbindInfiniteScroll) { try { this._unbindInfiniteScroll(); } catch {} this._unbindInfiniteScroll = null; }
     this._infiniteScrollEl = null;
   }
@@ -1031,32 +1203,22 @@ class BskyMyPosts extends HTMLElement {
       const uri  = cnt.getAttribute('data-uri');
       const cid  = cnt.getAttribute('data-cid') || '';
 
-      // Replies: default to inline preview. Hold Ctrl/Cmd to open Content panel.
-      if (kind === 'replies' && uri) {
-        if (e?.metaKey || e?.ctrlKey) {
-          this.dispatchEvent(new CustomEvent('bsky-open-content', {
-            detail: { uri, cid, spawnAfter: 'posts' },
-            bubbles: true,
-            composed: true,
-          }));
-        } else {
-          const entry = cnt.closest?.('.entry[data-uri]');
-          if (entry) {
-            const rootUri = String(entry.getAttribute('data-uri') || uri || '');
-            const curMode = this._expandedThreadMode.get(rootUri) || null;
-            if (rootUri && this._expandedThreads.has(rootUri) && curMode === 'preview') {
-              await this._toggleInlineThread(entry, { uri: rootUri, cid }, { ensureOpen: false, mode: 'preview' });
-            } else if (rootUri && curMode !== 'full') {
-              await this._toggleInlineThread(entry, { uri: rootUri, cid }, { ensureOpen: true, mode: 'preview' });
-            }
-          }
-        }
-        e.preventDefault();
-        e.stopPropagation();
+      // Integrate counts into the Content panel.
+      // Ctrl/Cmd-click keeps the old behavior (modal/lightbox) for power users.
+      if (e?.metaKey || e?.ctrlKey) {
+        this.openInteractions(kind, uri, cid);
         return;
       }
-
-      this.openInteractions(kind, uri, cid);
+      if (uri) {
+        this._focusUri = String(uri);
+        this._focusCenterNext = true;
+        const view = (kind === 'replies') ? 'replies' : (kind === 'reposts') ? 'reposts' : (kind === 'likes') ? 'likes' : '';
+        this.dispatchEvent(new CustomEvent('bsky-open-content', {
+          detail: { uri, cid, spawnAfter: 'posts', view },
+          bubbles: true,
+          composed: true,
+        }));
+      }
       return;
     }
 
@@ -1067,8 +1229,10 @@ class BskyMyPosts extends HTMLElement {
       const uri = nestedPost.getAttribute('data-uri') || '';
       const cid = nestedPost.getAttribute('data-cid') || '';
       if (!uri) return;
+      this._focusUri = String(uri);
+      this._focusCenterNext = true;
       this.dispatchEvent(new CustomEvent('bsky-open-content', {
-        detail: { uri, cid, spawnAfter: 'posts' },
+        detail: { uri, cid, spawnAfter: 'posts', view: 'replies' },
         bubbles: true,
         composed: true,
       }));
@@ -1082,8 +1246,10 @@ class BskyMyPosts extends HTMLElement {
       const uri = entry.getAttribute('data-uri') || '';
       const cid = entry.getAttribute('data-cid') || '';
       if (!uri) return;
+      this._focusUri = String(uri);
+      this._focusCenterNext = true;
       this.dispatchEvent(new CustomEvent('bsky-open-content', {
-        detail: { uri, cid, spawnAfter: 'posts' },
+        detail: { uri, cid, spawnAfter: 'posts', view: 'replies' },
         bubbles: true,
         composed: true,
       }));
@@ -1101,15 +1267,25 @@ class BskyMyPosts extends HTMLElement {
   }
 
   async _toggleInlineThread(entryEl, root, opts = null) {
-    const rootUri = String(root?.uri || '');
-    const rootCid = String(root?.cid || '');
-    if (!rootUri) return;
+    const entryUri = String(root?.uri || '');
+    const entryCid = String(root?.cid || '');
+    if (!entryUri) return;
+
+    // If this entry is a reply, prefer showing the actual thread root first
+    // (root post, then our reply nested beneath it).
+    const entryPost = this._findCachedPostByUri(entryUri);
+    const entryRec = entryPost?.record || {};
+    const replyInfo = entryRec?.reply || null;
+    const threadUri = String(replyInfo?.root?.uri || entryUri);
+    const isReplyEntry = !!(replyInfo && threadUri && threadUri !== entryUri);
 
     const options = opts || {};
     const ensureOpen = !!options.ensureOpen;
-    const mode = (options.mode === 'preview' || options.mode === 'full') ? options.mode : (this._expandedThreadMode.get(rootUri) || 'full');
-    const shouldOpen = ensureOpen || !this._expandedThreads.has(rootUri);
-    const shouldClose = !ensureOpen && this._expandedThreads.has(rootUri) && (this._expandedThreadMode.get(rootUri) === mode);
+    // For reply entries, default to full thread so the root + our reply is always visible.
+    const defaultMode = isReplyEntry ? 'full' : 'full';
+    const mode = (options.mode === 'preview' || options.mode === 'full') ? options.mode : (this._expandedThreadMode.get(entryUri) || defaultMode);
+    const shouldOpen = ensureOpen || !this._expandedThreads.has(entryUri);
+    const shouldClose = !ensureOpen && this._expandedThreads.has(entryUri) && (this._expandedThreadMode.get(entryUri) === mode);
 
     const toggleBtn = entryEl.querySelector('[data-toggle-thread]');
 
@@ -1123,8 +1299,8 @@ class BskyMyPosts extends HTMLElement {
     }
 
     if (shouldClose) {
-      this._expandedThreads.delete(rootUri);
-      this._expandedThreadMode.delete(rootUri);
+      this._expandedThreads.delete(entryUri);
+      this._expandedThreadMode.delete(entryUri);
       host.hidden = true;
       host.textContent = '';
       if (toggleBtn) toggleBtn.textContent = '+';
@@ -1132,33 +1308,34 @@ class BskyMyPosts extends HTMLElement {
     }
 
     if (!shouldOpen) return;
-    this._expandedThreads.add(rootUri);
-    this._expandedThreadMode.set(rootUri, mode);
+    this._expandedThreads.add(entryUri);
+    this._expandedThreadMode.set(entryUri, mode);
     host.hidden = false;
     if (toggleBtn) toggleBtn.textContent = '−';
 
-    const cache = this._threadCache.get(rootUri) || { preview: null, full: null };
+    const cacheKey = threadUri || entryUri;
+    const cache = this._threadCache.get(cacheKey) || { preview: null, full: null };
     // Canonicalize: always try to fetch/store a full thread so preview can show the true newest replies.
     const cachedOut = cache.full || cache.preview || null;
     if (!cachedOut) {
       host.textContent = (mode === 'preview') ? 'Loading thread preview…' : 'Loading thread…';
       try {
         const out = await call('getPostThread', {
-          uri: rootUri,
+          uri: cacheKey,
           depth: 10,
           parentHeight: 6,
         });
-        const next = this._threadCache.get(rootUri) || { preview: null, full: null };
+        const next = this._threadCache.get(cacheKey) || { preview: null, full: null };
         next.full = out || null;
         next.preview = out || null;
-        this._threadCache.set(rootUri, next);
+        this._threadCache.set(cacheKey, next);
       } catch (err) {
         host.textContent = `Error loading thread: ${String(err?.message || err || '')}`;
         return;
       }
     }
 
-    const outNow = this._threadCache.get(rootUri) || { preview: null, full: null };
+    const outNow = this._threadCache.get(cacheKey) || { preview: null, full: null };
     const threadOut = outNow.full || outNow.preview || null;
     const fullThread = threadOut?.thread || null;
 
@@ -1189,27 +1366,83 @@ class BskyMyPosts extends HTMLElement {
       }
     };
 
-    const makeRecentRepliesPreview = (thread, maxReplies = 5) => {
+    const makeRecentRepliesPreview = (thread, maxReplies = 5, mustIncludeUris = []) => {
       if (!thread || !thread.post) return thread;
-      const nodes = [];
-      collectReplyNodes(thread, nodes);
-      const sorted = nodes
-        .map((n) => ({
-          node: n,
-          iso: pickIso(n?.post),
-          uri: String(n?.post?.uri || ''),
-        }))
+
+      // We want a "newest N replies" preview but still nested beneath their actual parent
+      // (i.e. don't flatten all picked replies as direct children of the root).
+      const withPath = [];
+      const pathByUri = new Map();
+      const collectWithPath = (node, pathUris) => {
+        const replies = Array.isArray(node?.replies) ? node.replies : [];
+        for (const r of replies) {
+          const uri = String(r?.post?.uri || '');
+          const nextPath = uri ? [...pathUris, uri] : [...pathUris];
+          if (r && r.post && uri) {
+            try { pathByUri.set(uri, nextPath); } catch {}
+            withPath.push({
+              node: r,
+              uri,
+              iso: pickIso(r.post),
+              pathUris: nextPath,
+            });
+          }
+          collectWithPath(r, nextPath);
+        }
+      };
+      collectWithPath(thread, []);
+
+      const sorted = withPath
         .filter((x) => x.uri)
         .sort((a, b) => {
           if (a.iso !== b.iso) return (a.iso < b.iso) ? 1 : -1; // desc
           return (a.uri < b.uri) ? -1 : (a.uri > b.uri ? 1 : 0);
         });
 
-      const picked = sorted.slice(0, Math.max(0, Number(maxReplies || 0) || 0));
-      const replies = picked.map((x) => ({ post: x.node.post, replies: [] }));
+      const n = Math.max(0, Number(maxReplies || 0) || 0);
+      const picked = sorted.slice(0, n);
+      const includeUris = new Set();
+      for (const p of picked) {
+        for (const u of (Array.isArray(p.pathUris) ? p.pathUris : [])) includeUris.add(String(u || ''));
+      }
+
+      // Force-include specific replies (e.g. the entry itself when the entry is a reply)
+      // so the user always sees "root post → our reply" even if the reply isn't among newest N.
+      try {
+        for (const u0 of (Array.isArray(mustIncludeUris) ? mustIncludeUris : [])) {
+          const u = String(u0 || '');
+          if (!u) continue;
+          const path = pathByUri.get(u) || null;
+          if (Array.isArray(path)) {
+            for (const x of path) includeUris.add(String(x || ''));
+          } else {
+            includeUris.add(u);
+          }
+        }
+      } catch {}
+
+      const prune = (node, forceInclude = false) => {
+        if (!node || !node.post) return null;
+        const uri = String(node?.post?.uri || '');
+        const replies = Array.isArray(node?.replies) ? node.replies : [];
+        const keptReplies = [];
+        for (const r of replies) {
+          const kept = prune(r, false);
+          if (kept) keptReplies.push(kept);
+        }
+
+        const keepMe = forceInclude || (uri && includeUris.has(uri)) || keptReplies.length > 0;
+        if (!keepMe) return null;
+
+        return {
+          post: node.post,
+          replies: keptReplies,
+        };
+      };
+
+      const pruned = prune(thread, true) || { post: thread.post, replies: [] };
       return {
-        post: thread.post,
-        replies,
+        ...pruned,
         // preserve ancestors if the selected post is itself a reply
         ...(thread.parent ? { parent: thread.parent } : {}),
       };
@@ -1217,7 +1450,7 @@ class BskyMyPosts extends HTMLElement {
 
       const totalReplies = fullThread ? countReplies(fullThread) : 0;
       const PREVIEW_N = Math.max(0, this._cssInt('--bsky-thread-preview-count', 5));
-    const thread = (mode === 'preview') ? makeRecentRepliesPreview(fullThread, PREVIEW_N) : fullThread;
+    const thread = (mode === 'preview') ? makeRecentRepliesPreview(fullThread, PREVIEW_N, isReplyEntry ? [entryUri] : []) : fullThread;
     const showing = (mode === 'preview') ? Math.min(PREVIEW_N, totalReplies) : totalReplies;
 
     const showFull = (mode === 'preview');
@@ -1231,7 +1464,7 @@ class BskyMyPosts extends HTMLElement {
     `;
 
     const tree = host.querySelector('bsky-thread-tree');
-    tree?.setThread?.(thread);
+    tree?.setThread?.(thread, { hideRoot: true });
 
     const composer = host.querySelector('bsky-comment-composer');
     if (options.replyTo) composer?.setReplyTo?.(options.replyTo);
@@ -1243,19 +1476,24 @@ class BskyMyPosts extends HTMLElement {
     // Default reply target: root post.
     if (!options.replyTo && composer?.setReplyTo) {
       const rootPost = thread?.post || null;
-      const uri = String(rootPost?.uri || rootUri);
-      const cid = String(rootPost?.cid || rootCid);
+      const uri = String(rootPost?.uri || threadUri || entryUri);
+      const cid = String(rootPost?.cid || entryCid);
       const author = String(rootPost?.author?.handle || '');
       if (uri && cid) composer.setReplyTo({ uri, cid, author });
     }
   }
 
   async _submitInlineComment(entryEl, detail) {
-    const rootUri = String(entryEl?.getAttribute?.('data-uri') || '');
-    const rootCid = String(entryEl?.getAttribute?.('data-cid') || '');
-    if (!rootUri) return;
+    const entryUri = String(entryEl?.getAttribute?.('data-uri') || '');
+    const entryCid = String(entryEl?.getAttribute?.('data-cid') || '');
+    if (!entryUri) return;
 
-    if (this._postingRoots.has(rootUri)) return;
+    const entryPost = this._findCachedPostByUri(entryUri);
+    const entryRec = entryPost?.record || {};
+    const replyInfo = entryRec?.reply || null;
+    const cacheKey = String(replyInfo?.root?.uri || entryUri);
+
+    if (this._postingRoots.has(entryUri)) return;
     const text = String(detail?.text || '').trim();
     if (!text) return;
 
@@ -1264,19 +1502,19 @@ class BskyMyPosts extends HTMLElement {
     const parentCid = String(replyTo?.cid || '');
     if (!parentUri || !parentCid) return;
 
-    const outNow = this._threadCache.get(rootUri) || { preview: null, full: null };
+    const outNow = this._threadCache.get(cacheKey) || { preview: null, full: null };
     const threadOut = outNow.full || outNow.preview || null;
     const thread = threadOut?.thread || null;
     const rootPost = thread?.post || null;
     const rootRef = {
-      uri: String(rootPost?.uri || rootUri),
-      cid: String(rootPost?.cid || rootCid || parentCid),
+      uri: String(rootPost?.uri || cacheKey || entryUri),
+      cid: String(rootPost?.cid || entryCid || parentCid),
     };
 
     const images = Array.isArray(detail?.media?.images) ? detail.media.images : [];
     const uploaded = [];
 
-    this._postingRoots.add(rootUri);
+    this._postingRoots.add(entryUri);
     try {
       for (const img of images) {
         const mime = String(img?.mime || '');
@@ -1332,14 +1570,14 @@ class BskyMyPosts extends HTMLElement {
 
       // Refresh thread cache and rerender expanded thread.
       try {
-        const outFull = await call('getPostThread', { uri: rootUri, depth: 10, parentHeight: 6 });
-        const next = this._threadCache.get(rootUri) || { preview: null, full: null };
+        const outFull = await call('getPostThread', { uri: cacheKey, depth: 10, parentHeight: 6 });
+        const next = this._threadCache.get(cacheKey) || { preview: null, full: null };
         next.full = outFull || null;
-        this._threadCache.set(rootUri, next);
+        this._threadCache.set(cacheKey, next);
       } catch {}
-      await this._toggleInlineThread(entryEl, { uri: rootUri, cid: rootCid }, { ensureOpen: true, mode: this._expandedThreadMode.get(rootUri) || 'full' });
+      await this._toggleInlineThread(entryEl, { uri: entryUri, cid: entryCid }, { ensureOpen: true, mode: this._expandedThreadMode.get(entryUri) || 'full' });
     } finally {
-      this._postingRoots.delete(rootUri);
+      this._postingRoots.delete(entryUri);
     }
   }
 
@@ -1485,6 +1723,10 @@ class BskyMyPosts extends HTMLElement {
         unique.push(it);
       }
 
+      // Prefetch root posts so reply entries can render "root first" without extra clicks.
+      // Best-effort; failure should not block list rendering.
+      try { await this._prefetchReplyRoots(unique); } catch {}
+
       if (unique.length) {
         const id = this._newBatchId(reset ? 'b' : 'p');
         this._batches = [...(this._batches || []), { id, items: unique }];
@@ -1577,6 +1819,27 @@ class BskyMyPosts extends HTMLElement {
     const p = it.post || {};
     const rec = p.record || {};
     const open = atUriToWebPost(p.uri);
+
+    // 0) quote posts (record / recordWithMedia)
+    const recEmbed = extractRecordEmbed(p.embed);
+    if (recEmbed?.record) {
+      const quoted = recordViewToPostView(recEmbed.record);
+      const quoteHtml = quoted ? renderQuotePostCard(quoted) : '';
+
+      // recordWithMedia: render media below the quote
+      const media = recEmbed.media || null;
+      const imgsM = extractImagesFromEmbed(media);
+      const vidM = extractVideoFromEmbed(media);
+      const extM = extractExternalFromEmbed(media);
+      const mediaHtml = (imgsM && imgsM.length) ? renderImagesGrid(imgsM)
+        : (vidM && (vidM.thumb || vidM.playlist)) ? renderVideoPoster(vidM, open)
+        : extM ? (() => { const ytId = getYouTubeId(extM.uri || ''); return ytId ? renderYouTubeCard(ytId) : renderExternalCard(extM); })()
+        : '';
+
+      return `
+        <div class="quote-embed">${quoteHtml}${mediaHtml ? `<div class="q-media">${mediaHtml}</div>` : ''}</div>
+      `;
+    }
 
     // 1) images
     const imgs = extractImagesFromEmbed(p.embed);
@@ -1777,16 +2040,29 @@ class BskyMyPosts extends HTMLElement {
     };
 
     const groupIntoThreads = (items = []) => {
-      // Thread grouping from partial feed batches is prone to incorrectly nesting
-      // unrelated posts. Render each entry as a summary card and fetch the full
-      // thread on demand when the user expands it.
+      // Group by true thread root when known (reply.root), otherwise by post URI.
+      // This avoids duplicate cards when multiple items in the feed refer to the
+      // same original post (e.g. you replied to a post, and also have another row
+      // tied to that same root).
       const groups = [];
+      const byRoot = new Map();
+
       for (let ord = 0; ord < items.length; ord++) {
         const it = items[ord];
         const uri = String(it?.post?.uri || '');
-        const key = uri || String(ord);
-        groups.push({ key, rootUri: uri, items: [{ it, ord }] });
+        const rec = it?.post?.record || {};
+        const r = rec?.reply || null;
+        const rootUri = String(r?.root?.uri || uri || String(ord));
+        const key = rootUri || String(ord);
+
+        if (!byRoot.has(key)) {
+          const g = { key, rootUri: rootUri || uri, items: [] };
+          byRoot.set(key, g);
+          groups.push(g);
+        }
+        byRoot.get(key).items.push({ it, ord });
       }
+
       return groups;
     };
 
@@ -1794,17 +2070,47 @@ class BskyMyPosts extends HTMLElement {
       const key = String(group?.key || '');
       const anchorKey = `${key}::${String(batchId || '')}`;
       const items = Array.isArray(group?.items) ? group.items : [];
-      const rootObj = items[0] || null;
+      const groupRootUri = String(group?.rootUri || '');
+
+      const kindOf = (it) => { try { return this.itemType(it); } catch { return 'post'; } };
+      const pickRootObj = () => {
+        // Prefer a real "post" item if we have it; fall back to any item whose post.uri is the root.
+        const rootMatches = items.filter((x) => String(x?.it?.post?.uri || '') === groupRootUri);
+        const prefer = rootMatches.find((x) => kindOf(x.it) === 'post')
+          || rootMatches.find((x) => kindOf(x.it) !== 'repost')
+          || rootMatches[0]
+          || items[0]
+          || null;
+        return prefer;
+      };
+
+      const rootObj = pickRootObj();
       const rootIt = rootObj?.it || null;
       const rootOrd = rootObj?.ord || 0;
-      const rootUri = String(rootIt?.post?.uri || group?.rootUri || '');
-      const rootCid = String(rootIt?.post?.cid || '');
+
+      const rootPostView = (groupRootUri && this._postCache.has(groupRootUri)) ? (this._postCache.get(groupRootUri) || null) : null;
+      const rootUri = groupRootUri || String(rootIt?.post?.uri || '');
+      const rootCid = String(rootPostView?.cid || rootIt?.post?.cid || '');
+
+      const repliesInGroup = items
+        .map((x) => ({ it: x?.it || null, ord: x?.ord || 0 }))
+        .filter((x) => x.it && kindOf(x.it) === 'reply' && String(x.it?.post?.uri || '') !== rootUri);
+
+      const entryIsThread = (repliesInGroup.length > 0)
+        || ((typeof rootIt?.post?.replyCount === 'number') && rootIt.post.replyCount > 0);
+      const entryClass = entryIsThread ? 'entry is-thread' : 'entry';
+
+      const rootPseudoItem = rootPostView ? ({ post: rootPostView }) : null;
 
       return {
         key,
         html: `
-          <article class="entry" data-k="${esc(anchorKey)}" data-uri="${esc(rootUri)}" data-cid="${esc(rootCid)}">
-            ${rootIt ? renderPostBlock(rootIt, rootOrd, 0, chron) : ''}
+          <article class="${entryClass}" data-k="${esc(anchorKey)}" data-uri="${esc(rootUri)}" data-cid="${esc(rootCid)}">
+            ${rootPseudoItem
+              ? renderPostBlock(rootPseudoItem, rootOrd, 0, chron)
+              : (rootIt ? renderPostBlock(rootIt, rootOrd, 0, chron) : '')}
+
+            ${repliesInGroup.map(({ it, ord }) => renderPostBlock(it, ord, 1, null)).join('')}
             <div class="inline-thread" data-inline-thread hidden></div>
           </article>
         `
@@ -1965,6 +2271,7 @@ class BskyMyPosts extends HTMLElement {
         .entries.pack .entry{width:100%;max-width:100%;min-width:0;margin:0;}
 
         .entry{border:2px solid #333; border-radius:0; padding:5px; margin:0; background:#0b0b0b; width:100%; max-width:100%}
+        .entry.is-thread{border:2px dotted rgba(255,255,255,0.9); padding-top:7px; padding-bottom:7px}
 
         /* Inline thread expansion */
         .inline-thread{margin-top:10px; padding:10px; border-top:1px solid #222}
@@ -1994,9 +2301,18 @@ class BskyMyPosts extends HTMLElement {
         .ext-card .host{color:#8aa;font-size:.85rem;margin-top:auto}
 
         /* Images grid */
-        .images-grid{display:grid;grid-template-columns:repeat(auto-fit, minmax(180px, 1fr));gap:0;width:100%}
+        .images-grid{display:grid;grid-template-columns:1fr;gap:0;width:100%}
         .img-wrap{margin:0;padding:0;background:#111;border-radius:0;overflow:hidden}
         .img-wrap img{display:block;width:100%;height:100%;object-fit:cover}
+
+        /* Quote posts */
+        .quote-embed{display:grid;gap:8px}
+        .quote-card{border:1px solid #222;background:#0a0a0a;padding:8px}
+        .q-top{display:flex;gap:10px;align-items:center;color:#bbb;font-size:.9rem;margin-bottom:6px}
+        .q-who{font-weight:700;color:#eaeaea;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .q-when{margin-left:auto;white-space:nowrap}
+        .q-text{white-space:pre-wrap;line-height:1.3;color:#ddd}
+        .q-media{margin-top:2px}
 
         /* YouTube preview */
         .ext-card.yt{cursor:pointer}
@@ -2040,7 +2356,7 @@ class BskyMyPosts extends HTMLElement {
         .ext-card .thumb{background:#111;overflow:hidden}
         .ext-card.link .thumb{width:72px;height:72px;flex:0 0 auto;display:flex;align-items:center;justify-content:center}
         .ext-card.link .thumb-img{width:72px;height:72px}
-        .images-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;margin-top:6px}
+        .images-grid{display:grid;grid-template-columns:1fr;gap:6px;margin-top:6px}
         .img-wrap{background:#111;overflow:hidden}
         .img-wrap bsky-lazy-img{width:100%}
       </style>
@@ -2181,12 +2497,14 @@ class BskyMyPosts extends HTMLElement {
               // Only update existing batch HTML when we can't safely reuse (e.g. search active).
               if (rebuildAll || !allowReuse) {
                 entriesHost.innerHTML = b.entriesHtml;
-                buildPackedColumns(entriesHost);
               } else if (!sec.dataset.bskyRendered) {
                 // First time created.
                 entriesHost.innerHTML = b.entriesHtml;
-                buildPackedColumns(entriesHost);
               }
+
+              // Always (re)build packed columns so column count tracks panel width changes.
+              // This is safe because it preserves source order and only rewraps existing `.entry` nodes.
+              buildPackedColumns(entriesHost);
             }
             sec.dataset.bskyRendered = '1';
           }
