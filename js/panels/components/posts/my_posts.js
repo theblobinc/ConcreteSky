@@ -146,12 +146,14 @@ class BskyMyPosts extends HTMLElement {
     super();
     this.attachShadow({mode:'open'});
     this._batches = []; // [{ id, items: [] }]
+    // Layout modes:
+    // - 'pack': CSS multi-column layout to minimize vertical whitespace.
+    // - 'grid': CSS grid layout (more chronological row feel, more whitespace).
+    this.layout = 'pack';
     this.loading = false;
     this.error = null;
     this.cursor = null;
     this.filters = { from: '', to: '', types: new Set(TYPES) };
-    // Single layout mode: MagicGrid.
-    this.view = 'magic';
 
     this._batchSeq = 0;
     this._layoutRO = null;
@@ -173,9 +175,8 @@ class BskyMyPosts extends HTMLElement {
     // Used to ignore stale delayed restore attempts (e.g. multiple rapid load-more renders).
     this._scrollRestoreToken = 0;
 
-    // Incremental batch rendering + per-batch magic grid.
+    // Incremental batch rendering (keep existing batch DOM stable).
     this._renderedBatchOrder = [];
-    this._magicGrid = null;
     this._autoFillPending = true;
     this._autoFillTries = 0;
 
@@ -525,260 +526,6 @@ class BskyMyPosts extends HTMLElement {
     }
   }
 
-  _computeColumns(){
-    try {
-      const shell = this.shadowRoot.querySelector('bsky-panel-shell');
-      const scroller = shell?.getScroller?.() || null;
-
-      const UNIT = this._cssPx('--bsky-grid-unit', 0);
-      const panelSpanRaw = this._cssPx('--bsky-panel-span', 0);
-      const panelSpan = Math.max(0, Math.round(panelSpanRaw || 0));
-      const GAP = this._cssPx('--bsky-grid-gutter', this._cssPx('--bsky-card-gap', 0));
-
-      const MIN_SPAN = 2;
-      const MIN = (UNIT && UNIT > 0)
-        ? Math.max(1, Math.floor((UNIT * MIN_SPAN) + GAP))
-        : this._cssPx('--bsky-card-min-w', 350);
-
-      const fallback = this.getBoundingClientRect?.().width || 0;
-      const available = scroller?.clientWidth || scroller?.getBoundingClientRect?.().width || fallback || 0;
-      if (!available || available < 2) return { cols: 1, cardW: Math.max(1, Math.floor(available || MIN)), gap: GAP };
-
-      const colsBySpan = (panelSpan >= MIN_SPAN) ? Math.max(1, Math.floor(panelSpan / MIN_SPAN)) : 0;
-      const colsByMin = Math.max(1, Math.floor((available + GAP) / (MIN + GAP)));
-      const cols = colsBySpan ? Math.min(colsBySpan, colsByMin) : colsByMin;
-      const cardW = Math.max(1, Math.floor((available - ((cols - 1) * GAP)) / cols));
-
-      return { cols: Math.max(1, cols), cardW, gap: GAP };
-    } catch {
-      return { cols: 1, cardW: this._cssPx('--bsky-card-min-w', 350), gap: this._cssPx('--bsky-grid-gutter', 0) };
-    }
-  }
-
-  ensureMagicGrid(){
-    if (this.view !== 'magic') {
-      if (this._layoutRO) { try { this._layoutRO.disconnect(); } catch {} this._layoutRO = null; }
-      if (this._magicGrid) {
-        try { this._magicGrid.teardown?.(); } catch {}
-        this._magicGrid = null;
-      }
-      return;
-    }
-
-    const shell = this.shadowRoot.querySelector('bsky-panel-shell');
-    const scroller = shell?.getScroller?.() || null;
-    if (!scroller) return;
-
-    const getHosts = () => Array.from(this.shadowRoot.querySelectorAll('.entries.magic[data-batch]'));
-    const anyHosts = getHosts();
-    if (!anyHosts.length) return;
-
-    // Initialize the magic-grid manager once and keep it alive across renders.
-    if (!this._magicGrid || this._magicGrid.scroller !== scroller) {
-      try { this._magicGrid?.teardown?.(); } catch {}
-
-      const state = {
-        scroller,
-        queued: false,
-        timer: null,
-        applyToken: 0,
-        ro: null,
-        teardown: () => {
-          try { if (state.timer) clearTimeout(state.timer); } catch {}
-          state.timer = null;
-          try { state.ro?.disconnect?.(); } catch {}
-          state.ro = null;
-        },
-        markAllDirty: () => {
-          for (const host of getHosts()) {
-            try { host.dataset.bskyDirty = '1'; } catch {}
-          }
-        },
-      };
-
-      const rebalanceDirtyHosts = () => {
-        const hosts = getHosts();
-        if (!hosts.length) return false;
-
-        const { cols, cardW, gap } = this._computeColumns();
-        this.style.setProperty('--bsky-card-w', `${cardW}px`);
-        this.style.setProperty('--bsky-grid-gutter', `${gap}px`);
-
-        let didWork = false;
-        for (const host of hosts) {
-          try {
-            if (String(host?.dataset?.bskyDirty || '') !== '1') continue;
-
-            const entries = Array.from(host.querySelectorAll(':scope > .entry, :scope > .cols > .col > .entry'));
-            if (!entries.length) {
-              host.dataset.bskyDirty = '0';
-              continue;
-            }
-            didWork = true;
-
-            if (cols <= 1) {
-              host.innerHTML = '';
-              for (const el of entries) host.appendChild(el);
-              host.dataset.bskyDirty = '0';
-              continue;
-            }
-
-            const ordFor = (el, fallback) => {
-              const raw = el?.getAttribute?.('data-ord');
-              const n = Number.parseInt(String(raw || ''), 10);
-              return Number.isFinite(n) ? n : fallback;
-            };
-            const ordered = entries.slice().sort((a, b) => ordFor(a, 0) - ordFor(b, 0));
-
-            let colsWrap = host.querySelector(':scope > .cols');
-            if (!colsWrap) {
-              colsWrap = document.createElement('div');
-              colsWrap.className = 'cols';
-              host.innerHTML = '';
-              host.appendChild(colsWrap);
-            }
-
-            const colEls = Array.from(colsWrap.querySelectorAll(':scope > .col'));
-            while (colEls.length < cols) {
-              const c = document.createElement('div');
-              c.className = 'col';
-              colsWrap.appendChild(c);
-              colEls.push(c);
-            }
-            while (colEls.length > cols) {
-              const last = colEls.pop();
-              if (last) {
-                const first = colEls[0];
-                if (first) {
-                  while (last.firstChild) first.appendChild(last.firstChild);
-                }
-                try { last.remove(); } catch { try { colsWrap.removeChild(last); } catch {} }
-              }
-            }
-
-            const entryHeights = ordered.map((el) => {
-              try { return Math.max(0, el.getBoundingClientRect().height || 0); } catch { return 0; }
-            });
-
-            const colHeights = new Array(colEls.length).fill(0);
-            for (const c of colEls) c.textContent = '';
-
-            for (let i = 0; i < ordered.length; i++) {
-              const el = ordered[i];
-              const h = entryHeights[i] || 0;
-
-              let bestIdx = 0;
-              let bestH = colHeights[0] ?? 0;
-              for (let c = 1; c < colHeights.length; c++) {
-                const ch = colHeights[c] ?? 0;
-                if (ch < bestH) { bestH = ch; bestIdx = c; }
-              }
-
-              colEls[bestIdx].appendChild(el);
-              colHeights[bestIdx] = (colHeights[bestIdx] ?? 0) + h;
-            }
-
-            const imgs = Array.from(host.querySelectorAll('img'));
-            for (const img of imgs) {
-              try {
-                if (img.dataset?.bskyRebalanceBound === '1') continue;
-                if (img.complete) continue;
-                img.dataset.bskyRebalanceBound = '1';
-                img.addEventListener('load', () => state.queueRebalance(), { once: true });
-                img.addEventListener('error', () => state.queueRebalance(), { once: true });
-              } catch {
-                // ignore
-              }
-            }
-
-            host.dataset.bskyDirty = '0';
-          } catch {
-            // ignore
-          }
-        }
-
-        return didWork;
-      };
-
-      state.queueRebalance = () => {
-        try {
-          if (state.timer) return;
-          state.timer = setTimeout(() => {
-            state.timer = null;
-            if (state.queued) return;
-            state.queued = true;
-            const token = ++state.applyToken;
-            requestAnimationFrame(() => {
-              state.queued = false;
-              // Only do work if there are dirty hosts.
-              const anyDirty = getHosts().some((h) => String(h?.dataset?.bskyDirty || '') === '1');
-              if (!anyDirty) return;
-
-              const anchor = captureScrollAnchor({
-                scroller: state.scroller,
-                root: this.shadowRoot,
-                itemSelector: '.entry[data-k]',
-                keyAttr: 'data-k',
-              });
-
-              const didWork = rebalanceDirtyHosts();
-              if (!didWork) return;
-
-              requestAnimationFrame(() => {
-                if (token !== state.applyToken) return;
-                const r = this.shadowRoot;
-                applyScrollAnchor({ scroller: state.scroller, root: r, anchor, keyAttr: 'data-k' });
-              });
-              setTimeout(() => {
-                try {
-                  if (token !== state.applyToken) return;
-                  const r = this.shadowRoot;
-                  applyScrollAnchor({ scroller: state.scroller, root: r, anchor, keyAttr: 'data-k' });
-                } catch {
-                  // ignore
-                }
-              }, 160);
-            });
-          }, 60);
-        } catch {
-          // ignore
-        }
-      };
-
-      // Observe width changes: mark all batches dirty and rebalance.
-      try {
-        let t = null;
-        state.ro = new ResizeObserver(() => {
-          if (t) clearTimeout(t);
-          t = setTimeout(() => {
-            t = null;
-            state.markAllDirty();
-            state.queueRebalance();
-          }, 60);
-        });
-        state.ro.observe(scroller);
-        state.ro.observe(this);
-      } catch {
-        state.ro = null;
-      }
-
-      this._magicGrid = state;
-    }
-
-    // Ensure we lay out columns on initial mount, even if the scroller width
-    // hasn't fully settled yet (some browsers only emit ResizeObserver after a resize).
-    try { this._magicGrid?.markAllDirty?.(); } catch {}
-
-    // If any new/updated batches were marked dirty, rebalance them.
-    this._magicGrid?.queueRebalance?.();
-    requestAnimationFrame(() => this._magicGrid?.queueRebalance?.());
-    // One more delayed pass to catch late layout/font loading.
-    setTimeout(() => {
-      try { this._magicGrid?.markAllDirty?.(); } catch {}
-      try { this._magicGrid?.queueRebalance?.(); } catch {}
-    }, 240);
-  }
-
   async refreshRecent(minutes=2){
     if (this.loading) return;
     const mins = Math.max(1, Number(minutes || 2));
@@ -832,19 +579,18 @@ class BskyMyPosts extends HTMLElement {
   }
 
   onChange(e){
+    if (e.target?.id === 'layout') {
+      const v = String(e.target.value || '').toLowerCase();
+      this.layout = (v === 'grid') ? 'grid' : 'pack';
+      this.render();
+      return;
+    }
     const t = e.target?.getAttribute?.('data-type');
     if (t) {
       if (e.target.checked) this.filters.types.add(t);
       else this.filters.types.delete(t);
       // Reload so limit/offset apply to the selected types.
       this.load(true);
-    }
-
-    if (e.target.id === 'view') {
-      // Collapse legacy view selections into MagicGrid only.
-      this.view = 'magic';
-      this.render();
-      return;
     }
   }
 
@@ -1248,11 +994,17 @@ class BskyMyPosts extends HTMLElement {
       ? `${fromDate || '…'} → ${toDate || '…'}`
       : 'All time';
 
+    const layout = (String(this.layout || 'pack') === 'grid') ? 'grid' : 'pack';
+
     const filters = `
       <div class="filters">
         <button id="open-range" title="Select date range" aria-label="Select date range">📅</button>
         <span class="range-label" title="Current date range">${rangeLabel}</span>
         <button id="clear-range" ${(!this.filters.from && !this.filters.to) ? 'disabled' : ''}>Clear</button>
+        <select id="layout" title="Layout">
+          <option value="pack" ${layout==='pack'?'selected':''}>Packed</option>
+          <option value="grid" ${layout==='grid'?'selected':''}>Grid</option>
+        </select>
         <div class="types">
           ${TYPES.map((t) => `
             <label><input type="checkbox" data-type="${t}" ${this.filters.types.has(t) ? 'checked' : ''}> ${t}</label>
@@ -1341,7 +1093,7 @@ class BskyMyPosts extends HTMLElement {
       }
     };
 
-    const renderPostBlock = (it, ord = 0, depth = 0) => {
+    const renderPostBlock = (it, ord = 0, depth = 0, chron = null) => {
       const p = it.post || {};
       const rec = p.record || {};
       const text = esc(rec.text || '');
@@ -1359,6 +1111,7 @@ class BskyMyPosts extends HTMLElement {
       return `
         <div class="post" style="--depth:${esc(depth)}" data-ord="${esc(ord)}" data-uri="${esc(uri)}" data-cid="${esc(cid)}">
           <header class="meta">
+            ${chron ? `<span class="chron">#${esc(chron)}</span>` : ''}
             <span class="kind">${esc(kind)}</span>
             <span class="time">${esc(when)}</span>
             ${open ? `<a class="open" target="_blank" rel="noopener" href="${esc(open)}">Open</a>` : ''}
@@ -1394,7 +1147,7 @@ class BskyMyPosts extends HTMLElement {
       return groups;
     };
 
-    const renderThreadEntry = (group, batchId) => {
+    const renderThreadEntry = (group, batchId, chron = null) => {
       const key = String(group?.key || '');
       // Anchor key must be unique across the entire rendered DOM.
       // A thread root URI can legitimately appear across multiple pages/batches (replies
@@ -1454,7 +1207,7 @@ class BskyMyPosts extends HTMLElement {
         key,
         html: `
           <article class="entry thread" data-k="${esc(anchorKey)}" data-uri="${esc(rootUri)}" data-cid="${esc(rootCid)}">
-            ${rootIt ? renderPostBlock(rootIt, rootOrd, 0) : ''}
+            ${rootIt ? renderPostBlock(rootIt, rootOrd, 0, chron) : ''}
             ${childrenHtml}
           </article>
         `
@@ -1469,6 +1222,98 @@ class BskyMyPosts extends HTMLElement {
       return `<div class="search-status">Search: <b>${esc(searchQ)}</b> · Source: ${esc(src)}${loading}${err}</div>`;
     })();
 
+    const pxVar = (el, prop, fallback) => {
+      try {
+        const raw = window.getComputedStyle(el).getPropertyValue(prop);
+        const n = Number.parseFloat(String(raw || ''));
+        return Number.isFinite(n) ? n : fallback;
+      } catch {
+        return fallback;
+      }
+    };
+
+    const computePackCols = () => {
+      try {
+        const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+        const scroller = shell?.getScroller?.() || null;
+        const fallbackW = this.getBoundingClientRect?.().width || 0;
+        const w = scroller?.clientWidth || scroller?.getBoundingClientRect?.().width || fallbackW || 0;
+        const card = pxVar(this, '--bsky-card-min-w', 350);
+        const gap = pxVar(this, '--bsky-card-gap', pxVar(this, '--bsky-grid-gutter', 0));
+        if (!w || w < 2) return 1;
+        const stride = Math.max(1, card + gap);
+        const cols = Math.max(1, Math.floor((w + gap) / stride));
+        return Math.min(8, cols);
+      } catch {
+        return 1;
+      }
+    };
+
+    const packCols = (layout === 'pack') ? computePackCols() : 1;
+
+    const buildPackedColumns = (entriesHost) => {
+      if (!entriesHost) return;
+      if (layout !== 'pack') return;
+
+      const cols = Math.max(1, Number(packCols || 1));
+
+      // Flatten entries from either direct children or an existing .cols wrapper.
+      const entries = Array.from(entriesHost.querySelectorAll(':scope > .entry, :scope > .cols .entry'));
+      if (!entries.length) {
+        // Ensure no stale column wrapper sticks around.
+        const w = entriesHost.querySelector(':scope > .cols');
+        if (w) {
+          try { w.remove(); } catch { try { entriesHost.removeChild(w); } catch {} }
+        }
+        return;
+      }
+
+      entriesHost.textContent = '';
+      const colsWrap = document.createElement('div');
+      colsWrap.className = 'cols';
+      colsWrap.setAttribute('data-cols', String(cols));
+
+      const colEls = [];
+      for (let i = 0; i < cols; i++) {
+        const c = document.createElement('div');
+        c.className = 'col';
+        colsWrap.appendChild(c);
+        colEls.push(c);
+      }
+
+      entriesHost.appendChild(colsWrap);
+
+      const heights = new Array(cols).fill(0);
+      let tieRot = 0;
+      const pickCol = () => {
+        let min = heights[0] ?? 0;
+        for (let i = 1; i < heights.length; i++) {
+          const h = heights[i] ?? 0;
+          if (h < min) min = h;
+        }
+        const candidates = [];
+        for (let i = 0; i < heights.length; i++) {
+          if ((heights[i] ?? 0) <= min + 1) candidates.push(i);
+        }
+        if (!candidates.length) return 0;
+        const idx = candidates[tieRot % candidates.length];
+        tieRot++;
+        return idx;
+      };
+
+      for (const el of entries) {
+        const idx = pickCol();
+        colEls[idx].appendChild(el);
+        // Update measured column height (includes all children).
+        try {
+          heights[idx] = colEls[idx].offsetHeight || colEls[idx].getBoundingClientRect().height || heights[idx];
+        } catch {
+          // leave as-is
+        }
+      }
+    };
+
+    let chron = 0;
     const batchRenders = batchViews.map((b) => {
       const groupsAll = groupIntoThreads(b.items || []);
       const groups = searchActive
@@ -1482,8 +1327,9 @@ class BskyMyPosts extends HTMLElement {
           })
         : groupsAll;
 
-      const cards = groups.map((g) => renderThreadEntry(g, b.id));
+      const cards = groups.map((g) => renderThreadEntry(g, b.id, ++chron));
       const entriesHtml = cards.map((c) => c.html).join('');
+
       return { id: String(b.id || ''), entriesHtml };
     });
 
@@ -1508,11 +1354,18 @@ class BskyMyPosts extends HTMLElement {
 
         .search-status{margin:8px 0;color:#bbb;font-size:.9rem}
 
-        /* Balanced-columns layout: each batch becomes N columns, entries placed by measured height. */
-        .entries.magic{display:block;max-width:100%;min-height:0}
-        .entries.magic .cols{display:flex;gap:var(--bsky-grid-gutter, 0px);align-items:flex-start;justify-content:flex-start;width:100%}
-        .entries.magic .col{flex:0 0 auto;width:min(100%, var(--bsky-card-w, 350px));display:flex;flex-direction:column;gap:0;min-width:0}
-        .entries.magic .entry{width:100%;max-width:100%;min-width:0;margin:0;}
+        /* Layout modes (pure CSS; no JS masonry/reparenting).
+           - grid: CSS grid (source order).
+           - pack: fixed columns filled left→right in source order so the top row is newest.
+         */
+        .entries{max-width:100%;min-height:0}
+        .entries.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--bsky-card-min-w, 350px),1fr));gap:var(--bsky-card-gap, var(--bsky-grid-gutter, 0px));align-items:start}
+        .entries.grid .entry{width:100%;max-width:100%;min-width:0;margin:0;}
+
+        .entries.pack{display:block}
+        .entries.pack .cols{display:flex;gap:var(--bsky-card-gap, var(--bsky-grid-gutter, 0px));align-items:flex-start;width:100%;max-width:100%}
+        .entries.pack .col{flex:1 1 0;min-width:0;display:flex;flex-direction:column;gap:var(--bsky-card-gap, var(--bsky-grid-gutter, 0px))}
+        .entries.pack .entry{width:100%;max-width:100%;min-width:0;margin:0;}
 
         .entry{border:2px solid #333; border-radius:0; padding:5px; margin:0; background:#0b0b0b; width:100%; max-width:100%}
 
@@ -1524,6 +1377,7 @@ class BskyMyPosts extends HTMLElement {
         .thread-node .post{border:1px solid #222; background:#0a0a0a; padding:6px}
         .thread-node .thread-children{margin-top:6px}
         .meta{display:flex; align-items:center; gap:10px; color:#bbb; font-size:.9rem; margin-bottom:6px}
+        .meta .chron{background:#111;border:1px solid #444;border-radius:0;padding:1px 8px;color:#ddd}
         .meta .kind{background:#111;border:1px solid #444;border-radius:0;padding:1px 8px}
         .meta .time{margin-left:auto}
         .open{color:#9cd3ff}
@@ -1654,7 +1508,9 @@ class BskyMyPosts extends HTMLElement {
 
         // Decide whether we can append-only (no teardown) or we must rebuild.
         const desiredIds = batchRenders.map((b) => b.id);
-        const allowReuse = !searchActive; // search filters may change visible cards in every batch
+        const layoutChanged = (String(this._lastLayout || '') !== String(layout));
+        this._lastLayout = layout;
+        const allowReuse = !searchActive && !layoutChanged; // search/layout changes may change visible cards in every batch
         const prev = Array.isArray(this._renderedBatchOrder) ? this._renderedBatchOrder : [];
 
         const isAppendOnly = (() => {
@@ -1708,22 +1564,28 @@ class BskyMyPosts extends HTMLElement {
               sec.className = 'batch';
               sec.setAttribute('data-batch', bid);
               sec.innerHTML = `
-                <div class="entries magic" data-batch="${esc(bid)}" role="region" aria-label="Posts batch"></div>
+                <div class="entries" data-batch="${esc(bid)}" role="region" aria-label="Posts batch"></div>
               `;
               batchesEl.appendChild(sec);
               byId.set(bid, sec);
             }
 
-            const entriesHost = sec.querySelector(':scope > .entries.magic[data-batch]') || null;
+            const entriesHost = sec.querySelector(':scope > .entries[data-batch]') || null;
             if (entriesHost) {
+              // Always apply the current layout class (even for append-only renders).
+              try {
+                entriesHost.classList.toggle('grid', layout === 'grid');
+                entriesHost.classList.toggle('pack', layout !== 'grid');
+              } catch {}
+
               // Only update existing batch HTML when we can't safely reuse (e.g. search active).
               if (rebuildAll || !allowReuse) {
                 entriesHost.innerHTML = b.entriesHtml;
-                entriesHost.dataset.bskyDirty = '1';
+                buildPackedColumns(entriesHost);
               } else if (!sec.dataset.bskyRendered) {
                 // First time created.
                 entriesHost.innerHTML = b.entriesHtml;
-                entriesHost.dataset.bskyDirty = '1';
+                buildPackedColumns(entriesHost);
               }
             }
             sec.dataset.bskyRendered = '1';
@@ -1835,9 +1697,6 @@ class BskyMyPosts extends HTMLElement {
     if (this._autoFillPending) {
       queueMicrotask(() => this._kickAutoFillViewport());
     }
-
-    this.view = 'magic';
-    queueMicrotask(() => this.ensureMagicGrid());
 
   }
 }

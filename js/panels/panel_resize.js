@@ -42,7 +42,7 @@ export function enablePanelResize(root) {
 
   const getCardWidth = () => {
     // Panels snap based on the *minimum* card width.
-    // Actual card widths inside MagicGrid may expand to fill available space.
+    // Actual rendered card widths may expand to fill available space.
     return cssPx(panelsWrap || document.documentElement, '--bsky-card-min-w', 350);
   };
 
@@ -323,7 +323,7 @@ export function enablePanelResize(root) {
       } catch {}
     }
 
-    // Notify listeners (masonry/magic-grid panels) that panel widths/spans may have changed.
+    // Notify listeners that panel widths/spans may have changed.
     notifyPanelsResized();
   };
 

@@ -90,29 +90,23 @@ Helper files:
 - `packages/concretesky/_private/mcp/auto-login-snippet.js`
 - `packages/concretesky/_private/mcp/auto-login-playwright.mjs`
 
-## Test 8 — Multi-panel MagicGrid fit (Posts + Connections)
+## Test 8 — Multi-panel grid fit (Posts + Connections)
 
-Goal: verify Posts + Connections can be shown together and their card entries still fit cleanly in MagicGrid (no clipping/overflow, proper column offsets).
+Goal: verify Posts + Connections can be shown together and their card entries still fit cleanly (no clipping/overflow).
 
 High-level steps:
 
 1. Complete Test 7 (session cookies set).
 2. Navigate to `https://www.theblobinc.com/concretesky#tabs=posts,connections`.
-3. Run the in-page snippet in:
-   - `packages/concretesky/_private/mcp/panels-magicgrid-snippet.js`
-   and call:
-   - `await window.__bskyTestPanelsMagicGrid()`
+3. Scroll both panels a bit; trigger a load-more (infinite scroll) in Posts.
 
 Expected:
 
-- Result `ok: true`.
-- In the `posts,connections` run:
-  - `visiblePanels` contains both `posts` and `connections`.
-  - Each visible panel reports `badLeft: 0` and `overflowPx <= ~1`.
+- No horizontal overflow/clipping within the Posts or Connections lists.
+- Cards reflow naturally as panel widths change (no JS-driven masonry repositioning).
 
 Notes:
 
-- This test dispatches a `resize` event before measuring so auto-fit + MagicGrid have a chance to reflow.
 - If you previously dragged panel resize handles, you can click the UI button `Reset layout` before re-testing.
 
 ## Test 9 — CSRF still required for browser callers without JWT

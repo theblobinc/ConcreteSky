@@ -21,7 +21,7 @@ function initTabs(root) {
       p.style.flex = '';
       p.style.flexBasis = '';
     }
-    // Nudge layouts (MagicGrid uses ResizeObserver and will reflow).
+    // Nudge layouts so components can reflow.
     requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
   };
 

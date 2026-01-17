@@ -195,4 +195,4 @@ See `CONTRIBUTING.md`.
 ## License
 
 - Project: MIT (see `LICENSE`).
-- Third-party licenses: see `THIRD_PARTY_NOTICES.md` (includes MagicGrid).
+- Third-party licenses: see `THIRD_PARTY_NOTICES.md`.

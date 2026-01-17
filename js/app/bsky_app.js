@@ -457,7 +457,7 @@ class BskyApp extends HTMLElement {
 
   async initGate() {
     // Debug escape hatch: allow loading the UI without auth so we can validate
-    // layout/MagicGrid sizing in a clean browser context.
+    // layout sizing in a clean browser context.
     try {
       const u = new URL(window.location.href);
       const force = (u.searchParams.get('bsky_force') === '1') || (window.BSKY?.debug?.forceUI === true);
@@ -532,7 +532,7 @@ class BskyApp extends HTMLElement {
         :host, *, *::before, *::after{box-sizing:border-box}
         :host{display:block;background:#000;color:#fff}
 
-        /* Card sizing: shared by panel resize logic + MagicGrid components */
+        /* Card sizing: shared by panel resize logic + card components */
         :host{
           /* Bootstrap-ish grid primitives */
           --bsky-grid-cols: 12;
@@ -552,7 +552,7 @@ class BskyApp extends HTMLElement {
            );
           /* Components override this per-panel to the computed column width. */
            --bsky-card-w: var(--bsky-card-min-w);
-          /* Align MagicGrid + panel gutters to the standardized gutter. */
+          /* Align card + panel gutters to the standardized gutter. */
           --bsky-card-gap: var(--bsky-grid-gutter);
           --bsky-panels-gap: var(--bsky-grid-gutter);
 

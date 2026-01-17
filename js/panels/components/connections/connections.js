@@ -2,7 +2,7 @@ import { call } from '../../../api.js';
 import { getAuthStatusCached, isNotConnectedError } from '../../../auth_state.js';
 import { identityCss, identityHtml, bindCopyClicks, toProfileUrl } from '../../../lib/identity.js';
 import { queueProfiles } from '../../../profile_hydrator.js';
-import { bindInfiniteScroll, captureScrollAnchor, applyScrollAnchor, createStableWorkQueue } from '../../panel_api.js';
+import { bindInfiniteScroll, captureScrollAnchor, applyScrollAnchor } from '../../panel_api.js';
 import { BSKY_SEARCH_EVENT } from '../../../search/search_bus.js';
 import { SEARCH_TARGETS } from '../../../search/constants.js';
 import { compileSearchMatcher } from '../../../search/query.js';
@@ -36,8 +36,6 @@ class BskyConnections extends HTMLElement {
     this.limit = 100;
     this.hasMore = false;
 
-    // Single layout mode: MagicGrid.
-    this.view = 'magic';
     this.filters = {
       q: '',
       sort: 'followers',
@@ -52,10 +50,6 @@ class BskyConnections extends HTMLElement {
     this._restoreScrollNext = false;
     this._scrollAnchor = null;
     this._scrollTop = 0;
-    this._magicRO = null;
-
-    this._queueMasonryRebalance = null;
-    this._onPanelsResized = null;
 
 
     this._qTimer = null;
@@ -214,15 +208,6 @@ class BskyConnections extends HTMLElement {
     this.shadowRoot.addEventListener('input', (e) => this.onInput(e));
     this.shadowRoot.addEventListener('change', (e) => this.onChange(e));
 
-    // When panels are added/removed, the panel_resize subsystem re-allocates widths.
-    // Trigger a masonry reflow for this panel even if ResizeObserver misses the first change.
-    if (!this._onPanelsResized) {
-      this._onPanelsResized = () => {
-        try { this._queueMasonryRebalance?.(); } catch {}
-      };
-      window.addEventListener('bsky-panels-resized', this._onPanelsResized);
-    }
-
     if (!this._onSearchChanged) {
       this._onSearchChanged = (e) => {
         const spec = e?.detail || null;
@@ -285,12 +270,6 @@ class BskyConnections extends HTMLElement {
   }
 
   disconnectedCallback(){
-    if (this._magicRO) { try { this._magicRO.disconnect(); } catch {} this._magicRO = null; }
-    if (this._onPanelsResized) {
-      try { window.removeEventListener('bsky-panels-resized', this._onPanelsResized); } catch {}
-      this._onPanelsResized = null;
-    }
-    this._queueMasonryRebalance = null;
     if (this._unbindInfiniteScroll) { try { this._unbindInfiniteScroll(); } catch {} this._unbindInfiniteScroll = null; }
     this._infiniteScrollEl = null;
 
@@ -305,144 +284,6 @@ class BskyConnections extends HTMLElement {
     }
     if (this._hydratedTimer) { try { clearTimeout(this._hydratedTimer); } catch {} this._hydratedTimer = null; }
     this._hydratedDidSet?.clear?.();
-
-  }
-
-  ensureMagicGrid(){
-    if (this.view !== 'magic') {
-      if (this._magicRO) { try { this._magicRO.disconnect(); } catch {} this._magicRO = null; }
-      return;
-    }
-
-    const host = this.shadowRoot.querySelector('.entries.magic');
-    if (!host) return;
-
-    const shell = this.shadowRoot.querySelector('bsky-panel-shell');
-    const scroller = shell?.getScroller?.() || null;
-
-    const computeColumns = () => {
-      try {
-        const UNIT = this._cssPx('--bsky-grid-unit', 0);
-        const GAP = this._cssPx('--bsky-grid-gutter', this._cssPx('--bsky-card-gap', 8));
-
-        const MIN_SPAN = 2;
-        const MIN = (UNIT && UNIT > 0)
-          ? Math.max(1, Math.floor((UNIT * MIN_SPAN) + GAP))
-          : this._cssPx('--bsky-card-min-w', 350);
-
-        const fallback = this.getBoundingClientRect?.().width || 0;
-        const available = scroller?.clientWidth || scroller?.getBoundingClientRect?.().width || fallback || 0;
-        if (!available || available < 2) return { cols: 1, cardW: Math.max(1, Math.floor(available || MIN)), gap: GAP };
-
-        const colsByMin = Math.max(1, Math.floor((available + GAP) / (MIN + GAP)));
-        // NOTE: Do not use the panel span hint to clamp columns here.
-        // Panel span can temporarily lag behind real pixel width during panel add/remove,
-        // which caused Connections to get stuck at 1 column even when there was room.
-        const cols = colsByMin;
-        const cardW = Math.max(1, Math.floor((available - ((cols - 1) * GAP)) / cols));
-        return { cols: Math.max(1, cols), cardW, gap: GAP };
-      } catch {
-        return { cols: 1, cardW: this._cssPx('--bsky-card-min-w', 350), gap: this._cssPx('--bsky-grid-gutter', 8) };
-      }
-    };
-
-    const queueStableLayout = createStableWorkQueue({
-      getScroller: () => this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.() || null,
-      getRoot: () => this.shadowRoot,
-      itemSelector: '.entry[data-did]',
-      keyAttr: 'data-did',
-    });
-
-    let rebalanceTimer = null;
-    const queueRebalance = () => {
-      if (rebalanceTimer) return;
-      rebalanceTimer = setTimeout(() => {
-        rebalanceTimer = null;
-        queueStableLayout(() => {
-          const { cols, cardW, gap } = computeColumns();
-          this.style.setProperty('--bsky-card-w', `${cardW}px`);
-          this.style.setProperty('--bsky-grid-gutter', `${gap}px`);
-
-          const entries = Array.from(host.querySelectorAll(':scope > .entry, :scope > .cols > .col > .entry'));
-          if (!entries.length) return;
-
-          if (cols <= 1) {
-            host.innerHTML = '';
-            for (const el of entries) host.appendChild(el);
-            return;
-          }
-
-          // Create/reuse the columns wrapper.
-          let colsWrap = host.querySelector(':scope > .cols');
-          if (!colsWrap) {
-            colsWrap = document.createElement('div');
-            colsWrap.className = 'cols';
-            host.innerHTML = '';
-            host.appendChild(colsWrap);
-          }
-
-          // Ensure column count.
-          const colEls = Array.from(colsWrap.querySelectorAll(':scope > .col'));
-          while (colEls.length < cols) {
-            const c = document.createElement('div');
-            c.className = 'col';
-            colsWrap.appendChild(c);
-            colEls.push(c);
-          }
-          while (colEls.length > cols) {
-            const last = colEls.pop();
-            if (last) {
-              const first = colEls[0];
-              if (first) {
-                while (last.firstChild) first.appendChild(last.firstChild);
-              }
-              try { last.remove(); } catch { try { colsWrap.removeChild(last); } catch {} }
-            }
-          }
-
-          // Measure heights, then greedy pack into shortest column.
-          const entryHeights = entries.map((el) => {
-            try { return Math.max(0, el.getBoundingClientRect().height || 0); } catch { return 0; }
-          });
-          const colHeights = new Array(colEls.length).fill(0);
-          for (const c of colEls) c.textContent = '';
-
-          for (let i = 0; i < entries.length; i++) {
-            const el = entries[i];
-            const h = entryHeights[i] || 0;
-            let bestIdx = 0;
-            let bestH = colHeights[0] ?? 0;
-            for (let c = 1; c < colHeights.length; c++) {
-              const ch = colHeights[c] ?? 0;
-              if (ch < bestH) { bestH = ch; bestIdx = c; }
-            }
-            colEls[bestIdx].appendChild(el);
-            colHeights[bestIdx] = (colHeights[bestIdx] ?? 0) + h;
-          }
-        });
-      }, 60);
-    };
-
-    // Expose so global panel resize events can request a relayout.
-    this._queueMasonryRebalance = queueRebalance;
-
-    // The list container is re-created on every render(), so always re-bind the observer.
-    if (this._magicRO) { try { this._magicRO.disconnect(); } catch {} this._magicRO = null; }
-    try {
-      this._magicRO = new ResizeObserver(() => {
-        queueRebalance();
-      });
-      if (scroller) this._magicRO.observe(scroller);
-      this._magicRO.observe(this);
-    } catch {
-      this._magicRO = null;
-    }
-
-    // Run immediately and also after layout settles.
-    queueRebalance();
-    requestAnimationFrame(() => queueRebalance());
-    setTimeout(() => queueRebalance(), 220);
-    setTimeout(() => queueRebalance(), 520);
   }
 
   onClick(e){
@@ -485,8 +326,6 @@ class BskyConnections extends HTMLElement {
     }
 
     if (e.target.id === 'view') {
-      // Force MagicGrid regardless of selection (back-compat for stored values).
-      this.view = 'magic';
       this.render();
     }
   }
@@ -688,21 +527,9 @@ class BskyConnections extends HTMLElement {
         button{background:#111;border:1px solid #555;color:#fff;padding:8px 10px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
         button:disabled{opacity:.6;cursor:not-allowed}
 
-        .entries{display:block;gap:12px;justify-content:start;align-items:start}
+        .entries{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--bsky-card-min-w, 350px),1fr));gap:var(--bsky-card-gap, var(--bsky-grid-gutter, 0px));align-items:start;max-width:100%;min-height:0}
 
-        /* Balanced-columns masonry: cards are reparented into N columns. */
-        .entries.magic{display:block;max-width:100%;min-height:0}
-        .entries.magic .cols{display:flex;gap:var(--bsky-grid-gutter, 8px);align-items:flex-start;justify-content:flex-start;width:100%}
-        .entries.magic .col{flex:0 0 auto;width:min(100%, var(--bsky-card-w, 350px));display:flex;flex-direction:column;gap:var(--bsky-grid-gutter, 8px);min-width:0}
-        /* Cards have a minimum width, but can expand to fill available space. */
-        .entries.magic .entry{
-          width:min(100%, var(--bsky-card-w, 350px));
-          max-width:min(100%, var(--bsky-card-w, 350px));
-          min-width:min(100%, var(--bsky-card-min-w, 350px));
-          margin:0;
-        }
-
-        .entry{display:flex;gap:8px;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:5px;background:#0f0f0f;width:100%;max-width:100%}
+        .entry{display:flex;gap:8px;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:5px;background:#0f0f0f;width:100%;max-width:100%;min-width:0}
         .av{width:40px;height:40px;border-radius: var(--bsky-radius, 0px);background:#222;object-fit:cover;flex:0 0 auto}
         .main{min-width:0;flex:1}
         .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
@@ -742,7 +569,7 @@ class BskyConnections extends HTMLElement {
 
         ${this.error ? `<div class="err">Error: ${esc(this.error)}</div>` : ''}
 
-        <div class="entries magic">
+        <div class="entries">
           ${rowsHtml || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No connections loaded.</div>')}
         </div>
       </bsky-panel-shell>
@@ -784,8 +611,6 @@ class BskyConnections extends HTMLElement {
         initialTick: false,
       });
     }
-
-    queueMicrotask(() => this.ensureMagicGrid());
   }
 }
 
