@@ -357,6 +357,16 @@ class BskyMyPosts extends HTMLElement {
     }
   }
 
+  _cssInt(varName, fallback) {
+    try {
+      const raw = getComputedStyle(this).getPropertyValue(varName);
+      const n = Number.parseInt(String(raw || '').trim(), 10);
+      return Number.isFinite(n) ? n : fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
   connectedCallback(){
     this.render();
     this.load(true);
@@ -990,8 +1000,8 @@ class BskyMyPosts extends HTMLElement {
       };
     };
 
-    const totalReplies = fullThread ? countReplies(fullThread) : 0;
-    const PREVIEW_N = 5;
+      const totalReplies = fullThread ? countReplies(fullThread) : 0;
+      const PREVIEW_N = Math.max(0, this._cssInt('--bsky-thread-preview-count', 5));
     const thread = (mode === 'preview') ? makeRecentRepliesPreview(fullThread, PREVIEW_N) : fullThread;
     const showing = (mode === 'preview') ? Math.min(PREVIEW_N, totalReplies) : totalReplies;
 
