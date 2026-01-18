@@ -13,6 +13,8 @@ import './notifications/notifications.js';
 import './notifications/notifications_panel.js';
 import './content/content_panel.js';
 import './people/people_panel.js';
+import './groups/groups_panel.js';
+import './group/group_home.js';
 import './thread/thread_tree.js';
 import './comment/comment_composer.js';
 

@@ -55,6 +55,31 @@ Add a new panel by creating a module in `js/panels/templates/` that exports:
 - `mountHtml` (what to mount when active)
 - optional `defaultActive`
 
+### Group context (site-local)
+
+The shell provides a simple “active group” context used by the Group panel and any future group-scoped features.
+
+- Persisted key: `localStorage['bsky_active_group_id']` (stringified integer; `0`/missing means “no active group”).
+- Event: `window` dispatches `bsky-group-changed` with `detail: { groupId, group }` whenever the selector changes.
+- UX: selecting a non-zero group automatically activates the `group` panel tab.
+- Consumer: `<bsky-group-home>` listens for `bsky-group-changed` and calls `groupGet/groupJoin/groupLeave`.
+
+#### Group posting/tagging (MVP)
+
+Because posts are stored on Bluesky, the MVP “post to group” feature associates posts with a group via a stable hashtag derived from the group slug:
+
+- Tag format: `#csky_<slug>` with non-alphanumerics normalized to `_`.
+- The Group panel uses `searchPosts` with `q = <tag>` to render a group feed.
+- The composer submits via `groupPostSubmit` (not `createPost` directly).
+  - `public` groups: the server immediately creates the Bluesky post.
+  - `closed/secret` groups: the server stores a pending item in `group_posts` for moderator approval.
+  - Mods approve/deny via `groupPostApprove` / `groupPostDeny` and list the queue via `groupPostsPendingList`.
+- Members can view their own submission history via `groupPostsMineList`.
+- Mods can suppress specific public posts from the group UI feed site-locally via `groupPostHide` / `groupPostUnhide` (does not delete the Bluesky post).
+- Note: this is **not privacy**; the feed is still public Bluesky content, and closed/secret semantics are enforced only for site-local membership/admin actions.
+
+Related event (optional): panels that create/join/leave groups may dispatch `bsky-groups-changed` so the shell refreshes its selector by re-calling `groupsList`.
+
 ### CSS Variables
 
 These are defined on `<bsky-app>` and inherited by panel components.
@@ -206,6 +231,14 @@ ConcreteSky uses a single JSON endpoint (ConcreteCMS controller) that behaves li
 **Moderation / graph**: `getBlocks`, `block`, `unblock`, `getMutes`, `mute`, `unmute`
 
 **Lists**: `getLists`
+
+**Groups (site-local)**: `groupsList`, `groupGet`, `groupCreate`, `groupUpdate`, `groupJoin`, `groupLeave`, `groupAuditList`, `groupMembersList`, `groupMemberApprove`, `groupMemberDeny`, `groupInviteCreate`, `groupInvitesList`, `groupInviteRevoke`, `groupInviteJoin`
+
+**Groups (post moderation)**: `groupPostSubmit`, `groupPostsList`, `groupPostsPendingList`, `groupPostApprove`, `groupPostDeny`
+
+**Groups (feed suppression)**: `groupHiddenPostsList`, `groupPostHide`, `groupPostUnhide`
+
+**Groups (self-service)**: `groupPostsMineList`
 
 **Bluesky parity: gates**: `createThreadGate`, `createPostGate`
 

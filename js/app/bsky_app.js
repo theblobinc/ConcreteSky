@@ -16,6 +16,22 @@ class BskyApp extends HTMLElement {
     this._authRefreshInFlight = null;
     this._lastConnected = null;
 
+    // Group context (site-local groups).
+    this._groupsLoaded = false;
+    this._groupsLoading = false;
+    this._groups = [];
+    this._activeGroupId = 0;
+
+    this._onGroupsChanged = (e) => {
+      try {
+        const gid = Number(e?.detail?.groupId || 0);
+        const selectGroupId = (Number.isFinite(gid) && gid > 0) ? gid : 0;
+        this.refreshGroups({ selectGroupId: selectGroupId || undefined });
+      } catch {
+        this.refreshGroups({});
+      }
+    };
+
     // Ephemeral layout overrides (do not persist to localStorage).
     this._fixedColsPrev = new Map(); // panelName -> previous string|null
     this._fixedPxPrev = new Map();   // panelName -> previous string|null
@@ -24,6 +40,17 @@ class BskyApp extends HTMLElement {
 
   connectedCallback() {
     this.render();
+
+    // Group selector changes.
+    this.shadowRoot.addEventListener('change', (e) => {
+      const sel = e.target?.closest?.('select[data-bsky-group-select]');
+      if (!sel) return;
+      const gid = Number(sel.value || 0);
+      this.setActiveGroupId(gid);
+    });
+
+    // Keep selector in sync when groups are created/updated elsewhere.
+    window.addEventListener('bsky-groups-changed', this._onGroupsChanged);
 
     // When the user toggles tabs, only mount the active panels.
     try {
@@ -77,7 +104,11 @@ class BskyApp extends HTMLElement {
   }
 
   disconnectedCallback() {
-    // Keep it simple: listeners above are cheap, and this component is intended to be long-lived.
+    try {
+      window.removeEventListener('bsky-groups-changed', this._onGroupsChanged);
+    } catch {
+      // ignore
+    }
   }
 
   setLocked(locked) {
@@ -444,6 +475,11 @@ class BskyApp extends HTMLElement {
         this.setLocked(false);
         this.ensureTabsBooted();
         this.mountPanels(this.getActiveTabsFromDom());
+
+        // Bootstrap group selector once after we have a session.
+        if (!this._groupsLoaded && !this._groupsLoading) {
+          queueMicrotask(() => { this.bootstrapGroups(); });
+        }
         return;
       }
     } catch {
@@ -453,6 +489,148 @@ class BskyApp extends HTMLElement {
     // Not connected: hide the app UI and avoid mounting components.
     this.unmountPanels();
     this.setLocked(true);
+  }
+
+  _loadSavedGroupId() {
+    try {
+      const raw = localStorage.getItem('bsky_active_group_id');
+      const n = Number(raw || 0);
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  _saveGroupId(groupId) {
+    try {
+      if (groupId > 0) localStorage.setItem('bsky_active_group_id', String(groupId));
+      else localStorage.removeItem('bsky_active_group_id');
+    } catch {
+      // ignore
+    }
+  }
+
+  setActiveGroupId(groupId) {
+    const gid = Number(groupId || 0);
+    const next = Number.isFinite(gid) && gid > 0 ? gid : 0;
+    if (next === this._activeGroupId) return;
+    this._activeGroupId = next;
+    this._saveGroupId(next);
+    this.updateGroupSelector();
+
+    this.emitGroupChanged(next);
+
+    // Bring the Group panel into view when selecting a group.
+    if (next > 0) {
+      try {
+        const root = this.shadowRoot.querySelector('[data-bsky-tabs]');
+        const api = root?.__bskyTabsApi;
+        api?.activate?.('group');
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  async bootstrapGroups() {
+    if (this._groupsLoaded || this._groupsLoading) return;
+    this._groupsLoading = true;
+    try {
+      const res = await call('groupsList', {});
+      this._groups = Array.isArray(res?.groups) ? res.groups : [];
+      this._groupsLoaded = true;
+
+      // Restore saved selection if possible.
+      const saved = this._loadSavedGroupId();
+      const ok = saved && (this._groups || []).some((g) => Number(g.group_id || 0) === saved);
+      this._activeGroupId = ok ? saved : 0;
+      this.updateGroupSelector();
+
+      if (this._activeGroupId) {
+        this.emitGroupChanged(this._activeGroupId);
+      }
+    } catch {
+      // Ignore selector failures; groups are optional.
+      this._groups = [];
+      this._groupsLoaded = true;
+      this._activeGroupId = 0;
+      this.updateGroupSelector();
+    } finally {
+      this._groupsLoading = false;
+    }
+  }
+
+  emitGroupChanged(groupId) {
+    const gid = Number(groupId || 0);
+    try {
+      window.dispatchEvent(new CustomEvent('bsky-group-changed', {
+        detail: {
+          groupId: gid,
+          group: (this._groups || []).find((g) => Number(g.group_id || 0) === gid) || null,
+        },
+      }));
+    } catch {
+      // ignore
+    }
+  }
+
+  async refreshGroups({ selectGroupId } = {}) {
+    // Groups are optional; if we can't refresh, keep the UI usable.
+    if (this._groupsLoading) return;
+    this._groupsLoading = true;
+    this.updateGroupSelector();
+
+    try {
+      const res = await call('groupsList', {});
+      this._groups = Array.isArray(res?.groups) ? res.groups : [];
+      this._groupsLoaded = true;
+
+      // If asked, try to select a specific group (e.g. newly created).
+      const pick = Number(selectGroupId || 0);
+      if (Number.isFinite(pick) && pick > 0) {
+        const ok = (this._groups || []).some((g) => Number(g.group_id || 0) === pick);
+        if (ok) this.setActiveGroupId(pick);
+      }
+
+      // If current selection disappeared, clear it.
+      if (this._activeGroupId) {
+        const stillOk = (this._groups || []).some((g) => Number(g.group_id || 0) === Number(this._activeGroupId));
+        if (!stillOk) this.setActiveGroupId(0);
+        else this.emitGroupChanged(this._activeGroupId);
+      }
+
+      this.updateGroupSelector();
+    } catch {
+      // ignore
+    } finally {
+      this._groupsLoading = false;
+      this.updateGroupSelector();
+    }
+  }
+
+  updateGroupSelector() {
+    const sel = this.shadowRoot.querySelector('select[data-bsky-group-select]');
+    if (!sel) return;
+
+    const groups = Array.isArray(this._groups) ? this._groups : [];
+    const opts = [
+      `<option value="0">All groups…</option>`,
+      ...groups.map((g) => {
+        const id = Number(g.group_id || 0);
+        const name = String(g.name || g.slug || `#${id}`);
+        const slug = String(g.slug || '');
+        return `<option value="${id}">${name}${slug ? ` /${slug}` : ''}</option>`;
+      }),
+    ].join('');
+
+    sel.innerHTML = opts;
+    try { sel.value = String(this._activeGroupId || 0); } catch {}
+
+    try {
+      sel.toggleAttribute('disabled', !!this._groupsLoading);
+    } catch {
+      // ignore
+    }
   }
 
   scheduleAuthRefresh() {
@@ -572,6 +750,10 @@ class BskyApp extends HTMLElement {
         .tab:focus{outline:2px solid #2f4b7a; outline-offset:2px}
         .tabhint{color:#aaa;font-size:.9rem;margin-left:auto;white-space:nowrap}
 
+        .groupWrap{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+        .groupLabel{font-size:12px;opacity:.8;white-space:nowrap}
+        .groupSelect{background:#000;border:1px solid #333;color:#fff;padding:7px 10px;min-width:240px}
+
         .panels{
           margin-top:12px;
           display:flex;
@@ -667,6 +849,13 @@ class BskyApp extends HTMLElement {
               <div class="tablist">
                 ${tabsHtml}
                 <span class="tabhint">Tip: click multiple tabs to compare in columns.</span>
+              </div>
+
+              <div class="groupWrap">
+                <span class="groupLabel">Group</span>
+                <select class="groupSelect" data-bsky-group-select>
+                  <option value="0">All groups…</option>
+                </select>
               </div>
             </div>
           </bsky-profile>

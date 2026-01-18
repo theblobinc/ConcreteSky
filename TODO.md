@@ -279,13 +279,17 @@ This section is the backlog for building “groups” as a first-class product. 
 ### 1) Group model (foundation)
 
 - [ ] Define a durable Group model:
-	- `group_id`, `slug`, `name`, `description`, `visibility` (`public|closed|secret`), `created_at`.
-	- Owner DID + role assignments.
-	- SQLite schema + migrations + export.
+	- [x] SQLite schema + migrations (groups + membership + audit log).
+	- [ ] Export/backup + import (site portability).
+	- [ ] Clarify constraints and invariants (owner transfer, delete semantics).
 - [ ] Group-scoped routing in UI:
-	- Group selector (site-level nav).
-	- Group home feed panel (pinned to the group context).
+	- [x] Group selector (site-level nav) + persisted active group.
+	- [x] Shell stays in sync on group changes (live refresh).
+	- [x] Group home panel with MVP activity feed.
 - [ ] Group settings UI (admins only).
+
+- [x] MVP server API for site-local groups (list/get/create/update/join/leave).
+- [x] MVP Groups panel (list + join/leave + admin create).
 
 ### 2) Membership + roles
 
@@ -293,18 +297,20 @@ This section is the backlog for building “groups” as a first-class product. 
 - [ ] Roles: `admin|moderator|member` (+ optional `trusted`).
 - [ ] Join flow parity:
 	- Join questions (form builder + stored answers).
-	- Approval queue for closed groups.
-	- Invite links (rotatable tokens).
+	- [x] Approval queue for closed groups (admin-only MVP).
+	- [x] Invite links (rotatable tokens) (admin-only MVP).
 - [ ] Group rules (markdown) + onboarding gate (“must accept rules”).
 
 ### 3) Group feed + posting
 
 - [ ] Group feed panel:
-	- Sort modes (new, top, hot) with clear semantics.
-	- Topic tags (group-local taxonomy).
+	- [x] MVP: tag-based feed from Bluesky search.
+	- [ ] Sort modes (new, top, hot) with clear semantics.
+	- [ ] Topic tags (group-local taxonomy).
 - [ ] Posting into a group:
-	- Post composer supports “post to group”.
-	- Group-only posting rules (who can post; post approval required; slow-mode).
+	- [x] Post composer supports “post to group” (adds group tag).
+	- [x] Group-only posting rules (MVP): members can submit; closed/secret require approval; public posts publish immediately.
+	- [ ] Slow-mode / per-member rate limits.
 - [ ] Announcement posts + pinning:
 	- Pin up to N posts; show pinned section.
 	- Admin-only announcement marker.
@@ -312,11 +318,11 @@ This section is the backlog for building “groups” as a first-class product. 
 ### 4) Moderation queue (Facebook-style)
 
 - [ ] Moderation surfaces:
-	- Pending posts queue (approve/deny).
+	- [x] Pending posts queue (approve/deny) (MVP: mods/admins only).
 	- Report queue (user reports with reasons).
 	- Member requests queue (approve/deny).
 - [ ] Moderator actions:
-	- Remove post (from group feed), keep audit log.
+	- [x] Remove post (from group feed) (MVP: site-local hide/unhide), keep audit log.
 	- Warn/suspend/ban member (group-local enforcement).
 	- Keyword filters / blocked phrases.
 - [ ] Audit log UI + export (who did what, when).
