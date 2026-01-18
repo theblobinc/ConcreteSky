@@ -9,6 +9,8 @@ import { compileSearchMatcher } from '../../../search/query.js';
 import '../../../components/thread_tree.js';
 import '../../../comment/comment_composer.js';
 import { resolveMentionDidsFromTexts, buildFacetsSafe, defaultLangs, uploadImagesToEmbed, unfurlEmbedFromText, selectEmbed, applyInteractionGates } from '../../../controllers/compose_controller.js';
+import { bindListsRequest } from '../../../controllers/lists_controller.js';
+import { syncRecent } from '../../../controllers/cache_sync_controller.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
   ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[m])
@@ -250,6 +252,7 @@ class BskyMyPosts extends HTMLElement {
     this._latestIso = '';
     this._unbindInfiniteScroll = null;
     this._infiniteScrollEl = null;
+    this._unbindListsRequest = null;
     this._backfillInFlight = false;
     this._backfillDone = false;
 
@@ -405,16 +408,7 @@ class BskyMyPosts extends HTMLElement {
       const created = this._extractCreatedRef(out);
       await this._applyInteractionGates(created?.uri, detail?.interactions, { isRootPost: true });
       try {
-        if (window.BSKY?.cacheAvailable !== false) {
-          const notifBar = document.querySelector('bsky-notification-bar');
-          const canUseThrottledSync = !!(notifBar && notifBar.isConnected);
-          if (canUseThrottledSync) {
-            window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 10 } }));
-          } else {
-            await call('cacheSyncRecent', { minutes: 10 });
-            window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes: 30 } }));
-          }
-        }
+        await syncRecent({ minutes: 10, refreshMinutes: 30 });
       } catch {}
       this.load(true);
     } finally {
@@ -464,16 +458,7 @@ class BskyMyPosts extends HTMLElement {
         await this._applyInteractionGates(created?.uri, interactions, { isRootPost: i === 0 });
       }
       try {
-        if (window.BSKY?.cacheAvailable !== false) {
-          const notifBar = document.querySelector('bsky-notification-bar');
-          const canUseThrottledSync = !!(notifBar && notifBar.isConnected);
-          if (canUseThrottledSync) {
-            window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 10 } }));
-          } else {
-            await call('cacheSyncRecent', { minutes: 10 });
-            window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes: 30 } }));
-          }
-        }
+        await syncRecent({ minutes: 10, refreshMinutes: 30 });
       } catch {}
       this.load(true);
     } finally {
@@ -563,16 +548,7 @@ class BskyMyPosts extends HTMLElement {
       } catch {}
 
       try {
-        if (window.BSKY?.cacheAvailable !== false) {
-          const notifBar = document.querySelector('bsky-notification-bar');
-          const canUseThrottledSync = !!(notifBar && notifBar.isConnected);
-          if (canUseThrottledSync) {
-            window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 10 } }));
-          } else {
-            await call('cacheSyncRecent', { minutes: 10 });
-            window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes: 30 } }));
-          }
-        }
+        await syncRecent({ minutes: 10, refreshMinutes: 30 });
       } catch {}
 
       try {
@@ -839,19 +815,7 @@ class BskyMyPosts extends HTMLElement {
     });
 
     // List picker support for reply-gating (threadgate listRule).
-    this.shadowRoot.addEventListener('bsky-request-lists', async (e) => {
-      const composer = (e?.target && String(e.target.tagName || '').toLowerCase() === 'bsky-comment-composer') ? e.target : null;
-      if (!composer) return;
-      try { composer.setListsLoading?.(true); } catch {}
-      try {
-        const res = await call('getLists', { limit: 100 });
-        const lists = Array.isArray(res?.lists) ? res.lists : (Array.isArray(res?.data?.lists) ? res.data.lists : []);
-        const shaped = lists.map((l) => ({ uri: l?.uri, name: l?.name }));
-        try { composer.setLists?.(shaped); } catch {}
-      } catch (err) {
-        try { composer.setListsError?.(err?.message || String(err || 'Failed to load lists')); } catch {}
-      }
-    });
+    if (!this._unbindListsRequest) this._unbindListsRequest = bindListsRequest(this.shadowRoot, { limit: 100 });
 
     // Restore packed layout + scroll position when the Content panel closes.
     if (!this._contentClosedHandler) {
@@ -1149,6 +1113,7 @@ class BskyMyPosts extends HTMLElement {
       try { window.removeEventListener('bsky-content-closed', this._contentClosedHandler); } catch {}
       this._contentClosedHandler = null;
     }
+    if (this._unbindListsRequest) { try { this._unbindListsRequest(); } catch {} this._unbindListsRequest = null; }
     if (this._unbindInfiniteScroll) { try { this._unbindInfiniteScroll(); } catch {} this._unbindInfiniteScroll = null; }
     this._infiniteScrollEl = null;
   }
@@ -1605,7 +1570,7 @@ class BskyMyPosts extends HTMLElement {
         } catch {}
 
         try {
-          window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 5 } }));
+          await syncRecent({ minutes: 5, refreshMinutes: 30, allowDirectFallback: false });
         } catch {}
       } catch (err) {
         console.warn('repost toggle failed', err);
@@ -1669,7 +1634,7 @@ class BskyMyPosts extends HTMLElement {
         } catch {}
 
         try {
-          window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 5 } }));
+          await syncRecent({ minutes: 5, refreshMinutes: 30, allowDirectFallback: false });
         } catch {}
       } catch (err) {
         console.warn('like toggle failed', err);
@@ -2112,16 +2077,7 @@ class BskyMyPosts extends HTMLElement {
 
       // Ensure cached feeds can see the new reply.
       try {
-        if (window.BSKY?.cacheAvailable !== false) {
-          const notifBar = document.querySelector('bsky-notification-bar');
-          const canUseThrottledSync = !!(notifBar && notifBar.isConnected);
-          if (canUseThrottledSync) {
-            window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 10 } }));
-          } else {
-            await call('cacheSyncRecent', { minutes: 10 });
-            window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes: 30 } }));
-          }
-        }
+        await syncRecent({ minutes: 10, refreshMinutes: 30 });
       } catch {}
 
       // Refresh thread cache and rerender expanded thread.

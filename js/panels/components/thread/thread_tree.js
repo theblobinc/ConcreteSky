@@ -1,4 +1,5 @@
 import { call } from '../../../api.js';
+import { syncRecent } from '../../../controllers/cache_sync_controller.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
 
@@ -285,7 +286,7 @@ export class BskyThreadTree extends HTMLElement {
         }));
 
         try {
-          window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 5 } }));
+          await syncRecent({ minutes: 5, refreshMinutes: 30, allowDirectFallback: false });
         } catch {}
 
         this.render();
@@ -335,7 +336,7 @@ export class BskyThreadTree extends HTMLElement {
         }));
 
         try {
-          window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 5 } }));
+          await syncRecent({ minutes: 5, refreshMinutes: 30, allowDirectFallback: false });
         } catch {}
 
         this.render();

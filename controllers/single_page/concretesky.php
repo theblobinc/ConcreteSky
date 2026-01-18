@@ -215,7 +215,7 @@ class Concretesky extends PageController
         if ($did) {
             $st = $pdo->prepare('SELECT s.c5_user_id, s.did,
                 COALESCE(p.handle, s.handle) AS handle,
-                s.pds, s.access_jwt, s.refresh_jwt, s.auth_type, s.auth_issuer, s.dpop_private_pem, s.dpop_public_jwk, s.auth_dpop_nonce, s.resource_dpop_nonce, s.token_expires_at, s.updated_at,
+                                s.pds, s.client_id, s.access_jwt, s.refresh_jwt, s.auth_type, s.auth_issuer, s.dpop_private_pem, s.dpop_public_jwk, s.auth_dpop_nonce, s.resource_dpop_nonce, s.token_expires_at, s.updated_at,
                 p.display_name, p.avatar
               FROM auth_sessions s
               LEFT JOIN profiles p ON p.did = s.did
@@ -229,7 +229,7 @@ class Concretesky extends PageController
         // Fallback: pick the most recently updated session for this Concrete user.
                 $st = $pdo->prepare('SELECT s.c5_user_id, s.did,
                         COALESCE(p.handle, s.handle) AS handle,
-                        s.pds, s.access_jwt, s.refresh_jwt, s.auth_type, s.auth_issuer, s.dpop_private_pem, s.dpop_public_jwk, s.auth_dpop_nonce, s.resource_dpop_nonce, s.token_expires_at, s.updated_at,
+                s.pds, s.client_id, s.access_jwt, s.refresh_jwt, s.auth_type, s.auth_issuer, s.dpop_private_pem, s.dpop_public_jwk, s.auth_dpop_nonce, s.resource_dpop_nonce, s.token_expires_at, s.updated_at,
                         p.display_name, p.avatar
                     FROM auth_sessions s
                     LEFT JOIN profiles p ON p.did = s.did
@@ -293,11 +293,12 @@ class Concretesky extends PageController
             throw new \RuntimeException('Missing session DID');
         }
 
-            $st = $pdo->prepare('INSERT INTO auth_sessions(c5_user_id, did, handle, pds, access_jwt, refresh_jwt, auth_type, auth_issuer, dpop_private_pem, dpop_public_jwk, auth_dpop_nonce, resource_dpop_nonce, token_expires_at, created_at, updated_at)
-                VALUES(:u,:did,:h,:pds,:a,:r,:type,:iss,:dpop_priv,:dpop_pub,:auth_nonce,:res_nonce,:exp,:c,:t)
+            $st = $pdo->prepare('INSERT INTO auth_sessions(c5_user_id, did, handle, pds, client_id, access_jwt, refresh_jwt, auth_type, auth_issuer, dpop_private_pem, dpop_public_jwk, auth_dpop_nonce, resource_dpop_nonce, token_expires_at, created_at, updated_at)
+                VALUES(:u,:did,:h,:pds,:client_id,:a,:r,:type,:iss,:dpop_priv,:dpop_pub,:auth_nonce,:res_nonce,:exp,:c,:t)
             ON CONFLICT(c5_user_id, did) DO UPDATE SET
               handle=excluded.handle,
               pds=excluded.pds,
+              client_id=excluded.client_id,
               access_jwt=excluded.access_jwt,
               refresh_jwt=excluded.refresh_jwt,
               auth_type=excluded.auth_type,
@@ -313,6 +314,7 @@ class Concretesky extends PageController
             ':did' => $did,
             ':h' => isset($sess['handle']) ? (string)$sess['handle'] : null,
             ':pds' => isset($sess['pds']) ? (string)$sess['pds'] : $this->pds,
+            ':client_id' => isset($sess['clientId']) ? (string)$sess['clientId'] : null,
             ':a' => (string)($sess['accessJwt'] ?? ''),
             ':r' => (string)($sess['refreshJwt'] ?? ''),
                         ':type' => isset($sess['authType']) ? (string)$sess['authType'] : 'password',
@@ -385,6 +387,7 @@ class Concretesky extends PageController
             'did' => (string)$row['did'],
             'handle' => (string)($row['handle'] ?? ''),
             'pds' => (string)($row['pds'] ?? $this->pds),
+            'clientId' => isset($row['client_id']) ? (string)$row['client_id'] : null,
             'authIssuer' => isset($row['auth_issuer']) ? (string)$row['auth_issuer'] : null,
             'dpopPrivatePem' => isset($row['dpop_private_pem']) ? (string)$row['dpop_private_pem'] : null,
             'dpopPublicJwk' => !empty($row['dpop_public_jwk']) ? (json_decode((string)$row['dpop_public_jwk'], true) ?: null) : null,
@@ -563,7 +566,7 @@ class Concretesky extends PageController
         return $this->oauthXrpc($verb, $url, $session, $json);
     }
 
-    protected function createRecord($session, $collection, array $record, $rkey = null)
+    protected function createRecord(array &$session, $collection, array $record, $rkey = null)
     {
         $repo = $session['did'] ?? ($session['handle'] ?? null);
         if (!$repo) throw new \RuntimeException('Missing repo DID for createRecord');

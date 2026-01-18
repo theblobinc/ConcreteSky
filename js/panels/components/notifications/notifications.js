@@ -4,6 +4,7 @@ import { bindInfiniteScroll, resolvePanelScroller, captureScrollAnchor, applyScr
 import { BSKY_SEARCH_EVENT } from '../../../search/search_bus.js';
 import { SEARCH_TARGETS } from '../../../search/constants.js';
 import { compileSearchMatcher } from '../../../search/query.js';
+import { queueFollows, startFollowQueueProcessor } from '../../../controllers/follow_queue_controller.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
   ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[m])
@@ -63,6 +64,9 @@ class BskyNotifications extends HTMLElement {
     this.followMap = {};
     this.filters = { hours:24, reasons:new Set(REASONS), onlyNotFollowed:false };
     this._bulkState = { running:false, done:0, total:0 };
+    this._bulkFollowTargets = null; // Set<string>
+    this._onFollowQueueProcessed = null;
+    this._onFollowQueueStatus = null;
 
     this._searchSpec = null;
     this._searchMatcher = null;
@@ -117,6 +121,52 @@ class BskyNotifications extends HTMLElement {
     this.shadowRoot.addEventListener('click',  (e) => this.onClick(e));
 
     window.addEventListener('bsky-refresh-recent', this._refreshRecentHandler);
+
+    this._onFollowQueueProcessed = (e) => {
+      try {
+        if (!this._bulkState?.running || !this._bulkFollowTargets) return;
+        const out = e?.detail || {};
+        const results = out?.results || {};
+        Object.keys(results).forEach((did) => {
+          if (results[did]?.ok) this.followMap[did] = { ...(this.followMap[did] || {}), following: true, queued: false };
+        });
+        const done = Array.from(this._bulkFollowTargets).filter((did) => !!this.followMap?.[did]?.following).length;
+        this._bulkState.done = done;
+
+        const pending = Number(out?.status?.pending || out?.status?.counts?.pending || 0);
+        if (done >= this._bulkState.total || pending === 0) {
+          this._bulkState.running = false;
+          this._bulkFollowTargets = null;
+        }
+        this.render();
+      } catch {
+        // ignore
+      }
+    };
+
+    this._onFollowQueueStatus = (e) => {
+      try {
+        if (!this._bulkState?.running) return;
+        const st = e?.detail || {};
+        const pending = Number(st?.pending || st?.counts?.pending || 0);
+        const rateUntil = st?.rateLimitedUntil;
+        if (rateUntil && pending > 0) {
+          this.error = `Bulk follow queued. Rate limited until ${rateUntil}`;
+        }
+        if (pending === 0 && this._bulkFollowTargets) {
+          const done = Array.from(this._bulkFollowTargets).filter((did) => !!this.followMap?.[did]?.following).length;
+          this._bulkState.done = done;
+          this._bulkState.running = false;
+          this._bulkFollowTargets = null;
+        }
+        this.render();
+      } catch {
+        // ignore
+      }
+    };
+
+    window.addEventListener('bsky-follow-queue-processed', this._onFollowQueueProcessed);
+    window.addEventListener('bsky-follow-queue-status', this._onFollowQueueStatus);
 
     this._authChangedHandler = (e) => {
       const connected = !!e?.detail?.connected;
@@ -186,6 +236,8 @@ class BskyNotifications extends HTMLElement {
 
   disconnectedCallback(){
     window.removeEventListener('bsky-refresh-recent', this._refreshRecentHandler);
+    if (this._onFollowQueueProcessed) window.removeEventListener('bsky-follow-queue-processed', this._onFollowQueueProcessed);
+    if (this._onFollowQueueStatus) window.removeEventListener('bsky-follow-queue-status', this._onFollowQueueStatus);
     if (this._authChangedHandler) window.removeEventListener('bsky-auth-changed', this._authChangedHandler);
     if (this._onSearchChanged) {
       try { window.removeEventListener(BSKY_SEARCH_EVENT, this._onSearchChanged); } catch {}
@@ -580,33 +632,35 @@ class BskyNotifications extends HTMLElement {
     const toFollow = Array.from(new Set(
       shown
         .map(n => n?.author?.did)
-        .filter(did => did && !this.followMap[did]?.following)
+        .filter(did => did && !this.followMap[did]?.following && !this.followMap[did]?.queued)
     ));
     if (!toFollow.length) return;
 
     this._bulkState = { running:true, done:0, total:toFollow.length };
+    this._bulkFollowTargets = new Set(toFollow);
     this.render();
 
-    // chunk bulk follow (avoid giant payloads)
-    const chunkSize = 50;
-    for (let i = 0; i < toFollow.length; i += chunkSize) {
-      const chunk = toFollow.slice(i, i + chunkSize);
-      try {
-        const res = await call('followMany', { dids: chunk });
-        Object.keys(res.results || {}).forEach(did => {
-          if (res.results[did]?.ok) this.followMap[did] = { ...(this.followMap[did] || {}), following: true };
-        });
-      } catch (e) {
-        // continue; partial success is fine
-        console.warn('followMany chunk failed', e);
-      } finally {
-        this._bulkState.done = Math.min(this._bulkState.total, this._bulkState.done + chunk.length);
-        this.render();
-      }
+    try {
+      // Mark as queued immediately to avoid re-enqueue spam while processing.
+      toFollow.forEach((did) => {
+        this.followMap[did] = { ...(this.followMap[did] || {}), queued: true };
+      });
+
+      const res = await queueFollows(toFollow, { processNow: true, maxNow: 50, maxPerTick: 50 });
+      const results = res?.processed?.results || {};
+      Object.keys(results).forEach((did) => {
+        if (results[did]?.ok) this.followMap[did] = { ...(this.followMap[did] || {}), following: true, queued: false };
+      });
+
+      this._bulkState.done = Array.from(this._bulkFollowTargets).filter((did) => !!this.followMap?.[did]?.following).length;
+      startFollowQueueProcessor({ maxPerTick: 50 });
+      this.render();
+    } catch (e) {
+      this._bulkState.running = false;
+      this._bulkFollowTargets = null;
+      this.error = 'Bulk follow failed: ' + (e?.message || String(e || 'unknown'));
+      this.render();
     }
-
-    this._bulkState.running = false;
-    this.render();
   }
 
   labelFor(n){
@@ -631,7 +685,7 @@ class BskyNotifications extends HTMLElement {
       if (!reasonsSet.has(n.reason)) return false;
       if (!onlyNotFollowed) return true;
       const did = n.author?.did;
-      return did && !this.followMap[did]?.following;
+      return did && !this.followMap[did]?.following && !this.followMap[did]?.queued;
     });
     // Newest first
     items.sort((a,b) => new Date(b.indexedAt || b.createdAt || 0) - new Date(a.indexedAt || a.createdAt || 0));
@@ -748,11 +802,14 @@ class BskyNotifications extends HTMLElement {
       const rel = this.followMap[a.did] || {};
       const following = !!rel.following;
       const followsYou = !!rel.followedBy;
+      const queued = !!rel.queued;
       const open = atUriToWebPost(n.reasonSubject);
       const canView = !!open && String(n.reasonSubject || '').startsWith('at://');
-      const cta = a.did && !following
+      const cta = a.did && !following && !queued
         ? `<button class="follow-btn" data-follow-did="${esc(a.did)}">${followsYou ? 'Follow back' : 'Follow'}</button>`
-        : `<span class="following-badge" ${following?'':'style="display:none"'}>${followsYou ? 'Mutuals' : 'Following'}</span>`;
+        : queued
+          ? `<span class="following-badge">Queued</span>`
+          : `<span class="following-badge" ${following?'':'style="display:none"'}>${followsYou ? 'Mutuals' : 'Following'}</span>`;
 
       const viewBtn = canView
         ? `<button class="view-btn" type="button" data-open-content data-uri="${esc(String(n.reasonSubject || ''))}">View</button>`

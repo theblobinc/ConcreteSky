@@ -27,7 +27,7 @@ class Api extends ParentController
      * Bump this when the cache schema/migration logic changes.
      * Stored in meta as __global__:schema_version so we can skip costly PRAGMA checks on every request.
      */
-    protected const CACHE_SCHEMA_VERSION = '2026-01-17-1';
+    protected const CACHE_SCHEMA_VERSION = '2026-01-18-1';
 
     protected static bool $envLoaded = false;
 
@@ -81,6 +81,16 @@ class Api extends ParentController
         {
             $v = getenv($key);
             return $v === false ? $default : (string)$v;
+        }
+
+        protected function envInt(string $key, int $default, int $min = PHP_INT_MIN, int $max = PHP_INT_MAX): int
+        {
+            $v = getenv($key);
+            if ($v === false || $v === null || $v === '') return $default;
+            $n = (int)$v;
+            if ($n < $min) $n = $min;
+            if ($n > $max) $n = $max;
+            return $n;
         }
 
         protected function base64UrlEncode(string $bin): string
@@ -1937,6 +1947,84 @@ class Api extends ParentController
                     return $this->json(['results' => $results]);
                 }
 
+                case 'queueFollows': {
+                    // Queue follows for later processing (rate-limit friendly bulk follow).
+                    // Params:
+                    // - dids: string[]
+                    // - processNow: bool (default true)
+                    // - maxNow: int (default 50)
+                    $dids = $params['dids'] ?? [];
+                    if (!is_array($dids) || !$dids) return $this->json(['error' => 'Missing dids[]'], 400);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Missing actor DID'], 500);
+
+                    $processNow = (bool)($params['processNow'] ?? true);
+                    $maxNow = min(500, max(1, (int)($params['maxNow'] ?? 50)));
+
+                    $norm = [];
+                    foreach ($dids as $d) {
+                        $s = trim((string)$d);
+                        if ($s !== '') $norm[$s] = true;
+                    }
+                    $unique = array_keys($norm);
+
+                    $enqueued = 0;
+                    $nowIso = gmdate('c');
+
+                    $pdo->beginTransaction();
+                    try {
+                        $st = $pdo->prepare('INSERT OR IGNORE INTO follow_queue(actor_did,target_did,state,attempts,created_at,updated_at)
+                            VALUES(:a,:t,"pending",0,:c,:u)');
+                        foreach ($unique as $did) {
+                            $st->execute([':a' => $actorDid, ':t' => $did, ':c' => $nowIso, ':u' => $nowIso]);
+                            $enqueued += (int)$st->rowCount();
+                        }
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    $processed = null;
+                    if ($processNow) {
+                        $processed = $this->processFollowQueueInternal($pdo, $session, $actorDid, $maxNow);
+                    }
+
+                    $status = $this->followQueueStatusInternal($pdo, $actorDid);
+                    return $this->json([
+                        'ok' => true,
+                        'actorDid' => $actorDid,
+                        'enqueued' => $enqueued,
+                        'unique' => count($unique),
+                        'processed' => $processed,
+                        'status' => $status,
+                    ]);
+                }
+
+                case 'followQueueStatus': {
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Missing actor DID'], 500);
+                    return $this->json(['ok' => true, 'actorDid' => $actorDid, 'status' => $this->followQueueStatusInternal($pdo, $actorDid)]);
+                }
+
+                case 'processFollowQueue': {
+                    // Process queued follows up to `max`.
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Missing actor DID'], 500);
+                    $max = min(500, max(1, (int)($params['max'] ?? 50)));
+                    $out = $this->processFollowQueueInternal($pdo, $session, $actorDid, $max);
+                    $out['status'] = $this->followQueueStatusInternal($pdo, $actorDid);
+                    return $this->json($out);
+                }
+
                 /* ===================== local SQLite cache ===================== */
 
                 case 'cacheSync': {
@@ -3695,6 +3783,217 @@ class Api extends ParentController
         return null;
     }
 
+    /* ===================== follow queue + rate limits ===================== */
+
+    protected function parseRetryAfterSeconds(?string $raw): ?int
+    {
+        $raw = trim((string)$raw);
+        if ($raw === '') return null;
+
+        if (ctype_digit($raw)) {
+            $n = (int)$raw;
+            return $n > 0 ? $n : null;
+        }
+
+        $ts = strtotime($raw);
+        if ($ts === false) return null;
+        $sec = $ts - time();
+        return $sec > 0 ? $sec : null;
+    }
+
+    protected function retryAfterFromException(\Throwable $e): ?int
+    {
+        $msg = (string)($e->getMessage() ?? '');
+        if (!preg_match('/retry-after:\s*([^\)\s]+)/i', $msg, $m)) return null;
+        return $this->parseRetryAfterSeconds($m[1] ?? null);
+    }
+
+    protected function isRateLimitException(\Throwable $e): bool
+    {
+        $msg = (string)($e->getMessage() ?? '');
+        return (stripos($msg, 'HTTP 429') !== false);
+    }
+
+    protected function followQueueStatusInternal(\PDO $pdo, string $actorDid): array
+    {
+        $counts = ['pending' => 0, 'done' => 0, 'failed' => 0];
+        try {
+            $st = $pdo->prepare('SELECT state, COUNT(*) AS c FROM follow_queue WHERE actor_did = :a GROUP BY state');
+            $st->execute([':a' => $actorDid]);
+            foreach ($st->fetchAll(\PDO::FETCH_ASSOC) ?: [] as $row) {
+                $state = (string)($row['state'] ?? '');
+                $c = (int)($row['c'] ?? 0);
+                if (isset($counts[$state])) $counts[$state] = $c;
+            }
+        } catch (\Throwable $e) {
+            // ignore
+        }
+
+        $nextAttemptAt = null;
+        try {
+            $st = $pdo->prepare('SELECT MIN(next_attempt_at) FROM follow_queue WHERE actor_did = :a AND state = "pending" AND next_attempt_at IS NOT NULL');
+            $st->execute([':a' => $actorDid]);
+            $v = $st->fetchColumn();
+            if ($v !== false && $v !== null && (string)$v !== '') $nextAttemptAt = (string)$v;
+        } catch (\Throwable $e) {
+            $nextAttemptAt = null;
+        }
+
+        $rateUntil = $this->cacheMetaGet($pdo, $actorDid, 'follow_rate_until');
+        $windowStart = $this->cacheMetaGet($pdo, $actorDid, 'follow_rate_window_start');
+        $windowCount = $this->cacheMetaGet($pdo, $actorDid, 'follow_rate_count');
+
+        return [
+            'counts' => $counts,
+            'pending' => $counts['pending'],
+            'done' => $counts['done'],
+            'failed' => $counts['failed'],
+            'nextAttemptAt' => $nextAttemptAt,
+            'rateLimitedUntil' => $rateUntil,
+            'windowStart' => $windowStart,
+            'windowCount' => ($windowCount !== null ? (int)$windowCount : null),
+        ];
+    }
+
+    protected function processFollowQueueInternal(\PDO $pdo, array &$session, string $actorDid, int $max = 50): array
+    {
+        $max = min(500, max(1, (int)$max));
+
+        $limitPerHour = $this->envInt('CONCRETESKY_FOLLOW_MAX_PER_HOUR', 2500, 1, 100000);
+        $max = min($max, $this->envInt('CONCRETESKY_FOLLOW_MAX_PER_RUN', 100, 1, 500));
+
+        $now = time();
+        $nowIso = gmdate('c', $now);
+
+        // Hard rate-limited until…
+        $untilIso = $this->cacheMetaGet($pdo, $actorDid, 'follow_rate_until');
+        if ($untilIso) {
+            try {
+                $untilTs = (new \DateTimeImmutable($untilIso))->getTimestamp();
+                if ($untilTs > $now) {
+                    return [
+                        'ok' => true,
+                        'skipped' => true,
+                        'reason' => 'rateLimited',
+                        'rateLimitedUntil' => $untilIso,
+                        'processed' => 0,
+                        'results' => [],
+                    ];
+                }
+            } catch (\Throwable $e) {
+                // ignore
+            }
+        }
+
+        // Per-hour budget window.
+        $winStartIso = $this->cacheMetaGet($pdo, $actorDid, 'follow_rate_window_start');
+        $winCountRaw = $this->cacheMetaGet($pdo, $actorDid, 'follow_rate_count');
+        $winStartTs = null;
+        if ($winStartIso) {
+            try { $winStartTs = (new \DateTimeImmutable($winStartIso))->getTimestamp(); } catch (\Throwable $e) { $winStartTs = null; }
+        }
+        $winCount = ($winCountRaw !== null) ? (int)$winCountRaw : 0;
+        if ($winStartTs === null || ($now - $winStartTs) >= 3600) {
+            $winStartTs = $now;
+            $winCount = 0;
+            $winStartIso = $nowIso;
+            $this->cacheMetaSet($pdo, $actorDid, 'follow_rate_window_start', $winStartIso);
+            $this->cacheMetaSet($pdo, $actorDid, 'follow_rate_count', (string)$winCount);
+        }
+        if ($winCount >= $limitPerHour) {
+            $untilTs = $winStartTs + 3600;
+            $untilIso = gmdate('c', $untilTs);
+            $this->cacheMetaSet($pdo, $actorDid, 'follow_rate_until', $untilIso);
+            return [
+                'ok' => true,
+                'skipped' => true,
+                'reason' => 'budget',
+                'rateLimitedUntil' => $untilIso,
+                'processed' => 0,
+                'results' => [],
+            ];
+        }
+
+        $results = [];
+        $processed = 0;
+        $rateLimitedUntilOut = null;
+
+        $st = $pdo->prepare('SELECT target_did, attempts FROM follow_queue
+            WHERE actor_did = :a AND state = "pending" AND (next_attempt_at IS NULL OR next_attempt_at <= :now)
+            ORDER BY created_at ASC
+            LIMIT :lim');
+        $st->bindValue(':a', $actorDid, \PDO::PARAM_STR);
+        $st->bindValue(':now', $nowIso, \PDO::PARAM_STR);
+        $st->bindValue(':lim', $max, \PDO::PARAM_INT);
+        $st->execute();
+        $rows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+
+        $stOk = $pdo->prepare('UPDATE follow_queue SET state="done", follow_uri=:u, attempts=:att, last_error=NULL, next_attempt_at=NULL, updated_at=:ts WHERE actor_did=:a AND target_did=:t');
+        $stFail = $pdo->prepare('UPDATE follow_queue SET state=:s, attempts=:att, last_error=:e, next_attempt_at=:n, updated_at=:ts WHERE actor_did=:a AND target_did=:t');
+
+        foreach ($rows as $row) {
+            if ($processed >= $max) break;
+            if ($winCount >= $limitPerHour) {
+                $untilTs = $winStartTs + 3600;
+                $rateLimitedUntilOut = gmdate('c', $untilTs);
+                $this->cacheMetaSet($pdo, $actorDid, 'follow_rate_until', $rateLimitedUntilOut);
+                break;
+            }
+
+            $targetDid = trim((string)($row['target_did'] ?? ''));
+            if ($targetDid === '') continue;
+
+            $attempts = (int)($row['attempts'] ?? 0);
+            $attemptsNext = $attempts + 1;
+
+            try {
+                $rec = ['subject' => $targetDid, 'createdAt' => gmdate('c')];
+                $resp = $this->createRecord($session, 'app.bsky.graph.follow', $rec);
+                $uri = isset($resp['uri']) ? (string)$resp['uri'] : null;
+                $stOk->execute([':u' => $uri, ':att' => $attemptsNext, ':ts' => $nowIso, ':a' => $actorDid, ':t' => $targetDid]);
+                $results[$targetDid] = ['ok' => true, 'uri' => $uri];
+                $processed++;
+                $winCount++;
+            } catch (\Throwable $e) {
+                $msg = (string)($e->getMessage() ?? 'Follow failed');
+                if ($this->isRateLimitException($e)) {
+                    $ra = $this->retryAfterFromException($e);
+                    $wait = ($ra !== null) ? min(86400, max(1, $ra)) : 10;
+                    $nextIso = gmdate('c', time() + $wait);
+                    $rateLimitedUntilOut = $nextIso;
+                    $this->cacheMetaSet($pdo, $actorDid, 'follow_rate_until', $nextIso);
+                    $stFail->execute([':s' => 'pending', ':att' => $attemptsNext, ':e' => $msg, ':n' => $nextIso, ':ts' => $nowIso, ':a' => $actorDid, ':t' => $targetDid]);
+                    $results[$targetDid] = ['ok' => false, 'error' => $msg, 'rateLimited' => true, 'retryAt' => $nextIso];
+                    // Stop processing further; we hit a real server rate limit.
+                    break;
+                }
+
+                // For non-rate errors, retry a couple times then mark failed.
+                $state = ($attemptsNext >= 3) ? 'failed' : 'pending';
+                $nextIso = ($state === 'pending') ? gmdate('c', time() + 30) : null;
+                $stFail->execute([':s' => $state, ':att' => $attemptsNext, ':e' => $msg, ':n' => $nextIso, ':ts' => $nowIso, ':a' => $actorDid, ':t' => $targetDid]);
+                $results[$targetDid] = ['ok' => false, 'error' => $msg, 'retryAt' => $nextIso];
+                $processed++;
+            }
+        }
+
+        $this->cacheMetaSet($pdo, $actorDid, 'follow_rate_count', (string)$winCount);
+        $this->cacheMetaSet($pdo, $actorDid, 'follow_queue_last_run_at', $nowIso);
+
+        return [
+            'ok' => true,
+            'skipped' => false,
+            'processed' => $processed,
+            'results' => $results,
+            'rateLimitedUntil' => $rateLimitedUntilOut,
+            'budget' => [
+                'limitPerHour' => $limitPerHour,
+                'windowStart' => $winStartIso,
+                'windowCount' => $winCount,
+            ],
+        ];
+    }
+
     /* ===================== SQLite cache helpers ===================== */
 
     protected function cacheDir(): string
@@ -3768,6 +4067,25 @@ class Api extends ParentController
                 // These checks are cheap and prevent runtime 500s.
                 $this->cacheEnsureColumn($pdo, 'profiles', 'avatar', 'TEXT');
                 $this->cacheEnsureColumn($pdo, 'posts', 'text', 'TEXT');
+
+                // New tables added over time should still be ensured here.
+                $pdo->exec('CREATE TABLE IF NOT EXISTS follow_queue (
+                    actor_did TEXT NOT NULL,
+                    target_did TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT "pending",
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    follow_uri TEXT,
+                    next_attempt_at TEXT,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    PRIMARY KEY(actor_did, target_did)
+                )');
+                $pdo->exec('CREATE INDEX IF NOT EXISTS idx_follow_queue_actor_state ON follow_queue(actor_did, state)');
+                $pdo->exec('CREATE INDEX IF NOT EXISTS idx_follow_queue_next_attempt ON follow_queue(actor_did, next_attempt_at)');
+
+                // OAuth background refresh requires client_id to be persisted.
+                $this->cacheEnsureColumn($pdo, 'auth_sessions', 'client_id', 'TEXT');
                 return;
             }
         } catch (\Throwable $e) {
@@ -3802,6 +4120,7 @@ class Api extends ParentController
             did TEXT NOT NULL,
             handle TEXT,
             pds TEXT,
+            client_id TEXT,
             access_jwt TEXT NOT NULL,
             refresh_jwt TEXT NOT NULL,
             auth_type TEXT,
@@ -3821,8 +4140,8 @@ class Api extends ParentController
 
         if ($needsAuthV2) {
             try {
-                $pdo->exec('INSERT OR IGNORE INTO auth_sessions(c5_user_id,did,handle,pds,access_jwt,refresh_jwt,auth_type,auth_issuer,dpop_private_pem,dpop_public_jwk,auth_dpop_nonce,resource_dpop_nonce,token_expires_at,created_at,updated_at)
-                    SELECT c5_user_id,did,handle,pds,access_jwt,refresh_jwt,auth_type,auth_issuer,dpop_private_pem,dpop_public_jwk,auth_dpop_nonce,resource_dpop_nonce,token_expires_at,created_at,updated_at FROM auth_sessions_v1');
+                $pdo->exec('INSERT OR IGNORE INTO auth_sessions(c5_user_id,did,handle,pds,client_id,access_jwt,refresh_jwt,auth_type,auth_issuer,dpop_private_pem,dpop_public_jwk,auth_dpop_nonce,resource_dpop_nonce,token_expires_at,created_at,updated_at)
+                    SELECT c5_user_id,did,handle,pds,NULL,access_jwt,refresh_jwt,auth_type,auth_issuer,dpop_private_pem,dpop_public_jwk,auth_dpop_nonce,resource_dpop_nonce,token_expires_at,created_at,updated_at FROM auth_sessions_v1');
             } catch (\Throwable $e) {
                 // ignore
             }
@@ -3850,6 +4169,7 @@ class Api extends ParentController
         $this->cacheEnsureColumn($pdo, 'auth_sessions', 'auth_dpop_nonce', 'TEXT');
         $this->cacheEnsureColumn($pdo, 'auth_sessions', 'resource_dpop_nonce', 'TEXT');
         $this->cacheEnsureColumn($pdo, 'auth_sessions', 'token_expires_at', 'TEXT');
+        $this->cacheEnsureColumn($pdo, 'auth_sessions', 'client_id', 'TEXT');
 
         // Temporary OAuth state for authorization code flow.
         $pdo->exec('CREATE TABLE IF NOT EXISTS oauth_states (
@@ -3921,6 +4241,22 @@ class Api extends ParentController
             PRIMARY KEY(snapshot_id, other_did),
             FOREIGN KEY(snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
         )');
+
+        // Persisted follow queue (rate-limit friendly bulk follow support).
+        $pdo->exec('CREATE TABLE IF NOT EXISTS follow_queue (
+            actor_did TEXT NOT NULL,
+            target_did TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT "pending",
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            follow_uri TEXT,
+            next_attempt_at TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            PRIMARY KEY(actor_did, target_did)
+        )');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_follow_queue_actor_state ON follow_queue(actor_did, state)');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_follow_queue_next_attempt ON follow_queue(actor_did, next_attempt_at)');
 
         // Per-snapshot profile metrics to compute deltas later.
         $pdo->exec('CREATE TABLE IF NOT EXISTS profile_snapshots (

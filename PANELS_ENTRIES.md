@@ -12,3 +12,8 @@ Goal: avoid each panel inventing its own heavy DOM/media strategy (e.g. loading 
 ## Templates
 
 `templates/` is reserved for standardized entry templates (per entry kind) that panels can reuse.
+
+Related docs:
+
+- Panel system contract: `PANELS_API.md`
+- Entry templates: `PANELS_ENTRY_TEMPLATES.md`

@@ -2,6 +2,9 @@ import { call } from '../../../api.js';
 import { identityCss, identityHtml, bindCopyClicks } from '../../../lib/identity.js';
 import { renderPostCard } from '../../../components/interactions/utils.js';
 import { resolveMentionDidsFromTexts, buildFacetsSafe, defaultLangs, selectEmbed, applyInteractionGates } from '../../../controllers/compose_controller.js';
+import { bindListsRequest } from '../../../controllers/lists_controller.js';
+import { syncRecent } from '../../../controllers/cache_sync_controller.js';
+import { queueFollows } from '../../../controllers/follow_queue_controller.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
 
@@ -34,6 +37,7 @@ export class BskyContentPanel extends HTMLElement {
     };
 
     this._replyPostedHandler = null;
+    this._unbindListsRequest = null;
   }
 
   pickThreadRootRef(thread) {
@@ -91,19 +95,7 @@ export class BskyContentPanel extends HTMLElement {
     });
 
     // List picker support for reply-gating (threadgate listRule).
-    this.shadowRoot.addEventListener('bsky-request-lists', async (e) => {
-      const composer = (e?.target && String(e.target.tagName || '').toLowerCase() === 'bsky-comment-composer') ? e.target : null;
-      if (!composer) return;
-      try { composer.setListsLoading?.(true); } catch {}
-      try {
-        const res = await call('getLists', { limit: 100 });
-        const lists = Array.isArray(res?.lists) ? res.lists : (Array.isArray(res?.data?.lists) ? res.data.lists : []);
-        const shaped = lists.map((l) => ({ uri: l?.uri, name: l?.name }));
-        try { composer.setLists?.(shaped); } catch {}
-      } catch (err) {
-        try { composer.setListsError?.(err?.message || String(err || 'Failed to load lists')); } catch {}
-      }
-    });
+    if (!this._unbindListsRequest) this._unbindListsRequest = bindListsRequest(this.shadowRoot, { limit: 100 });
 
     // If a reply is posted elsewhere into the currently open thread, refresh this view.
     if (!this._replyPostedHandler) {
@@ -126,6 +118,7 @@ export class BskyContentPanel extends HTMLElement {
   }
 
   disconnectedCallback() {
+    if (this._unbindListsRequest) { try { this._unbindListsRequest(); } catch {} this._unbindListsRequest = null; }
     if (this._replyPostedHandler) window.removeEventListener('bsky-reply-posted', this._replyPostedHandler);
   }
 
@@ -174,17 +167,7 @@ export class BskyContentPanel extends HTMLElement {
       // Prefer the throttled global sync (handled centrally), but fall back to a direct sync if the
       // notification bar isn't present/connected.
       try {
-        if (window.BSKY?.cacheAvailable !== false) {
-          const notifBar = document.querySelector('bsky-notification-bar');
-          const canUseThrottledSync = !!(notifBar && notifBar.isConnected);
-
-          if (canUseThrottledSync) {
-            window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 10 } }));
-          } else {
-            await call('cacheSyncRecent', { minutes: 10 });
-            window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes: 30 } }));
-          }
-        }
+        await syncRecent({ minutes: 10, refreshMinutes: 30 });
       } catch {}
 
       // Notify other panels (Posts) to update reply counts / refresh.
@@ -271,17 +254,7 @@ export class BskyContentPanel extends HTMLElement {
 
       // Ensure cached feeds can see the new replies.
       try {
-        if (window.BSKY?.cacheAvailable !== false) {
-          const notifBar = document.querySelector('bsky-notification-bar');
-          const canUseThrottledSync = !!(notifBar && notifBar.isConnected);
-
-          if (canUseThrottledSync) {
-            window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 10 } }));
-          } else {
-            await call('cacheSyncRecent', { minutes: 10 });
-            window.dispatchEvent(new CustomEvent('bsky-refresh-recent', { detail: { minutes: 30 } }));
-          }
-        }
+        await syncRecent({ minutes: 10, refreshMinutes: 30 });
       } catch {}
 
       // Notify other panels (Posts) to update reply counts / refresh.
@@ -432,12 +405,16 @@ export class BskyContentPanel extends HTMLElement {
     if (view === 'likes') dids = (this._eng.likes || []).map((i) => i.did);
     else if (view === 'reposts') dids = (this._eng.reposts || []).map((i) => i.did);
     else if (view === 'quotes') dids = (this._eng.quotes || []).map((p) => p?.author?.did);
-    dids = Array.from(new Set(dids.filter(Boolean))).filter((d) => !followMap[d]?.following);
+    dids = Array.from(new Set(dids.filter(Boolean))).filter((d) => !followMap[d]?.following && !followMap[d]?.queued);
     if (!dids.length) return;
     try {
-      await call('followMany', { dids });
+      const res = await queueFollows(dids, { processNow: true, maxNow: 50, maxPerTick: 50 });
+      const processed = res?.processed?.results || {};
       const next = { ...(followMap || {}) };
-      dids.forEach((d) => { next[d] = { following: true }; });
+      dids.forEach((d) => {
+        const ok = !!processed?.[d]?.ok;
+        next[d] = ok ? { following: true } : { ...(next[d] || {}), queued: true };
+      });
       this._eng.followMap = next;
       this.render();
     } catch (e) {
@@ -460,9 +437,10 @@ export class BskyContentPanel extends HTMLElement {
 
     const followAllDisabled = (() => {
       const m = this._eng.followMap || {};
-      if (view === 'likes') return (this._eng.likes || []).every((i) => !i?.did || m[i.did]?.following);
-      if (view === 'reposts') return (this._eng.reposts || []).every((i) => !i?.did || m[i.did]?.following);
-      if (view === 'quotes') return (this._eng.quotes || []).every((p) => !p?.author?.did || m[p.author.did]?.following);
+      const doneish = (did) => !!m?.[did]?.following || !!m?.[did]?.queued;
+      if (view === 'likes') return (this._eng.likes || []).every((i) => !i?.did || doneish(i.did));
+      if (view === 'reposts') return (this._eng.reposts || []).every((i) => !i?.did || doneish(i.did));
+      if (view === 'quotes') return (this._eng.quotes || []).every((p) => !p?.author?.did || doneish(p.author.did));
       return true;
     })();
 
@@ -471,6 +449,7 @@ export class BskyContentPanel extends HTMLElement {
       return (items || []).map((i) => {
         const did = String(i?.did || '');
         const following = !!m?.[did]?.following;
+        const queued = !!m?.[did]?.queued;
         return `
           <div class="row">
             ${i?.avatar ? `<img class="avatar" src="${esc(i.avatar)}" alt="">` : ''}
@@ -478,7 +457,11 @@ export class BskyContentPanel extends HTMLElement {
               <div class="name">${identityHtml({ did, handle: i?.handle, displayName: i?.displayName }, { showHandle: true, showCopyDid: true })}</div>
               <div class="sub">@${esc(i?.handle || '')}</div>
             </div>
-            ${following ? `<span class="sub">Following</span>` : `<button class="btn" type="button" data-follow-did="${esc(did)}" title="Follow" aria-label="Follow">➕</button>`}
+            ${following
+              ? `<span class="sub">Following</span>`
+              : queued
+                ? `<span class="sub">Queued</span>`
+                : `<button class="btn" type="button" data-follow-did="${esc(did)}" title="Follow" aria-label="Follow">➕</button>`}
           </div>
         `;
       }).join('') || '<div class="muted">No entries.</div>';

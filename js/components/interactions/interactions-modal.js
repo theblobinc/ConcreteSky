@@ -6,6 +6,7 @@ import './other-replies.js';
 import './engagement-lightbox.js';
 import { identityCss, bindCopyClicks } from '../../lib/identity.js';
 import { resolveMentionDidsFromTexts, buildFacetsSafe, defaultLangs } from '../../controllers/compose_controller.js';
+import { syncRecent } from '../../controllers/cache_sync_controller.js';
 
 const postCache   = new Map(); // uri -> post
 const threadCache = new Map(); // uri -> thread
@@ -198,7 +199,7 @@ export class BskyInteractionsModal extends HTMLElement {
 
       // Ask the throttled cache sync to run so cache-based panels can refresh.
       try {
-        window.dispatchEvent(new CustomEvent('bsky-sync-recent', { detail: { minutes: 5 } }));
+        await syncRecent({ minutes: 5, refreshMinutes: 30, allowDirectFallback: false });
       } catch {}
     } catch (e) {
       alert(`Action failed: ${e.message}`);

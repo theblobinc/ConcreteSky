@@ -2,6 +2,7 @@
 import { esc, fmtTime } from './utils.js';
 import { call } from '../../api.js';
 import { identityCss, identityHtml, bindCopyClicks } from '../../lib/identity.js';
+import { queueFollows } from '../../controllers/follow_queue_controller.js';
 
 function sortChronoAsc(items){
   // chronological (oldest → newest)
@@ -90,19 +91,26 @@ export class BskyEngagementLightbox extends HTMLElement {
     } catch (e) { alert('Follow failed: ' + e.message); btn?.removeAttribute('disabled'); }
   }
   async followAll(){
-    const dids = this.state.items.map(i => i.did).filter(did => did && !this.state.followMap[did]?.following);
+    const dids = this.state.items
+      .map(i => i.did)
+      .filter(did => did && !this.state.followMap[did]?.following && !this.state.followMap[did]?.queued);
     if (!dids.length) return;
     const btn = this.shadowRoot.getElementById('follow-all');
     btn?.setAttribute('disabled','disabled');
     try {
-      await call('followMany', { dids });
-      dids.forEach(did => this.state.followMap[did] = { following:true });
+      const res = await queueFollows(dids, { processNow: true, maxNow: 50, maxPerTick: 50 });
+      const processed = res?.processed?.results || {};
+      dids.forEach((did) => {
+        const ok = !!processed?.[did]?.ok;
+        this.state.followMap[did] = ok ? { following: true } : { queued: true };
+      });
       this.render();
     } catch (e) { alert('Bulk follow failed: ' + e.message); btn?.removeAttribute('disabled'); }
   }
 
   render(){
     const { open, type, items, followMap } = this.state;
+    const followAllDisabled = items.every((i) => !i?.did || followMap[i.did]?.following || followMap[i.did]?.queued);
     this.shadowRoot.innerHTML = open ? `
       <style>
         #overlay{ position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; z-index:999999; }
@@ -136,7 +144,7 @@ export class BskyEngagementLightbox extends HTMLElement {
           <div class="head">
             <div class="title">${type === 'likes' ? 'Likes' : type === 'reposts' ? 'Reposts' : 'Replies'}</div>
             <div style="display:flex; gap:8px">
-              <button id="follow-all" ${items.every(i => followMap[i.did]?.following) ? 'disabled' : ''}>Follow all</button>
+              <button id="follow-all" ${followAllDisabled ? 'disabled' : ''}>Follow all</button>
               <button id="close">✕</button>
             </div>
           </div>
@@ -151,6 +159,8 @@ export class BskyEngagementLightbox extends HTMLElement {
                 </div>
                 ${followMap[i.did]?.following
                   ? '<span class="sub">Following</span>'
+                  : followMap[i.did]?.queued
+                    ? '<span class="sub">Queued</span>'
                   : `<button class="btn" data-follow-did="${esc(i.did)}">Follow</button>`}
               </div>
             `).join('') || '<div class="sub" style="padding:8px">No entries.</div>'}

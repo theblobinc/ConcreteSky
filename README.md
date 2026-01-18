@@ -47,7 +47,16 @@ If you move the single page in the Concrete dashboard, the OAuth URLs and API pa
 3. Use the UI Connect flow (OAuth) to attach a Bluesky account.
 4. Use the account manager to switch between connected accounts (stored per Concrete user).
 
+## Documentation
+
+- UI/web-component + backend JSON API surfaces: `API.md`
+- Panel system framework + utilities: `PANELS_API.md`
+- Search router / HUD query language: `SEARCH.md`
+- Roadmap / status: `TODO.md`
+
 ## API (how the SPA talks to PHP)
+
+Canonical UI API documentation lives in `API.md` (this README includes only a short overview).
 
 The frontend calls `/concretesky/api` with JSON like:
 
@@ -68,6 +77,8 @@ Notable methods (see `controllers/single_page/concretesky/api.php` for the compl
 - Profiles: `getProfile`, `getProfiles`, `profilesHydrate`, `cacheGetProfiles`, `searchActors`
 - Feeds/posts: `getTimeline`, `getAuthorFeed`, `getPosts`, `getPostThread`, `searchPosts`, `getFeed`, `createPost`, `deletePost`
 - Social: `getFollowers`, `getFollows`, `getRelationships`, `follow`, `unfollow`, `block`, `unblock`, `mute`, `unmute`
+- Bulk follows: `queueFollows`, `followQueueStatus`, `processFollowQueue`
+   - Bulk follow actions are durable (queued in SQLite) and rate-limit aware.
 - Notifications: `listNotifications`, `updateSeenNotifications`, `listNotificationsSince`, `followMany`
 - Cache: `cacheStatus`, `cacheSync` (+ other `cache*` helpers)
 
@@ -82,6 +93,21 @@ You can change the subdirectory name with:
 - `BSKY_STORAGE_SUBDIR=concretesky`
 
 Back-compat: if `application/files/bluesky_feed/` exists and `BSKY_STORAGE_SUBDIR` is left at the default, ConcreteSky will continue using the legacy directory.
+
+## Automated jobs (background processing)
+
+ConcreteSky includes ConcreteCMS jobs for maintenance and long-running work.
+
+- Cache maintenance: `jobs/concretesky_cache_maintenance.php`
+   - Keeps `cache.sqlite` healthy/bounded (prune/vacuum style work).
+- Follow queue processor: `jobs/concretesky_follow_queue_processor.php`
+   - Drains queued follows server-side so it continues working even after the browser tab closes.
+
+Run via CLI (cron-friendly):
+
+- `php concrete/bin/concrete5 c5:job --list`
+- `php concrete/bin/concrete5 c5:job concretesky_cache_maintenance`
+- `php concrete/bin/concrete5 c5:job concretesky_follow_queue_processor`
 
 ## Configuration (.env)
 
@@ -148,7 +174,7 @@ Optional (off by default): `mcpLogin` can convert a valid JWT into a Concrete se
 - Entry: `js/main.js`
 - Top-level shell Web Component: `js/app/bsky_app.js`
 - Most UI is Web Components under `js/components/` and the panel system under `js/panels/`.
-- Panel framework docs: `js/panels/API.md`
+- Panel framework docs: `PANELS_API.md`
 
 ## Troubleshooting
 

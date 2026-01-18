@@ -2,7 +2,8 @@
 
 ## Planned features
 
-- Panel API docs: keep `API.md` current as new hooks are added.
+- Panel API docs: keep `PANELS_API.md` current as new hooks are added.
+
 - Standardize stable keys: all list-like components should use `data-k` for scroll anchoring.
 - Virtualization for long lists (connections/notifications/posts) to reduce DOM size.
 - Better “exhausted” UX for infinite scroll (explicit end-of-feed states per panel).
@@ -44,7 +45,7 @@ This is the roadmap for improving the ConcreteSky panel system and adding upcomi
 ## Panel Templates / Registry (Foundation)
 
 ### 4) Standardize panel templates
-- Templates live in: `packages/concretesky/js/panels/templates/`
+- Templates live in: `js/panels/templates/`
 - Each template exports:
   - `name` (must match `data-tab` / `data-panel`)
   - `title` (tab label)
@@ -54,7 +55,7 @@ This is the roadmap for improving the ConcreteSky panel system and adding upcomi
 Example template:
 
 ```js
-// packages/concretesky/js/panels/templates/notifications.js
+// js/panels/templates/notifications.js
 export default {
   name: 'notifications',
   title: 'Notifications',
@@ -64,7 +65,7 @@ export default {
 ```
 
 ### 5) Standardize panel utilities
-- Shared utilities live in: `packages/concretesky/js/panels/panel_api.js`
+- Shared utilities live in: `js/panels/panel_api.js`
 - Keep it framework-free; provide small helpers panels can share:
   - `registerPanelTemplate()` / `getPanelTemplates()`
   - `getDefaultActiveTabs()`
@@ -89,19 +90,19 @@ this._unbindNearBottom = bindNearBottom(scroller, () => this.load(false), {
 ## Notifications Panel (High Priority)
 
 ### 6) Add a Notifications panel template
-- Add: `packages/concretesky/js/panels/templates/notifications.js`
+- Add: `js/panels/templates/notifications.js`
 - Register in `panel_api.js`
 
 Code:
 
 ```js
-// packages/concretesky/js/panels/panel_api.js
+// js/panels/panel_api.js
 import notifications from './templates/notifications.js';
 registerPanelTemplate(notifications);
 ```
 
 ### 7) Implement `<bsky-notifications>` component
-- File: `packages/concretesky/js/components/notifications.js` (already exists but needs “panel shell parity” and UX).
+- File: `js/components/notifications.js` (already exists but needs “panel shell parity” and UX).
 - Requirements:
   - Display grouped/filtered notifications (mentions, replies, likes, reposts, follows).
   - Mark as read/unread.
@@ -112,7 +113,7 @@ registerPanelTemplate(notifications);
 Skeleton:
 
 ```js
-// packages/concretesky/js/components/notifications.js
+// js/components/notifications.js
 import { call } from '../api.js';
 import { bindNearBottom, debounce } from '../panels/panel_api.js';
 
@@ -175,13 +176,13 @@ Acceptance criteria:
 ## Content Panel (Post Details) (High Priority)
 
 ### 8) Add a “content” panel template
-- Template: `packages/concretesky/js/panels/templates/content.js`
+- Template: `js/panels/templates/content.js`
 - Mounted component: `<bsky-content-panel>` (new).
 
 Template:
 
 ```js
-// packages/concretesky/js/panels/templates/content.js
+// js/panels/templates/content.js
 export default {
   name: 'content',
   title: 'Content',
@@ -229,7 +230,7 @@ this.shadowRoot.addEventListener('bsky-open-content', (e) => {
 Content panel skeleton:
 
 ```js
-// packages/concretesky/js/components/content_panel.js
+// js/components/content_panel.js
 import { call } from '../api.js';
 
 class BskyContentPanel extends HTMLElement {
@@ -282,7 +283,7 @@ Acceptance criteria:
 Skeleton:
 
 ```js
-// packages/concretesky/js/components/comment_composer.js
+// js/components/comment_composer.js
 import { call } from '../api.js';
 
 class BskyCommentComposer extends HTMLElement {
@@ -364,7 +365,7 @@ customElements.define('bsky-comment-composer', BskyCommentComposer);
   Skeleton:
 
   ```js
-  // packages/concretesky/js/components/thread_tree.js
+  // js/components/thread_tree.js
   class BskyThreadTree extends HTMLElement {
     constructor(){
       super();

@@ -6,6 +6,21 @@ Thanks for contributing to ConcreteSky.
 
 This repo is intended to contain the ConcreteSky package folder contents (the code that normally lives at `packages/concretesky/` in a Concrete site).
 
+## Documentation expectations
+
+ConcreteSky keeps its canonical docs in the package folder so they can ship alongside the code.
+
+When you change behavior, please update the matching docs:
+
+- UI/web-component + backend JSON API surfaces: `API.md`
+- Panel system contract: `PANELS_API.md`
+- Search router / HUD query language: `SEARCH.md`
+
+If you add or change environment variables, update:
+
+- `.env.example`
+- `README.md` (and `API.md` if it affects jobs/rate limits)
+
 ## Development workflow
 
 - Prefer small, focused PRs.
@@ -31,7 +46,16 @@ At minimum:
 
 - PHP: `php -l controllers/single_page/concretesky/api.php`
 
+If you changed auth/session behavior, also lint:
+
+- PHP: `php -l controllers/single_page/concretesky.php`
+
 If you change frontend behavior, please also spot-check the SPA in a browser.
+
+If you changed background processing (jobs, follow queue, cache maintenance), run the jobs once via CLI:
+
+- `php concrete/bin/concrete5 c5:job concretesky_cache_maintenance`
+- `php concrete/bin/concrete5 c5:job concretesky_follow_queue_processor`
 
 ## Licensing
 

@@ -1,5 +1,7 @@
 # Panels API
 
+This document lives in the package root so all ConcreteSky docs sit next to `TODO.md`.
+
 This folder defines the ConcreteSky “panel system”: a small framework-free set of utilities + templates that mount Web Components inside a consistent panel shell.
 
 ## Concepts
@@ -23,7 +25,7 @@ This is the contract used by `captureScrollAnchor()` / `applyScrollAnchor()`.
 
 ## Templates / Registry
 
-Templates live in `packages/concretesky/js/panels/templates/`.
+Templates live in `js/panels/templates/`.
 
 Each template is a small object:
 

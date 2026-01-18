@@ -1,4 +1,9 @@
-This folder contains the HUD-driven search router.
+This doc covers the HUD-driven search router.
+
+Implementation lives in `js/search/`:
+
+- `js/search/query.js`
+- `js/search/search_bus.js`
 
 - `query.js`: parses a lightweight query language and compiles a matcher (used by panels for client-side filtering).
 - `search_bus.js`: global event used by panels to react to HUD search changes.
@@ -19,8 +24,9 @@ Recommended approach:
 ### Example: listen + filter client-side
 
 ```js
-import { BSKY_SEARCH_EVENT } from './search_bus.js';
-import { compileSearchMatcher } from './query.js';
+// NOTE: adjust the relative path based on where your component file lives.
+import { BSKY_SEARCH_EVENT } from '../search/search_bus.js';
+import { compileSearchMatcher } from '../search/query.js';
 
 // inside a panel component
 this._onSearchChanged = (e) => {
@@ -47,7 +53,7 @@ window.addEventListener(BSKY_SEARCH_EVENT, this._onSearchChanged);
 Notes:
 
 - Regex mode (`/.../i`) is intentionally constrained; do not apply it to extremely large strings.
-- If your list re-renders frequently, prefer stable item keys (`data-k`) + scroll anchor helpers (see `js/panels/API.md`).
+- If your list re-renders frequently, prefer stable item keys (`data-k`) + scroll anchor helpers (see `PANELS_API.md`).
 
 ## Query syntax (v1)
 
