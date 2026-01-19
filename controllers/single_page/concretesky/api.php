@@ -27,7 +27,7 @@ class Api extends ParentController
      * Bump this when the cache schema/migration logic changes.
      * Stored in meta as __global__:schema_version so we can skip costly PRAGMA checks on every request.
      */
-    protected const CACHE_SCHEMA_VERSION = '2026-01-18-5';
+    protected const CACHE_SCHEMA_VERSION = '2026-01-18-9';
 
     protected static bool $envLoaded = false;
 
@@ -1156,17 +1156,23 @@ class Api extends ParentController
                     $this->cacheMigrate($pdo);
 
                     if ($groupId > 0) {
-                        $st = $pdo->prepare('SELECT g.group_id, g.slug, g.name, g.description, g.visibility, g.owner_did, g.created_at, g.updated_at,
+                        $st = $pdo->prepare('SELECT g.group_id, g.slug, g.name, g.description, g.rules_md, g.rules_updated_at, g.post_cooldown_seconds, g.visibility, g.owner_did, g.created_at, g.updated_at,
                             (SELECT COUNT(1) FROM group_members gm WHERE gm.group_id = g.group_id AND gm.state = "member") AS members_count,
                             (SELECT gm.state FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_state,
-                            (SELECT gm.role FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_role
+                            (SELECT gm.role FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_role,
+                            (SELECT gm.rules_accepted_at FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_rules_accepted_at,
+                            (SELECT gm.suspended_until FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_suspended_until,
+                            (SELECT gm.banned_at FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_banned_at
                             FROM groups g WHERE g.group_id = :id LIMIT 1');
                         $st->execute([':id' => $groupId, ':me' => $meDid]);
                     } else {
-                        $st = $pdo->prepare('SELECT g.group_id, g.slug, g.name, g.description, g.visibility, g.owner_did, g.created_at, g.updated_at,
+                        $st = $pdo->prepare('SELECT g.group_id, g.slug, g.name, g.description, g.rules_md, g.rules_updated_at, g.post_cooldown_seconds, g.visibility, g.owner_did, g.created_at, g.updated_at,
                             (SELECT COUNT(1) FROM group_members gm WHERE gm.group_id = g.group_id AND gm.state = "member") AS members_count,
                             (SELECT gm.state FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_state,
-                            (SELECT gm.role FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_role
+                            (SELECT gm.role FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_role,
+                            (SELECT gm.rules_accepted_at FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_rules_accepted_at,
+                            (SELECT gm.suspended_until FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_suspended_until,
+                            (SELECT gm.banned_at FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_banned_at
                             FROM groups g WHERE g.slug = :slug LIMIT 1');
                         $st->execute([':slug' => $slug, ':me' => $meDid]);
                     }
@@ -1285,6 +1291,204 @@ class Api extends ParentController
                     return $this->json(['ok' => true, 'updated' => 1]);
                 }
 
+                case 'groupRulesAccept': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    if ($groupId <= 0) return $this->json(['error' => 'Missing groupId'], 400);
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $stG = $pdo->prepare('SELECT rules_md FROM groups WHERE group_id = :g LIMIT 1');
+                    $stG->execute([':g' => $groupId]);
+                    $rulesMd = (string)($stG->fetchColumn() ?: '');
+                    if ($rulesMd === '' || trim($rulesMd) === '') {
+                        return $this->json(['error' => 'This group has no rules to accept'], 400);
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $st = $pdo->prepare('UPDATE group_members
+                            SET rules_accepted_at = :t, updated_at = :t
+                            WHERE group_id = :g AND member_did = :me AND state IN ("member","pending")');
+                        $st->execute([':g' => $groupId, ':me' => $meDid, ':t' => $now]);
+                        if ($st->rowCount() < 1) {
+                            $pdo->rollBack();
+                            return $this->json(['error' => 'Membership required'], 403);
+                        }
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $meDid,
+                            ':act' => 'group.rules.accept',
+                            ':sub' => $meDid,
+                            ':det' => null,
+                            ':t' => $now,
+                        ]);
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true, 'groupId' => $groupId, 'acceptedAt' => $now]);
+                }
+
+                case 'groupRulesUpdate': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    if ($groupId <= 0) return $this->json(['error' => 'Missing groupId'], 400);
+
+                    $rulesMd = array_key_exists('rulesMd', (array)$params) ? (string)($params['rulesMd'] ?? '') : null;
+                    if ($rulesMd === null) return $this->json(['error' => 'Missing rulesMd'], 400);
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $meDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $stHave = $pdo->prepare('SELECT rules_md FROM groups WHERE group_id = :g LIMIT 1');
+                    $stHave->execute([':g' => $groupId]);
+                    $curRules = $stHave->fetchColumn();
+                    if ($curRules === false) return $this->json(['error' => 'Group not found'], 404);
+
+                    $curRulesStr = (string)($curRules ?? '');
+                    if ($curRulesStr === (string)$rulesMd) {
+                        return $this->json(['ok' => true, 'updated' => 0]);
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $pdo->prepare('UPDATE groups SET rules_md = :md, rules_updated_at = :t, updated_at = :t WHERE group_id = :g')
+                            ->execute([':md' => ($rulesMd === '' ? null : $rulesMd), ':t' => $now, ':g' => $groupId]);
+
+                        // If rules changed, require members to re-accept (site-local).
+                        $pdo->prepare('UPDATE group_members SET rules_accepted_at = NULL, updated_at = :t WHERE group_id = :g')
+                            ->execute([':g' => $groupId, ':t' => $now]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $meDid,
+                            ':act' => 'group.rules.update',
+                            ':sub' => (string)$groupId,
+                            ':det' => json_encode(['len' => strlen((string)$rulesMd)], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true, 'updated' => 1, 'rulesUpdatedAt' => $now]);
+                }
+
+                case 'groupPostingSettingsUpdate': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    if ($groupId <= 0) return $this->json(['error' => 'Missing groupId'], 400);
+
+                    $cooldown = isset($params['postCooldownSeconds']) ? (int)$params['postCooldownSeconds'] : 0;
+                    if ($cooldown < 0) $cooldown = 0;
+                    if ($cooldown > 86400) $cooldown = 86400;
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $meDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $stHave = $pdo->prepare('SELECT post_cooldown_seconds FROM groups WHERE group_id = :g LIMIT 1');
+                    $stHave->execute([':g' => $groupId]);
+                    $cur = $stHave->fetchColumn();
+                    if ($cur === false) return $this->json(['error' => 'Group not found'], 404);
+                    $curI = (int)($cur ?? 0);
+                    if ($curI === $cooldown) return $this->json(['ok' => true, 'updated' => 0]);
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $pdo->prepare('UPDATE groups SET post_cooldown_seconds = :c, updated_at = :t WHERE group_id = :g')
+                            ->execute([':c' => $cooldown, ':t' => $now, ':g' => $groupId]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $meDid,
+                            ':act' => 'group.posting.update',
+                            ':sub' => (string)$groupId,
+                            ':det' => json_encode(['postCooldownSeconds' => $cooldown], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true, 'updated' => 1, 'postCooldownSeconds' => $cooldown]);
+                }
+
                 case 'groupJoin': {
                     $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
                     if ($groupId <= 0) return $this->json(['error' => 'Missing groupId'], 400);
@@ -1296,6 +1500,20 @@ class Api extends ParentController
 
                     $pdo = $this->cacheDb();
                     $this->cacheMigrate($pdo);
+
+                    // Banned users cannot re-join.
+                    try {
+                        $stBan = $pdo->prepare('SELECT state, banned_at FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stBan->execute([':g' => $groupId, ':did' => $meDid]);
+                        $banRow = $stBan->fetch(\PDO::FETCH_ASSOC);
+                        $banState = (string)($banRow['state'] ?? '');
+                        $banAt = (string)($banRow['banned_at'] ?? '');
+                        if ($banState === 'blocked' || $banAt !== '') {
+                            return $this->json(['error' => 'You are banned from this group', 'code' => 'banned'], 403);
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
 
                     $stG = $pdo->prepare('SELECT visibility FROM groups WHERE group_id = :g LIMIT 1');
                     $stG->execute([':g' => $groupId]);
@@ -1476,6 +1694,108 @@ class Api extends ParentController
                     return $this->json(['ok' => true, 'groupId' => $groupId, 'items' => $items, 'nextBefore' => $nextBefore]);
                 }
 
+                case 'groupAuditExport': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    if ($groupId <= 0) return $this->json(['error' => 'Missing groupId'], 400);
+
+                    $format = strtolower(trim((string)($params['format'] ?? 'json')));
+                    if (!in_array($format, ['json', 'csv'], true)) $format = 'json';
+
+                    $limit = isset($params['limit']) ? (int)$params['limit'] : 1000;
+                    if ($limit < 1) $limit = 1;
+                    if ($limit > 5000) $limit = 5000;
+
+                    $before = isset($params['before']) ? trim((string)$params['before']) : '';
+                    if ($before === '') $before = null;
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    // Access control: public groups are visible; closed/secret require membership (or superuser).
+                    $stG = $pdo->prepare('SELECT g.slug, g.visibility,
+                        (SELECT gm.state FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_state
+                        FROM groups g WHERE g.group_id = :g LIMIT 1');
+                    $stG->execute([':g' => $groupId, ':me' => $meDid]);
+                    $g = $stG->fetch(\PDO::FETCH_ASSOC);
+                    if (!$g) return $this->json(['error' => 'Group not found'], 404);
+                    $slug = (string)($g['slug'] ?? '');
+                    $vis = (string)($g['visibility'] ?? 'public');
+                    if (!in_array($vis, ['public', 'closed', 'secret'], true)) $vis = 'public';
+                    $myState = (string)($g['my_state'] ?? '');
+                    if (!$meIsSuper && $vis !== 'public' && $myState !== 'member') {
+                        return $this->json(['error' => 'Membership required'], 403);
+                    }
+
+                    if ($before !== null) {
+                        $st = $pdo->prepare('SELECT id, group_id, actor_did, action, subject, detail, created_at
+                            FROM group_audit
+                            WHERE group_id = :g AND created_at < :before
+                            ORDER BY created_at DESC, id DESC
+                            LIMIT :lim');
+                        $st->bindValue(':g', $groupId, \PDO::PARAM_INT);
+                        $st->bindValue(':before', $before, \PDO::PARAM_STR);
+                        $st->bindValue(':lim', $limit, \PDO::PARAM_INT);
+                        $st->execute();
+                    } else {
+                        $st = $pdo->prepare('SELECT id, group_id, actor_did, action, subject, detail, created_at
+                            FROM group_audit
+                            WHERE group_id = :g
+                            ORDER BY created_at DESC, id DESC
+                            LIMIT :lim');
+                        $st->bindValue(':g', $groupId, \PDO::PARAM_INT);
+                        $st->bindValue(':lim', $limit, \PDO::PARAM_INT);
+                        $st->execute();
+                    }
+
+                    $items = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+                    $safeSlug = preg_replace('/[^a-z0-9_\-]+/i', '_', $slug ?: ('group_' . $groupId));
+                    $ts = gmdate('Ymd_His');
+                    $filename = 'group_audit_' . $safeSlug . '_' . $ts . '.' . $format;
+
+                    if ($format === 'csv') {
+                        $fh = fopen('php://temp', 'w+');
+                        if ($fh === false) return $this->json(['error' => 'Could not create export buffer'], 500);
+
+                        fputcsv($fh, ['id', 'group_id', 'actor_did', 'action', 'subject', 'detail', 'created_at']);
+                        foreach ($items as $it) {
+                            fputcsv($fh, [
+                                (string)($it['id'] ?? ''),
+                                (string)($it['group_id'] ?? ''),
+                                (string)($it['actor_did'] ?? ''),
+                                (string)($it['action'] ?? ''),
+                                (string)($it['subject'] ?? ''),
+                                (string)($it['detail'] ?? ''),
+                                (string)($it['created_at'] ?? ''),
+                            ]);
+                        }
+                        rewind($fh);
+                        $csv = stream_get_contents($fh);
+                        fclose($fh);
+                        if ($csv === false) $csv = '';
+                        return $this->json(['ok' => true, 'groupId' => $groupId, 'format' => 'csv', 'filename' => $filename, 'csv' => $csv, 'count' => count($items)]);
+                    }
+
+                    return $this->json(['ok' => true, 'groupId' => $groupId, 'format' => 'json', 'filename' => $filename, 'items' => $items, 'count' => count($items)]);
+                }
+
                 case 'groupPostSubmit': {
                     $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
                     if ($groupId <= 0) return $this->json(['error' => 'Missing groupId'], 400);
@@ -1504,8 +1824,12 @@ class Api extends ParentController
                     $pdo = $this->cacheDb();
                     $this->cacheMigrate($pdo);
 
-                    $stG = $pdo->prepare('SELECT g.slug, g.visibility,
-                        (SELECT gm.state FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_state
+                    $stG = $pdo->prepare('SELECT g.slug, g.visibility, g.rules_md, g.post_cooldown_seconds,
+                        (SELECT gm.state FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_state,
+                        (SELECT gm.role FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_role,
+                        (SELECT gm.rules_accepted_at FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_rules_accepted_at,
+                        (SELECT gm.suspended_until FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_suspended_until,
+                        (SELECT gm.banned_at FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_banned_at
                         FROM groups g WHERE g.group_id = :g LIMIT 1');
                     $stG->execute([':g' => $groupId, ':me' => $meDid]);
                     $g = $stG->fetch(\PDO::FETCH_ASSOC);
@@ -1514,9 +1838,51 @@ class Api extends ParentController
                     $vis = (string)($g['visibility'] ?? 'public');
                     if (!in_array($vis, ['public', 'closed', 'secret'], true)) $vis = 'public';
                     $myState = (string)($g['my_state'] ?? '');
+                    $rulesMd = (string)($g['rules_md'] ?? '');
+                    $myRulesAcceptedAt = (string)($g['my_rules_accepted_at'] ?? '');
+                    $myRole = (string)($g['my_role'] ?? '');
+                    $cooldownSeconds = (int)($g['post_cooldown_seconds'] ?? 0);
+                    $suspendedUntil = (string)($g['my_suspended_until'] ?? '');
+                    $bannedAt = (string)($g['my_banned_at'] ?? '');
 
-                    if (!$meIsSuper && $myState !== 'member') {
-                        return $this->json(['error' => 'Membership required'], 403);
+                    if (!$meIsSuper) {
+                        if ($bannedAt !== '') {
+                            return $this->json(['error' => 'You are banned from this group', 'code' => 'banned'], 403);
+                        }
+                        if ($suspendedUntil !== '') {
+                            $suTs = strtotime($suspendedUntil);
+                            if ($suTs && $suTs > time()) {
+                                $retry = $suTs - time();
+                                if ($retry < 1) $retry = 1;
+                                return $this->json(['error' => 'You are suspended from posting in this group', 'code' => 'suspended', 'retryAfterSeconds' => $retry], 403);
+                            }
+                        }
+
+                        if ($myState !== 'member') {
+                            return $this->json(['error' => 'Membership required'], 403);
+                        }
+
+                        $hasRules = trim($rulesMd) !== '';
+                        if ($hasRules && $myRulesAcceptedAt === '') {
+                            return $this->json(['error' => 'You must accept the group rules before posting', 'code' => 'rules_required'], 403);
+                        }
+
+                        // Slow-mode: enforce minimum seconds between submissions for non-mod members.
+                        if ($cooldownSeconds > 0 && !in_array($myRole, ['admin', 'moderator'], true)) {
+                            $stLast = $pdo->prepare('SELECT created_at FROM group_posts WHERE group_id = :g AND author_did = :me ORDER BY post_id DESC LIMIT 1');
+                            $stLast->execute([':g' => $groupId, ':me' => $meDid]);
+                            $lastAt = (string)($stLast->fetchColumn() ?: '');
+                            $lastTs = $lastAt !== '' ? strtotime($lastAt) : 0;
+                            if ($lastTs > 0) {
+                                $nowTs = time();
+                                $delta = $nowTs - $lastTs;
+                                if ($delta < $cooldownSeconds) {
+                                    $retry = $cooldownSeconds - $delta;
+                                    if ($retry < 1) $retry = 1;
+                                    return $this->json(['error' => 'Slow mode: please wait before posting again', 'code' => 'slow_mode', 'retryAfterSeconds' => $retry], 429);
+                                }
+                            }
+                        }
                     }
 
                     // Stable group tag (MVP): #csky_<slug> with normalization.
@@ -1537,6 +1903,30 @@ class Api extends ParentController
 
                     $now = gmdate('c');
                     $requiresApproval = ($vis === 'closed' || $vis === 'secret');
+
+                    // Phrase filters can force require-approval or deny.
+                    try {
+                        $stF = $pdo->prepare('SELECT phrase, action FROM group_phrase_filters WHERE group_id = :g');
+                        $stF->execute([':g' => $groupId]);
+                        $filters = $stF->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+                        if ($filters) {
+                            $lower = mb_strtolower($text, 'UTF-8');
+                            foreach ($filters as $f) {
+                                $phrase = trim((string)($f['phrase'] ?? ''));
+                                if ($phrase === '') continue;
+                                $action = (string)($f['action'] ?? 'require_approval');
+                                $pLower = mb_strtolower($phrase, 'UTF-8');
+                                if ($pLower !== '' && mb_strpos($lower, $pLower, 0, 'UTF-8') !== false) {
+                                    if ($action === 'deny') {
+                                        return $this->json(['error' => 'Post blocked by group filter', 'blockedPhrase' => $phrase], 403);
+                                    }
+                                    $requiresApproval = true;
+                                }
+                            }
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore filter failures; do not block posting
+                    }
 
                     $pdo->beginTransaction();
                     try {
@@ -2025,6 +2415,374 @@ class Api extends ParentController
                     return $this->json(['ok' => true, 'groupId' => $groupId, 'uri' => $uri]);
                 }
 
+                case 'groupPhraseFiltersList': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    if ($groupId <= 0) return $this->json(['error' => 'Missing groupId'], 400);
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    // Allow listing for members (publicly visible filters are OK for MVP).
+                    $st = $pdo->prepare('SELECT phrase, action, created_by_did, created_at FROM group_phrase_filters WHERE group_id = :g ORDER BY phrase ASC');
+                    $st->execute([':g' => $groupId]);
+                    $items = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+                    return $this->json(['ok' => true, 'groupId' => $groupId, 'items' => $items]);
+                }
+
+                case 'groupPhraseFilterAdd': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $phrase = trim((string)($params['phrase'] ?? ''));
+                    $action = trim((string)($params['action'] ?? 'require_approval'));
+                    if ($groupId <= 0 || $phrase === '') return $this->json(['error' => 'Missing groupId/phrase'], 400);
+                    if (!in_array($action, ['require_approval', 'deny'], true)) $action = 'require_approval';
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $meDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $pdo->prepare('INSERT OR REPLACE INTO group_phrase_filters(group_id, phrase, action, created_by_did, created_at)
+                            VALUES(:g,:p,:a,:d,:t)')->execute([
+                            ':g' => $groupId,
+                            ':p' => $phrase,
+                            ':a' => $action,
+                            ':d' => $meDid,
+                            ':t' => $now,
+                        ]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $meDid,
+                            ':act' => 'group.filter.add',
+                            ':sub' => $phrase,
+                            ':det' => json_encode(['action' => $action], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true, 'groupId' => $groupId, 'phrase' => $phrase, 'action' => $action]);
+                }
+
+                case 'groupPhraseFilterRemove': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $phrase = trim((string)($params['phrase'] ?? ''));
+                    if ($groupId <= 0 || $phrase === '') return $this->json(['error' => 'Missing groupId/phrase'], 400);
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $meDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $pdo->prepare('DELETE FROM group_phrase_filters WHERE group_id = :g AND phrase = :p')
+                            ->execute([':g' => $groupId, ':p' => $phrase]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $meDid,
+                            ':act' => 'group.filter.remove',
+                            ':sub' => $phrase,
+                            ':det' => json_encode(new \stdClass(), JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true, 'groupId' => $groupId, 'phrase' => $phrase]);
+                }
+
+                case 'groupReportCreate': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $uri = trim((string)($params['uri'] ?? ''));
+                    $reason = isset($params['reason']) ? trim((string)$params['reason']) : null;
+                    if ($groupId <= 0 || $uri === '') return $this->json(['error' => 'Missing groupId/uri'], 400);
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    // For closed/secret groups: membership required to file reports.
+                    $stG = $pdo->prepare('SELECT g.visibility,
+                        (SELECT gm.state FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_state
+                        FROM groups g WHERE g.group_id = :g LIMIT 1');
+                    $stG->execute([':g' => $groupId, ':me' => $meDid]);
+                    $g = $stG->fetch(\PDO::FETCH_ASSOC);
+                    if (!$g) return $this->json(['error' => 'Group not found'], 404);
+                    $vis = (string)($g['visibility'] ?? 'public');
+                    if (!in_array($vis, ['public', 'closed', 'secret'], true)) $vis = 'public';
+                    $myState = (string)($g['my_state'] ?? '');
+                    if (!$meIsSuper && $vis !== 'public' && $myState !== 'member') {
+                        return $this->json(['error' => 'Membership required'], 403);
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $pdo->prepare('INSERT INTO group_reports(group_id, post_uri, reporter_did, reason, state, created_at)
+                            VALUES(:g,:u,:d,:r,"open",:t)')->execute([
+                            ':g' => $groupId,
+                            ':u' => $uri,
+                            ':d' => $meDid,
+                            ':r' => ($reason === '' ? null : $reason),
+                            ':t' => $now,
+                        ]);
+                        $rid = (int)$pdo->lastInsertId();
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $meDid,
+                            ':act' => 'group.report.create',
+                            ':sub' => (string)$rid,
+                            ':det' => json_encode(['uri' => $uri], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+
+                        $pdo->commit();
+                        return $this->json(['ok' => true, 'groupId' => $groupId, 'reportId' => $rid]);
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+                }
+
+                case 'groupReportsList': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    if ($groupId <= 0) return $this->json(['error' => 'Missing groupId'], 400);
+
+                    $state = trim((string)($params['state'] ?? 'open'));
+                    if (!in_array($state, ['open', 'resolved'], true)) $state = 'open';
+
+                    $limit = isset($params['limit']) ? (int)$params['limit'] : 50;
+                    if ($limit < 1) $limit = 1;
+                    if ($limit > 200) $limit = 200;
+
+                    $cursor = isset($params['cursor']) ? (int)$params['cursor'] : 0;
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $meDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $mState = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($mState !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    if ($cursor > 0) {
+                        $st = $pdo->prepare('SELECT report_id, post_uri, reporter_did, reason, state, created_at, resolved_at, resolved_by_did, resolution_note
+                            FROM group_reports
+                            WHERE group_id = :g AND state = :s AND report_id < :c
+                            ORDER BY report_id DESC
+                            LIMIT :lim');
+                        $st->bindValue(':g', $groupId, \PDO::PARAM_INT);
+                        $st->bindValue(':s', $state, \PDO::PARAM_STR);
+                        $st->bindValue(':c', $cursor, \PDO::PARAM_INT);
+                        $st->bindValue(':lim', $limit, \PDO::PARAM_INT);
+                        $st->execute();
+                    } else {
+                        $st = $pdo->prepare('SELECT report_id, post_uri, reporter_did, reason, state, created_at, resolved_at, resolved_by_did, resolution_note
+                            FROM group_reports
+                            WHERE group_id = :g AND state = :s
+                            ORDER BY report_id DESC
+                            LIMIT :lim');
+                        $st->bindValue(':g', $groupId, \PDO::PARAM_INT);
+                        $st->bindValue(':s', $state, \PDO::PARAM_STR);
+                        $st->bindValue(':lim', $limit, \PDO::PARAM_INT);
+                        $st->execute();
+                    }
+
+                    $items = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+                    $next = null;
+                    if ($items) {
+                        $last = $items[count($items) - 1];
+                        $next = !empty($last['report_id']) ? (int)$last['report_id'] : null;
+                    }
+                    return $this->json(['ok' => true, 'groupId' => $groupId, 'state' => $state, 'items' => $items, 'cursor' => $next]);
+                }
+
+                case 'groupReportResolve': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $reportId = isset($params['reportId']) ? (int)$params['reportId'] : 0;
+                    $note = isset($params['note']) ? trim((string)$params['note']) : null;
+                    $hide = !empty($params['hide']);
+                    if ($groupId <= 0 || $reportId <= 0) return $this->json(['error' => 'Missing groupId/reportId'], 400);
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $meDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $mState = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($mState !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $stR = $pdo->prepare('SELECT post_uri, state FROM group_reports WHERE group_id = :g AND report_id = :r LIMIT 1');
+                    $stR->execute([':g' => $groupId, ':r' => $reportId]);
+                    $r = $stR->fetch(\PDO::FETCH_ASSOC);
+                    if (!$r) return $this->json(['error' => 'Report not found'], 404);
+                    if ((string)($r['state'] ?? '') !== 'open') return $this->json(['error' => 'Report not open'], 409);
+                    $postUri = (string)($r['post_uri'] ?? '');
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $pdo->prepare('UPDATE group_reports SET state="resolved", resolved_at=:t, resolved_by_did=:d, resolution_note=:n WHERE group_id=:g AND report_id=:r AND state="open"')
+                            ->execute([':t' => $now, ':d' => $meDid, ':n' => ($note === '' ? null : $note), ':g' => $groupId, ':r' => $reportId]);
+
+                        if ($hide && $postUri !== '') {
+                            $pdo->prepare('INSERT OR REPLACE INTO group_post_hidden(group_id, post_uri, hidden_by_did, hidden_at, note)
+                                VALUES(:g,:u,:d,:t,:n)')->execute([
+                                ':g' => $groupId,
+                                ':u' => $postUri,
+                                ':d' => $meDid,
+                                ':t' => $now,
+                                ':n' => 'hidden via report resolve',
+                            ]);
+                        }
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $meDid,
+                            ':act' => 'group.report.resolve',
+                            ':sub' => (string)$reportId,
+                            ':det' => json_encode(['hide' => $hide, 'uri' => $postUri], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true, 'groupId' => $groupId, 'reportId' => $reportId, 'state' => 'resolved', 'hide' => $hide]);
+                }
+
                 case 'groupPostApprove': {
                     $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
                     $postId = isset($params['postId']) ? (int)$params['postId'] : 0;
@@ -2192,11 +2950,26 @@ class Api extends ParentController
                 }
 
                 case 'groupMembersList': {
-                    // MVP: membership moderation is admin-only.
-                    $this->requireSuperUser($jwt);
-
                     $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
                     if ($groupId <= 0) return $this->json(['error' => 'Missing groupId'], 400);
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
 
                     $state = isset($params['state']) ? trim((string)$params['state']) : '';
                     if ($state !== '' && !in_array($state, ['member', 'pending', 'blocked', 'invited'], true)) {
@@ -2206,15 +2979,30 @@ class Api extends ParentController
                     $pdo = $this->cacheDb();
                     $this->cacheMigrate($pdo);
 
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $meDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $curState = (string)($mr['state'] ?? '');
+                        $curRole = (string)($mr['role'] ?? '');
+                        if ($curState !== 'member' || !in_array($curRole, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
                     $stHave = $pdo->prepare('SELECT group_id FROM groups WHERE group_id = :g LIMIT 1');
                     $stHave->execute([':g' => $groupId]);
                     if ($stHave->fetchColumn() === false) return $this->json(['error' => 'Group not found'], 404);
 
                     if ($state !== '') {
-                        $st = $pdo->prepare('SELECT member_did, state, role, joined_at, created_at, updated_at FROM group_members WHERE group_id = :g AND state = :s ORDER BY created_at ASC');
+                        $st = $pdo->prepare('SELECT member_did, state, role, joined_at, created_at, updated_at,
+                            warn_count, last_warned_at, last_warn_note, suspended_until, suspend_note, banned_at, ban_note
+                            FROM group_members WHERE group_id = :g AND state = :s ORDER BY created_at ASC');
                         $st->execute([':g' => $groupId, ':s' => $state]);
                     } else {
-                        $st = $pdo->prepare('SELECT member_did, state, role, joined_at, created_at, updated_at FROM group_members WHERE group_id = :g ORDER BY created_at ASC');
+                        $st = $pdo->prepare('SELECT member_did, state, role, joined_at, created_at, updated_at,
+                            warn_count, last_warned_at, last_warn_note, suspended_until, suspend_note, banned_at, ban_note
+                            FROM group_members WHERE group_id = :g ORDER BY created_at ASC');
                         $st->execute([':g' => $groupId]);
                     }
                     $rows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
@@ -2222,9 +3010,6 @@ class Api extends ParentController
                 }
 
                 case 'groupMemberApprove': {
-                    // MVP: membership moderation is admin-only.
-                    $this->requireSuperUser($jwt);
-
                     $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
                     $memberDid = trim((string)($params['memberDid'] ?? ''));
                     if ($groupId <= 0 || $memberDid === '') return $this->json(['error' => 'Missing groupId or memberDid'], 400);
@@ -2234,6 +3019,32 @@ class Api extends ParentController
 
                     $pdo = $this->cacheDb();
                     $this->cacheMigrate($pdo);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
 
                     $now = gmdate('c');
                     $pdo->beginTransaction();
@@ -2273,9 +3084,6 @@ class Api extends ParentController
                 }
 
                 case 'groupMemberDeny': {
-                    // MVP: membership moderation is admin-only.
-                    $this->requireSuperUser($jwt);
-
                     $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
                     $memberDid = trim((string)($params['memberDid'] ?? ''));
                     if ($groupId <= 0 || $memberDid === '') return $this->json(['error' => 'Missing groupId or memberDid'], 400);
@@ -2285,6 +3093,32 @@ class Api extends ParentController
 
                     $pdo = $this->cacheDb();
                     $this->cacheMigrate($pdo);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
 
                     $now = gmdate('c');
                     $pdo->beginTransaction();
@@ -2319,6 +3153,425 @@ class Api extends ParentController
 
                         $pdo->commit();
                         return $this->json(['ok' => true]);
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+                }
+
+                case 'groupMemberWarn': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $memberDid = trim((string)($params['memberDid'] ?? ''));
+                    if ($groupId <= 0 || $memberDid === '') return $this->json(['error' => 'Missing groupId or memberDid'], 400);
+
+                    $note = isset($params['note']) ? trim((string)$params['note']) : null;
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $stHave = $pdo->prepare('SELECT member_did FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stHave->execute([':g' => $groupId, ':did' => $memberDid]);
+                        if ($stHave->fetchColumn() === false) {
+                            $pdo->rollBack();
+                            return $this->json(['error' => 'Membership not found'], 404);
+                        }
+
+                        $pdo->prepare('UPDATE group_members
+                            SET warn_count = COALESCE(warn_count, 0) + 1,
+                                last_warned_at = :t,
+                                last_warn_note = :n,
+                                updated_at = :t
+                            WHERE group_id = :g AND member_did = :did')
+                            ->execute([':t' => $now, ':n' => ($note === '' ? null : $note), ':g' => $groupId, ':did' => $memberDid]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $actorDid,
+                            ':act' => 'group.member.warn',
+                            ':sub' => $memberDid,
+                            ':det' => json_encode(['note' => ($note === '' ? null : $note)], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+
+                        $stOut = $pdo->prepare('SELECT member_did, state, role, joined_at, created_at, updated_at,
+                            warn_count, last_warned_at, last_warn_note, suspended_until, suspend_note, banned_at, ban_note
+                            FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stOut->execute([':g' => $groupId, ':did' => $memberDid]);
+                        $member = $stOut->fetch(\PDO::FETCH_ASSOC);
+
+                        $pdo->commit();
+                        return $this->json(['ok' => true, 'groupId' => $groupId, 'member' => $member]);
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+                }
+
+                case 'groupMemberSuspend': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $memberDid = trim((string)($params['memberDid'] ?? ''));
+                    if ($groupId <= 0 || $memberDid === '') return $this->json(['error' => 'Missing groupId or memberDid'], 400);
+
+                    $until = isset($params['until']) ? trim((string)$params['until']) : '';
+                    $seconds = isset($params['suspendSeconds']) ? (int)$params['suspendSeconds'] : 0;
+                    $note = isset($params['note']) ? trim((string)$params['note']) : null;
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    if ($seconds < 0) $seconds = 0;
+                    if ($seconds > 86400 * 365) $seconds = 86400 * 365;
+
+                    $untilIso = '';
+                    if ($seconds > 0) {
+                        $untilIso = gmdate('c', time() + $seconds);
+                    } else {
+                        if ($until === '') return $this->json(['error' => 'Missing until or suspendSeconds'], 400);
+                        $ts = strtotime($until);
+                        if (!$ts) return $this->json(['error' => 'Invalid until'], 400);
+                        if ($ts <= time()) return $this->json(['error' => 'until must be in the future'], 400);
+                        $untilIso = gmdate('c', $ts);
+                    }
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $stHave = $pdo->prepare('SELECT member_did FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stHave->execute([':g' => $groupId, ':did' => $memberDid]);
+                        if ($stHave->fetchColumn() === false) {
+                            $pdo->rollBack();
+                            return $this->json(['error' => 'Membership not found'], 404);
+                        }
+
+                        $pdo->prepare('UPDATE group_members
+                            SET suspended_until = :u,
+                                suspend_note = :n,
+                                updated_at = :t
+                            WHERE group_id = :g AND member_did = :did')
+                            ->execute([':u' => $untilIso, ':n' => ($note === '' ? null : $note), ':t' => $now, ':g' => $groupId, ':did' => $memberDid]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $actorDid,
+                            ':act' => 'group.member.suspend',
+                            ':sub' => $memberDid,
+                            ':det' => json_encode(['until' => $untilIso, 'note' => ($note === '' ? null : $note)], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+
+                        $stOut = $pdo->prepare('SELECT member_did, state, role, joined_at, created_at, updated_at,
+                            warn_count, last_warned_at, last_warn_note, suspended_until, suspend_note, banned_at, ban_note
+                            FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stOut->execute([':g' => $groupId, ':did' => $memberDid]);
+                        $member = $stOut->fetch(\PDO::FETCH_ASSOC);
+
+                        $pdo->commit();
+                        return $this->json(['ok' => true, 'groupId' => $groupId, 'member' => $member]);
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+                }
+
+                case 'groupMemberUnsuspend': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $memberDid = trim((string)($params['memberDid'] ?? ''));
+                    if ($groupId <= 0 || $memberDid === '') return $this->json(['error' => 'Missing groupId or memberDid'], 400);
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $stHave = $pdo->prepare('SELECT member_did FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stHave->execute([':g' => $groupId, ':did' => $memberDid]);
+                        if ($stHave->fetchColumn() === false) {
+                            $pdo->rollBack();
+                            return $this->json(['error' => 'Membership not found'], 404);
+                        }
+
+                        $pdo->prepare('UPDATE group_members
+                            SET suspended_until = NULL,
+                                suspend_note = NULL,
+                                updated_at = :t
+                            WHERE group_id = :g AND member_did = :did')
+                            ->execute([':t' => $now, ':g' => $groupId, ':did' => $memberDid]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $actorDid,
+                            ':act' => 'group.member.unsuspend',
+                            ':sub' => $memberDid,
+                            ':det' => null,
+                            ':t' => $now,
+                        ]);
+
+                        $stOut = $pdo->prepare('SELECT member_did, state, role, joined_at, created_at, updated_at,
+                            warn_count, last_warned_at, last_warn_note, suspended_until, suspend_note, banned_at, ban_note
+                            FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stOut->execute([':g' => $groupId, ':did' => $memberDid]);
+                        $member = $stOut->fetch(\PDO::FETCH_ASSOC);
+
+                        $pdo->commit();
+                        return $this->json(['ok' => true, 'groupId' => $groupId, 'member' => $member]);
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+                }
+
+                case 'groupMemberBan': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $memberDid = trim((string)($params['memberDid'] ?? ''));
+                    if ($groupId <= 0 || $memberDid === '') return $this->json(['error' => 'Missing groupId or memberDid'], 400);
+
+                    $note = isset($params['note']) ? trim((string)$params['note']) : null;
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $stHave = $pdo->prepare('SELECT member_did FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stHave->execute([':g' => $groupId, ':did' => $memberDid]);
+                        if ($stHave->fetchColumn() === false) {
+                            $pdo->rollBack();
+                            return $this->json(['error' => 'Membership not found'], 404);
+                        }
+
+                        $pdo->prepare('UPDATE group_members
+                            SET state = "blocked",
+                                banned_at = :t,
+                                ban_note = :n,
+                                suspended_until = NULL,
+                                suspend_note = NULL,
+                                updated_at = :t
+                            WHERE group_id = :g AND member_did = :did')
+                            ->execute([':t' => $now, ':n' => ($note === '' ? null : $note), ':g' => $groupId, ':did' => $memberDid]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $actorDid,
+                            ':act' => 'group.member.ban',
+                            ':sub' => $memberDid,
+                            ':det' => json_encode(['note' => ($note === '' ? null : $note)], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+
+                        $stOut = $pdo->prepare('SELECT member_did, state, role, joined_at, created_at, updated_at,
+                            warn_count, last_warned_at, last_warn_note, suspended_until, suspend_note, banned_at, ban_note
+                            FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stOut->execute([':g' => $groupId, ':did' => $memberDid]);
+                        $member = $stOut->fetch(\PDO::FETCH_ASSOC);
+
+                        $pdo->commit();
+                        return $this->json(['ok' => true, 'groupId' => $groupId, 'member' => $member]);
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+                }
+
+                case 'groupMemberUnban': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $memberDid = trim((string)($params['memberDid'] ?? ''));
+                    if ($groupId <= 0 || $memberDid === '') return $this->json(['error' => 'Missing groupId or memberDid'], 400);
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $stHave = $pdo->prepare('SELECT member_did FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stHave->execute([':g' => $groupId, ':did' => $memberDid]);
+                        if ($stHave->fetchColumn() === false) {
+                            $pdo->rollBack();
+                            return $this->json(['error' => 'Membership not found'], 404);
+                        }
+
+                        // Unban does not auto-rejoin; member can join again.
+                        $pdo->prepare('UPDATE group_members
+                            SET state = "pending",
+                                joined_at = NULL,
+                                banned_at = NULL,
+                                ban_note = NULL,
+                                updated_at = :t
+                            WHERE group_id = :g AND member_did = :did')
+                            ->execute([':t' => $now, ':g' => $groupId, ':did' => $memberDid]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $actorDid,
+                            ':act' => 'group.member.unban',
+                            ':sub' => $memberDid,
+                            ':det' => null,
+                            ':t' => $now,
+                        ]);
+
+                        $stOut = $pdo->prepare('SELECT member_did, state, role, joined_at, created_at, updated_at,
+                            warn_count, last_warned_at, last_warn_note, suspended_until, suspend_note, banned_at, ban_note
+                            FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stOut->execute([':g' => $groupId, ':did' => $memberDid]);
+                        $member = $stOut->fetch(\PDO::FETCH_ASSOC);
+
+                        $pdo->commit();
+                        return $this->json(['ok' => true, 'groupId' => $groupId, 'member' => $member]);
                     } catch (\Throwable $e) {
                         $pdo->rollBack();
                         throw $e;
@@ -2469,6 +3722,20 @@ class Api extends ParentController
 
                     $groupId = (int)($inv['group_id'] ?? 0);
                     if ($groupId <= 0) return $this->json(['error' => 'Invite token invalid'], 403);
+
+                    // Banned users cannot accept invites.
+                    try {
+                        $stBan = $pdo->prepare('SELECT state, banned_at FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stBan->execute([':g' => $groupId, ':did' => $meDid]);
+                        $banRow = $stBan->fetch(\PDO::FETCH_ASSOC);
+                        $banState = (string)($banRow['state'] ?? '');
+                        $banAt = (string)($banRow['banned_at'] ?? '');
+                        if ($banState === 'blocked' || $banAt !== '') {
+                            return $this->json(['error' => 'You are banned from this group', 'code' => 'banned'], 403);
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
 
                     $now = gmdate('c');
                     $pdo->beginTransaction();
@@ -5485,6 +6752,9 @@ class Api extends ParentController
                 )');
                 $pdo->exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_slug ON groups(slug)');
                 $pdo->exec('CREATE INDEX IF NOT EXISTS idx_groups_owner ON groups(owner_did)');
+                $this->cacheEnsureColumn($pdo, 'groups', 'rules_md', 'TEXT');
+                $this->cacheEnsureColumn($pdo, 'groups', 'rules_updated_at', 'TEXT');
+                $this->cacheEnsureColumn($pdo, 'groups', 'post_cooldown_seconds', 'INTEGER');
 
                 $pdo->exec('CREATE TABLE IF NOT EXISTS group_members (
                     group_id INTEGER NOT NULL,
@@ -5498,6 +6768,16 @@ class Api extends ParentController
                 )');
                 $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_members_group_state ON group_members(group_id, state)');
                 $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_members_member ON group_members(member_did)');
+                $this->cacheEnsureColumn($pdo, 'group_members', 'rules_accepted_at', 'TEXT');
+
+                // Group-local enforcement (warn/suspend/ban).
+                $this->cacheEnsureColumn($pdo, 'group_members', 'warn_count', 'INTEGER');
+                $this->cacheEnsureColumn($pdo, 'group_members', 'last_warned_at', 'TEXT');
+                $this->cacheEnsureColumn($pdo, 'group_members', 'last_warn_note', 'TEXT');
+                $this->cacheEnsureColumn($pdo, 'group_members', 'suspended_until', 'TEXT');
+                $this->cacheEnsureColumn($pdo, 'group_members', 'suspend_note', 'TEXT');
+                $this->cacheEnsureColumn($pdo, 'group_members', 'banned_at', 'TEXT');
+                $this->cacheEnsureColumn($pdo, 'group_members', 'ban_note', 'TEXT');
 
                 $pdo->exec('CREATE TABLE IF NOT EXISTS group_audit (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5555,6 +6835,33 @@ class Api extends ParentController
                     PRIMARY KEY(group_id, post_uri)
                 )');
                 $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_post_hidden_group ON group_post_hidden(group_id, hidden_at)');
+
+                // Group phrase filters (keyword/phrase moderation).
+                $pdo->exec('CREATE TABLE IF NOT EXISTS group_phrase_filters (
+                    group_id INTEGER NOT NULL,
+                    phrase TEXT NOT NULL,
+                    action TEXT NOT NULL DEFAULT "require_approval",
+                    created_by_did TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(group_id, phrase)
+                )');
+                $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_phrase_filters_group ON group_phrase_filters(group_id)');
+
+                // Group report queue (member reports against public posts/URIs).
+                $pdo->exec('CREATE TABLE IF NOT EXISTS group_reports (
+                    report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    group_id INTEGER NOT NULL,
+                    post_uri TEXT NOT NULL,
+                    reporter_did TEXT NOT NULL,
+                    reason TEXT,
+                    state TEXT NOT NULL DEFAULT "open",
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolved_by_did TEXT,
+                    resolution_note TEXT
+                )');
+                $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_reports_group_state ON group_reports(group_id, state, report_id DESC)');
+                $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_reports_post ON group_reports(group_id, post_uri)');
 
                 // OAuth background refresh requires client_id to be persisted.
                 $this->cacheEnsureColumn($pdo, 'auth_sessions', 'client_id', 'TEXT');
@@ -5878,6 +7185,9 @@ class Api extends ParentController
         )');
         $pdo->exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_groups_slug ON groups(slug)');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_groups_owner ON groups(owner_did)');
+        $this->cacheEnsureColumn($pdo, 'groups', 'rules_md', 'TEXT');
+        $this->cacheEnsureColumn($pdo, 'groups', 'rules_updated_at', 'TEXT');
+        $this->cacheEnsureColumn($pdo, 'groups', 'post_cooldown_seconds', 'INTEGER');
 
         $pdo->exec('CREATE TABLE IF NOT EXISTS group_members (
             group_id INTEGER NOT NULL,
@@ -5891,6 +7201,16 @@ class Api extends ParentController
         )');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_members_group_state ON group_members(group_id, state)');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_members_member ON group_members(member_did)');
+        $this->cacheEnsureColumn($pdo, 'group_members', 'rules_accepted_at', 'TEXT');
+
+        // Group-local enforcement (warn/suspend/ban).
+        $this->cacheEnsureColumn($pdo, 'group_members', 'warn_count', 'INTEGER');
+        $this->cacheEnsureColumn($pdo, 'group_members', 'last_warned_at', 'TEXT');
+        $this->cacheEnsureColumn($pdo, 'group_members', 'last_warn_note', 'TEXT');
+        $this->cacheEnsureColumn($pdo, 'group_members', 'suspended_until', 'TEXT');
+        $this->cacheEnsureColumn($pdo, 'group_members', 'suspend_note', 'TEXT');
+        $this->cacheEnsureColumn($pdo, 'group_members', 'banned_at', 'TEXT');
+        $this->cacheEnsureColumn($pdo, 'group_members', 'ban_note', 'TEXT');
 
         $pdo->exec('CREATE TABLE IF NOT EXISTS group_audit (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -5948,6 +7268,33 @@ class Api extends ParentController
             PRIMARY KEY(group_id, post_uri)
         )');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_post_hidden_group ON group_post_hidden(group_id, hidden_at)');
+
+        // Group phrase filters (keyword/phrase moderation).
+        $pdo->exec('CREATE TABLE IF NOT EXISTS group_phrase_filters (
+            group_id INTEGER NOT NULL,
+            phrase TEXT NOT NULL,
+            action TEXT NOT NULL DEFAULT "require_approval",
+            created_by_did TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(group_id, phrase)
+        )');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_phrase_filters_group ON group_phrase_filters(group_id)');
+
+        // Group report queue (member reports against public posts/URIs).
+        $pdo->exec('CREATE TABLE IF NOT EXISTS group_reports (
+            report_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            post_uri TEXT NOT NULL,
+            reporter_did TEXT NOT NULL,
+            reason TEXT,
+            state TEXT NOT NULL DEFAULT "open",
+            created_at TEXT NOT NULL,
+            resolved_at TEXT,
+            resolved_by_did TEXT,
+            resolution_note TEXT
+        )');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_reports_group_state ON group_reports(group_id, state, report_id DESC)');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_reports_post ON group_reports(group_id, post_uri)');
 
         // Mark schema current.
         $this->cacheMetaSet($pdo, null, 'schema_version', self::CACHE_SCHEMA_VERSION);

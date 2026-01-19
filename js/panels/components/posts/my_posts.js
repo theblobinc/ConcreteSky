@@ -320,18 +320,54 @@ class BskyMyPosts extends HTMLElement {
   _defaultLangs() {
     try {
       return defaultLangs();
+    } catch {
+      return [];
+    }
   }
 
   async _unfurlEmbedFromText(text) {
+    try {
       return await unfurlEmbedFromText(text, { thumb: true });
+    } catch {
+      return null;
+    }
   }
 
   _setComposeQuote(quote) {
-      return await uploadImagesToEmbed(images);
-    }
+    const uri = String(quote?.uri || '').trim();
+    const cid = String(quote?.cid || '').trim();
+    this._composeQuote = uri ? { uri, cid } : null;
 
-    const holder = dlg.querySelector('#compose-quote');
-      await applyInteractionGates(createdUri, interactions, { isRootPost });
+    try {
+      const dlg = this.shadowRoot?.querySelector?.('#compose-dlg');
+      const holder = dlg?.querySelector?.('#compose-quote');
+      if (!holder) return;
+
+      if (!this._composeQuote) {
+        holder.textContent = '';
+        holder.setAttribute('hidden', '');
+        return;
+      }
+
+      const p = this._findCachedPostByUri(this._composeQuote.uri);
+      const title = p ? 'Quote post' : 'Quote URI';
+      const meta = this._composeQuote.uri;
+      const card = p ? `<div class="quote-embed">${renderQuotePostCard(p)}</div>` : '';
+
+      holder.removeAttribute('hidden');
+      holder.innerHTML = `
+        <div class="qbox">
+          <div class="qhead">
+            <div class="qmeta">${esc(title)}</div>
+            <button class="qrm" type="button" data-compose-remove-quote>Remove</button>
+          </div>
+          <div class="qmeta" title="${esc(meta)}"><span class="mono">${esc(meta)}</span></div>
+          ${card}
+        </div>
+      `;
+    } catch {
+      // ignore
+    }
   }
 
   _extractCreatedRef(out) {
@@ -2105,7 +2141,10 @@ class BskyMyPosts extends HTMLElement {
   }
 
   mountYouTubeIframe(wrapper, id){
-    const src = `https://www.youtube.com/embed/${encodeURIComponent(id)}?autoplay=1&rel=0`;
+    const origin = (() => {
+      try { return encodeURIComponent(String(window.location.origin || '')); } catch { return ''; }
+    })();
+    const src = `https://www.youtube.com/embed/${encodeURIComponent(id)}?autoplay=1&rel=0&enablejsapi=1${origin ? `&origin=${origin}` : ''}`;
     wrapper.outerHTML = `
       <div class="ext-card yt iframe">
         <div class="yt-16x9">

@@ -299,7 +299,7 @@ This section is the backlog for building “groups” as a first-class product. 
 	- Join questions (form builder + stored answers).
 	- [x] Approval queue for closed groups (admin-only MVP).
 	- [x] Invite links (rotatable tokens) (admin-only MVP).
-- [ ] Group rules (markdown) + onboarding gate (“must accept rules”).
+- [x] Group rules (markdown) + onboarding gate (“must accept rules”) (MVP).
 
 ### 3) Group feed + posting
 
@@ -310,7 +310,7 @@ This section is the backlog for building “groups” as a first-class product. 
 - [ ] Posting into a group:
 	- [x] Post composer supports “post to group” (adds group tag).
 	- [x] Group-only posting rules (MVP): members can submit; closed/secret require approval; public posts publish immediately.
-	- [ ] Slow-mode / per-member rate limits.
+	- [x] Slow-mode / per-member rate limits (MVP: per-group cooldown seconds).
 - [ ] Announcement posts + pinning:
 	- Pin up to N posts; show pinned section.
 	- Admin-only announcement marker.
@@ -319,12 +319,12 @@ This section is the backlog for building “groups” as a first-class product. 
 
 - [ ] Moderation surfaces:
 	- [x] Pending posts queue (approve/deny) (MVP: mods/admins only).
-	- Report queue (user reports with reasons).
-	- Member requests queue (approve/deny).
+	- [x] Report queue (user reports with reasons) (MVP).
+	- [x] Member requests queue (approve/deny).
 - [ ] Moderator actions:
 	- [x] Remove post (from group feed) (MVP: site-local hide/unhide), keep audit log.
-	- Warn/suspend/ban member (group-local enforcement).
-	- Keyword filters / blocked phrases.
+	- [x] Warn/suspend/ban member (group-local enforcement).
+	- [x] Keyword filters / blocked phrases (MVP: deny / require approval).
 - [ ] Audit log UI + export (who did what, when).
 
 ### 5) Units / Guides (learning content)

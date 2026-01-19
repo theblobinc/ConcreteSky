@@ -76,6 +76,26 @@ Because posts are stored on Bluesky, the MVP “post to group” feature associa
   - Mods approve/deny via `groupPostApprove` / `groupPostDeny` and list the queue via `groupPostsPendingList`.
 - Members can view their own submission history via `groupPostsMineList`.
 - Mods can suppress specific public posts from the group UI feed site-locally via `groupPostHide` / `groupPostUnhide` (does not delete the Bluesky post).
+- Mods can configure phrase filters (site-local) via `groupPhraseFiltersList` / `groupPhraseFilterAdd` / `groupPhraseFilterRemove`.
+  - Filters are enforced during `groupPostSubmit`.
+  - Action `deny`: blocks the submission.
+  - Action `require_approval`: forces a pending submission even in `public` groups.
+- Groups can optionally enable “slow mode” (site-local) via `groupPostingSettingsUpdate`.
+  - When enabled, `groupPostSubmit` enforces a minimum time between submissions for non-mod members.
+- Group moderators/admins can apply site-local member sanctions:
+  - Warn: `groupMemberWarn`
+  - Suspend/unsuspend: `groupMemberSuspend` / `groupMemberUnsuspend`
+  - Ban/unban: `groupMemberBan` / `groupMemberUnban`
+  - Enforcement:
+    - `groupPostSubmit` returns `403` with `code: "banned"` for banned members.
+    - `groupPostSubmit` returns `403` with `code: "suspended"` and `retryAfterSeconds` for active suspensions.
+    - `groupJoin` and `groupInviteJoin` return `403` with `code: "banned"` if a member is banned/blocked.
+- Members can report a post URI (site-local) via `groupReportCreate`; mods can list/resolve via `groupReportsList` / `groupReportResolve`.
+  - `groupReportsList` supports `state: open|resolved`.
+  - Resolving supports an optional “hide this post from the group feed” behavior (site-local).
+- Groups can define site-local rules (Markdown) enforced for posting.
+  - Members accept rules via `groupRulesAccept`.
+  - Mods/admins set rules via `groupRulesUpdate`.
 - Note: this is **not privacy**; the feed is still public Bluesky content, and closed/secret semantics are enforced only for site-local membership/admin actions.
 
 Related event (optional): panels that create/join/leave groups may dispatch `bsky-groups-changed` so the shell refreshes its selector by re-calling `groupsList`.
@@ -232,13 +252,19 @@ ConcreteSky uses a single JSON endpoint (ConcreteCMS controller) that behaves li
 
 **Lists**: `getLists`
 
-**Groups (site-local)**: `groupsList`, `groupGet`, `groupCreate`, `groupUpdate`, `groupJoin`, `groupLeave`, `groupAuditList`, `groupMembersList`, `groupMemberApprove`, `groupMemberDeny`, `groupInviteCreate`, `groupInvitesList`, `groupInviteRevoke`, `groupInviteJoin`
+**Groups (site-local)**: `groupsList`, `groupGet`, `groupCreate`, `groupUpdate`, `groupJoin`, `groupLeave`, `groupAuditList`, `groupMembersList`, `groupMemberApprove`, `groupMemberDeny`, `groupMemberWarn`, `groupMemberSuspend`, `groupMemberUnsuspend`, `groupMemberBan`, `groupMemberUnban`, `groupInviteCreate`, `groupInvitesList`, `groupInviteRevoke`, `groupInviteJoin`, `groupRulesAccept`, `groupRulesUpdate`
 
 **Groups (post moderation)**: `groupPostSubmit`, `groupPostsList`, `groupPostsPendingList`, `groupPostApprove`, `groupPostDeny`
 
 **Groups (feed suppression)**: `groupHiddenPostsList`, `groupPostHide`, `groupPostUnhide`
 
+**Groups (phrase filters)**: `groupPhraseFiltersList`, `groupPhraseFilterAdd`, `groupPhraseFilterRemove`
+
+**Groups (reports)**: `groupReportCreate`, `groupReportsList`, `groupReportResolve`
+
 **Groups (self-service)**: `groupPostsMineList`
+
+**Groups (posting settings)**: `groupPostingSettingsUpdate`
 
 **Bluesky parity: gates**: `createThreadGate`, `createPostGate`
 
