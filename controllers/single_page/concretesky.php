@@ -249,9 +249,11 @@ class Concretesky extends PageController
         $st = $pdo->prepare('SELECT s.c5_user_id, s.did,
             COALESCE(p.handle, s.handle) AS handle,
             s.pds, s.auth_type, s.updated_at,
+                        a.account_created_at,
             p.display_name, p.avatar
           FROM auth_sessions s
           LEFT JOIN profiles p ON p.did = s.did
+                    LEFT JOIN c5_accounts a ON a.c5_user_id = s.c5_user_id AND a.did = s.did
           WHERE s.c5_user_id = :u
           ORDER BY s.updated_at DESC');
         $st->execute([':u' => $c5UserId]);

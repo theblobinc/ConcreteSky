@@ -14,3 +14,9 @@ Thumbs.db
 
 # Logs
 *.log
+
+# SQLite cache (runtime data)
+db/*.sqlite
+db/*.sqlite-*
+db/*.db
+db/*.db-*

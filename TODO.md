@@ -571,9 +571,9 @@ Acceptance criteria:
 - [x] Drafts: local drafts per context + autosave (text + interaction settings; incl. thread parts).
 - [x] Drafts: persist media selections across reloads (IndexedDB-backed; text/settings remain in localStorage).
 - [x] Scheduled posts (client-side scheduler + server job to publish).
-- [ ] Edit post (Bluesky supports record update semantics; confirm UX + history).
+- [x] Edit post (Bluesky supports record update semantics; confirm UX + history).
 - [x] Post deletion UX improvements (undo window, optimistic removal).
-- [ ] Post “translations” / inline translate UX (if supported; else defer) + copy-to-clipboard.
+- [x] Post “translations” / inline translate UX (if supported; else defer) + copy-to-clipboard.
 - [ ] Per-post audience controls parity (where applicable): visibility-like semantics (note: ATProto is public-first; document constraints clearly).
 - [x] Drafts: autosave to IndexedDB (text + media + gates) for crash-proof drafts. (IndexedDB snapshot + recovery path.)
 - [x] Drafts: export/import (JSON) for power users. (Composer settings: Export/Import.)

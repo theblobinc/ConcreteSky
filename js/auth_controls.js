@@ -202,11 +202,14 @@ export function bindAuthControls(root) {
         const displayName = a?.displayName ? String(a.displayName) : '';
         const isActive = activeDid && did && activeDid === did;
         const updated = a?.updatedAt ? `${fmtAge(a.updatedAt)} ago` : '';
+        const createdIso = String(a?.accountCreatedAt || '').trim();
+        const joined = createdIso ? createdIso.slice(0, 10) : '';
+        const age = createdIso ? fmtAge(createdIso) : '';
         return `
           <div style="display:flex;align-items:center;gap:10px;justify-content:space-between;border:1px solid rgba(255,255,255,.10);border-radius:10px;padding:10px">
             <div style="min-width:0">
               <div style="font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${identityHtml({ did, handle, displayName }, { showHandle: true, showCopyDid: true })}</div>
-              <div class="muted">${updated ? `Updated ${esc(updated)}` : ''}${a?.authType ? `${updated ? ' • ' : ''}${esc(String(a.authType))}` : ''}</div>
+              <div class="muted">${updated ? `Updated ${esc(updated)}` : ''}${a?.authType ? `${updated ? ' • ' : ''}${esc(String(a.authType))}` : ''}${joined ? `${(updated || a?.authType) ? ' • ' : ''}Joined ${esc(joined)}${age ? ` (${esc(age)})` : ''}` : ''}</div>
               ${isActive ? '<div class="muted" style="color:#89f0a2">Active</div>' : ''}
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">

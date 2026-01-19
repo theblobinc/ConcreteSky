@@ -128,6 +128,19 @@ function ensureHudCacheCalendarModal() {
       #bsky-hud-cache-calendar .msg{color:var(--bsky-muted-fg, #bbb);font-size:.9rem}
       #bsky-hud-cache-calendar .err{color:var(--bsky-danger-fg, #f88)}
 
+      #bsky-hud-cache-calendar .manage{border-top:1px solid rgba(255,255,255,.10);padding-top:10px;margin-top:2px}
+      #bsky-hud-cache-calendar .manage .hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
+      #bsky-hud-cache-calendar .manage .hdr .dt{font-weight:900}
+      #bsky-hud-cache-calendar .manage .btns{display:flex;gap:8px;flex-wrap:wrap}
+      #bsky-hud-cache-calendar .manage button{appearance:none;background:var(--bsky-btn-bg, #111);border:1px solid var(--bsky-border, #333);color:var(--bsky-fg, #fff);border-radius: var(--bsky-radius, 0px);padding:8px 10px;cursor:pointer;font-weight:900}
+      #bsky-hud-cache-calendar .manage button:hover{background:#1b1b1b}
+      #bsky-hud-cache-calendar .manage button:disabled{opacity:.6;cursor:not-allowed}
+      #bsky-hud-cache-calendar .manage .row2{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px}
+      #bsky-hud-cache-calendar .manage label{display:flex;align-items:center;gap:6px;color:var(--bsky-muted-fg, #bbb);font-size:.9rem}
+      #bsky-hud-cache-calendar .manage input{width:88px;appearance:none;background:var(--bsky-input-bg, #0f0f0f);border:1px solid var(--bsky-border, #333);color:var(--bsky-fg, #fff);border-radius: var(--bsky-radius, 0px);padding:6px 8px}
+      #bsky-hud-cache-calendar .manage .stats{color:var(--bsky-muted-fg, #bbb);font-size:.9rem;line-height:1.2}
+      #bsky-hud-cache-calendar .manage .stats b{color:var(--bsky-fg, #ddd)}
+
       #bsky-hud-cache-calendar .daypanel{border-top:1px solid rgba(255,255,255,.10);padding-top:10px;margin-top:2px}
       #bsky-hud-cache-calendar .daypanel[hidden]{display:none}
       #bsky-hud-cache-calendar .daypanel .hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
@@ -178,6 +191,7 @@ function ensureHudCacheCalendarModal() {
         </div>
         <div class="msg" data-status></div>
         <div class="grid" data-grid></div>
+        <div class="manage" data-manage></div>
         <div class="daypanel" data-day-panel hidden></div>
       </div>
     </div>
@@ -236,7 +250,79 @@ class BskyProfile extends HTMLElement {
       dayNotifs: null,
       backfillRunning: false,
       backfillCancel: false,
+      backfillMsg: '',
+      catalog: null,
+      catalogLoading: false,
+      catalogError: null,
+
+      manageRunning: false,
+      manageMsg: '',
+      manageKeepDays: 90,
+      manageVacuum: false,
+      manageClear: true,
     };
+
+    // Keyed by actor DID: { open, loading, error, followers, fetchedAt }
+    this._knownFollowers = new Map();
+  }
+
+  _kfState(key) {
+    const k = String(key || '').trim();
+    if (!k) return { open: false, loading: false, error: '', followers: null, fetchedAt: null };
+    const cur = this._knownFollowers.get(k);
+    if (cur && typeof cur === 'object') return cur;
+    return { open: false, loading: false, error: '', followers: null, fetchedAt: null };
+  }
+
+  _setKfState(key, next) {
+    const k = String(key || '').trim();
+    if (!k) return;
+    this._knownFollowers.set(k, { ...this._kfState(k), ...(next || {}) });
+  }
+
+  _fmtKnownFollowersLine(list) {
+    const items = Array.isArray(list) ? list : [];
+    const names = items
+      .map((p) => p?.displayName || (p?.handle ? `@${p.handle}` : '') || p?.did)
+      .filter(Boolean);
+    if (!names.length) return '';
+    if (names.length === 1) return `Mutual with ${names[0]}`;
+    if (names.length === 2) return `Mutual with ${names[0]} and ${names[1]}`;
+    return `Mutual with ${names[0]}, ${names[1]}, and ${names.length - 2} others`;
+  }
+
+  async _toggleKnownFollowers(actorDid) {
+    const did = String(actorDid || '').trim();
+    if (!did) return;
+
+    const cur = this._kfState(did);
+    const nextOpen = !cur.open;
+    this._setKfState(did, { open: nextOpen, error: cur.error || '' });
+    this.render();
+
+    if (!nextOpen) return;
+    if (cur.loading) return;
+    if (Array.isArray(cur.followers)) return;
+
+    this._setKfState(did, { loading: true, error: '' });
+    this.render();
+
+    try {
+      const res = await call('getKnownFollowers', { actor: did, limit: 12, pagesMax: 10 });
+      const followers = Array.isArray(res?.followers) ? res.followers : [];
+      const mapped = followers.map((p) => ({
+        did: String(p?.did || ''),
+        handle: String(p?.handle || ''),
+        displayName: String(p?.displayName || p?.display_name || ''),
+        avatar: String(p?.avatar || ''),
+      })).filter((p) => p.did || p.handle);
+      this._setKfState(did, { followers: mapped, loading: false, error: '', fetchedAt: new Date().toISOString() });
+    } catch (e) {
+      const msg = e?.message || String(e || 'Failed to load followers you know');
+      this._setKfState(did, { loading: false, error: msg, followers: [] });
+    } finally {
+      this.render();
+    }
   }
   connectedCallback(){
     this._authHandler = () => this.render();
@@ -375,7 +461,43 @@ class BskyProfile extends HTMLElement {
       if (followsCount !== null) counts.push(`${followsCount} following`);
       if (postsCount !== null) counts.push(`${postsCount} posts`);
 
+      const createdAtIso = String(prof?.createdAt || '').trim();
+      const joinedDate = createdAtIso ? createdAtIso.slice(0, 10) : '';
+      if (joinedDate) counts.push(`Joined: ${joinedDate}`);
+
       const hudQ = String(this._hudQ || '');
+
+      const kf = prof?.did ? this._kfState(prof.did) : null;
+      const kfBtn = prof?.did ? `
+        <button class="auth-btn mini" type="button" data-action="known-followers" data-did="${esc(prof.did)}" ${kf?.loading ? 'disabled' : ''}>
+          ${kf?.open ? 'Hide followers you know' : 'Followers you know'}
+        </button>
+      ` : '';
+
+      const kfWrap = (() => {
+        if (!kf || !kf.open) return '';
+        if (kf.loading) return '<div class="kfWrap"><div class="kf muted">Loading followers you know…</div></div>';
+        if (kf.error) return `<div class="kfWrap"><div class="kf err">${esc(kf.error)}</div></div>`;
+        const items = Array.isArray(kf.followers) ? kf.followers : [];
+        if (!items.length) return '<div class="kfWrap"><div class="kf muted">No mutuals found.</div></div>';
+        const line = this._fmtKnownFollowersLine(items);
+        const list = items.slice(0, 10).map((p) => {
+          const url = p?.did ? `https://bsky.app/profile/${encodeURIComponent(p.did)}` : (p?.handle ? `https://bsky.app/profile/${encodeURIComponent(p.handle)}` : '');
+          const label = p?.displayName || (p?.handle ? `@${p.handle}` : '') || p?.did;
+          return `
+            <a class="kfItem" href="${esc(url)}" target="_blank" rel="noopener">
+              <img class="kfAv" src="${esc(p?.avatar || '')}" alt="" onerror="this.style.display='none'">
+              <span class="kfName">${esc(label)}</span>
+            </a>
+          `;
+        }).join('');
+        return `
+          <div class="kfWrap">
+            ${line ? `<div class="kf muted">${esc(line)}</div>` : ''}
+            <div class="kfList">${list}</div>
+          </div>
+        `;
+      })();
 
       this.shadowRoot.innerHTML = `
         <style>
@@ -391,6 +513,15 @@ class BskyProfile extends HTMLElement {
           .auth-status{color:#bbb;font-size:.9rem}
           .auth-btn{appearance:none;background:#111;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:8px 12px;cursor:pointer;font-weight:700}
           .auth-btn:hover{background:#1b1b1b}
+          .auth-btn.mini{padding:6px 10px;font-size:.78rem;font-weight:800}
+
+          .kfWrap{margin-top:10px;padding-left:10px;border-left:2px solid #2f4b7a}
+          .kf{font-size:.9rem;line-height:1.2}
+          .kfList{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+          .kfItem{display:inline-flex;align-items:center;gap:6px;max-width:100%;border:1px solid #222;border-radius: var(--bsky-radius, 0px);padding:4px 6px;background:rgba(0,0,0,.15);color:#fff;text-decoration:none}
+          .kfItem:hover{border-color:#3b5a8f;background:rgba(0,0,0,.25)}
+          .kfAv{width:18px;height:18px;border-radius: var(--bsky-radius, 0px);object-fit:cover;background:#222}
+          .kfName{font-size:.85rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}
 
           .right{margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:8px;min-width:min(440px, 100%)}
           .hud-search{width:min(440px, 100%)}
@@ -444,6 +575,8 @@ class BskyProfile extends HTMLElement {
             <div class="muted">Concrete: ${esc(c5Name)}${c5Registered ? '' : ' (Guest)'}</div>
             <div class="name">${identityHtml({ did: prof.did, handle: prof.handle, displayName: prof.displayName }, { showHandle: true, showCopyDid: true })}</div>
             <div class="meta">${counts.map(esc).join(' · ')}</div>
+            ${kfBtn ? `<div class="meta">${kfBtn}</div>` : ''}
+            ${kfWrap}
             <div class="auth" data-auth-controls-root>
               <span class="auth-status" data-auth-status>Bluesky: connected</span>
               <button class="auth-btn" type="button" data-auth-connect>Connect</button>
@@ -511,6 +644,16 @@ class BskyProfile extends HTMLElement {
         </div>
       `;
       bindAuthControls(this.shadowRoot.querySelector('[data-auth-controls-root]'));
+
+      const knownBtn = this.shadowRoot.querySelector('button[data-action="known-followers"]');
+      if (knownBtn) {
+        knownBtn.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          const did = String(knownBtn.getAttribute('data-did') || '').trim();
+          this._toggleKnownFollowers(did);
+        });
+      }
 
       const calBtn = this.shadowRoot.querySelector('[data-hud-cache-calendar]');
       if (calBtn) {
@@ -639,8 +782,26 @@ class BskyProfile extends HTMLElement {
       };
     } catch {}
 
-    await this.loadHudCacheCalendarMonth(this._hudCal.month);
     this.renderHudCacheCalendarModal();
+
+    await Promise.all([
+      this.loadHudCacheCalendarMonth(this._hudCal.month),
+      this.loadHudCacheCatalogStatus(),
+    ]);
+    this.renderHudCacheCalendarModal();
+  }
+
+  async loadHudCacheCatalogStatus() {
+    this._hudCal.catalogLoading = true;
+    this._hudCal.catalogError = null;
+    try {
+      this._hudCal.catalog = await call('cacheCatalogStatus', {});
+    } catch (e) {
+      this._hudCal.catalog = null;
+      this._hudCal.catalogError = e?.message || String(e);
+    } finally {
+      this._hudCal.catalogLoading = false;
+    }
   }
 
   closeHudCacheCalendar() {
@@ -651,22 +812,200 @@ class BskyProfile extends HTMLElement {
 
   shiftHudCacheCalendarMonth(delta) {
     this._hudCal.month = shiftMonthKey(this._hudCal.month, delta);
-    this.loadHudCacheCalendarMonth(this._hudCal.month);
+    void this.loadHudCacheCalendarMonth(this._hudCal.month);
     this.renderHudCacheCalendarModal();
   }
 
   async loadHudCacheCalendarMonth(month) {
-    try {
-      window.dispatchEvent(new CustomEvent('bsky-open-cache-settings', { detail: { tab: 'calendar' } }));
-    } catch {
-      // ignore
+    const key = String(month || '').trim();
+    if (!key) return;
+
+    if (!this._hudCal.cache.has(key)) {
+      await this.reloadHudCacheCalendarMonth(key);
+      return;
     }
+
+    if (!this._hudCal.sync) {
+      try { this._hudCal.sync = await call('cacheStatus', {}); } catch {}
+    }
+  }
+
+  async reloadHudCacheCalendarMonth(month) {
+    const key = String(month || '').trim();
+    if (!key) return;
+    this._hudCal.loading = true;
+    this._hudCal.error = null;
+    this.renderHudCacheCalendarModal();
+
+    try {
+      const [monthRes, syncRes] = await Promise.all([
+        call('cacheCalendarMonth', { month: key }),
+        call('cacheStatus', {}),
+      ]);
+      this._hudCal.cache.set(key, monthRes || {});
+      this._hudCal.sync = syncRes || null;
+    } catch (e) {
+      this._hudCal.error = e?.message || String(e);
+    } finally {
+      this._hudCal.loading = false;
+      this.renderHudCacheCalendarModal();
+    }
+  }
+
+  renderHudCacheCalendarModal() {
+    const modal = ensureHudCacheCalendarModal();
+    const monthEl = modal.querySelector('[data-month]');
+    const statusEl = modal.querySelector('[data-status]');
+    const gridEl = modal.querySelector('[data-grid]');
+    const manageEl = modal.querySelector('[data-manage]');
+
     if (monthEl) monthEl.textContent = String(this._hudCal.month || '');
 
     if (statusEl) {
       if (this._hudCal.loading) statusEl.textContent = 'Scanning cache coverage…';
       else if (this._hudCal.error) statusEl.innerHTML = `<span class="err">${esc(this._hudCal.error)}</span>`;
       else statusEl.textContent = 'Ring shows whether the day is up-to-date (based on per-day DB updates vs last sync). Click a day for details + backfill.';
+    }
+
+    const fmtBytes = (n) => {
+      const v = Number(n);
+      if (!Number.isFinite(v) || v < 0) return '—';
+      const units = ['B','KB','MB','GB','TB'];
+      let x = v;
+      let i = 0;
+      while (x >= 1024 && i < units.length - 1) { x /= 1024; i++; }
+      return `${x.toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+    };
+
+    if (manageEl) {
+      const busy = !!this._hudCal.manageRunning || !!this._hudCal.loading || !!this._hudCal.dayLoading || !!this._hudCal.backfillRunning;
+
+      const cat = this._hudCal.catalog;
+      const postsCount = Number(cat?.posts?.count ?? 0);
+      const notifsCount = Number(cat?.notifications?.count ?? 0);
+      const postsRange = (cat?.posts?.minCreatedAt && cat?.posts?.maxCreatedAt)
+        ? `${String(cat.posts.minCreatedAt).slice(0,10)} → ${String(cat.posts.maxCreatedAt).slice(0,10)}`
+        : '—';
+      const notifsRange = (cat?.notifications?.minIndexedAt && cat?.notifications?.maxIndexedAt)
+        ? `${String(cat.notifications.minIndexedAt).slice(0,10)} → ${String(cat.notifications.maxIndexedAt).slice(0,10)}`
+        : '—';
+
+      const db = cat?.db || {};
+      const dbSize = [
+        fmtBytes(db.fileBytes),
+        (db.walBytes ? `+ ${fmtBytes(db.walBytes)} WAL` : null),
+        (db.shmBytes ? `+ ${fmtBytes(db.shmBytes)} SHM` : null),
+      ].filter(Boolean).join(' ');
+
+      const msg = this._hudCal.manageMsg ? `<div class="msg">${esc(this._hudCal.manageMsg)}</div>` : '';
+      const err = this._hudCal.catalogError ? `<div class="msg err">${esc(this._hudCal.catalogError)}</div>` : '';
+      const loading = this._hudCal.catalogLoading ? `<div class="msg">Loading catalogue status…</div>` : '';
+
+      manageEl.innerHTML = `
+        <div class="hdr">
+          <div class="dt">Catalogue management</div>
+          <div class="btns">
+            <button type="button" data-action="refresh" ${busy ? 'disabled' : ''}>Refresh</button>
+          </div>
+        </div>
+        ${loading}${err}${msg}
+        <div class="stats">
+          <div><b>Posts</b>: ${Number.isFinite(postsCount) ? esc(postsCount) : '—'} <span class="muted">(${esc(postsRange)})</span></div>
+          <div><b>Notifications</b>: ${Number.isFinite(notifsCount) ? esc(notifsCount) : '—'} <span class="muted">(${esc(notifsRange)})</span></div>
+          <div><b>DB</b>: ${esc(dbSize || '—')}</div>
+        </div>
+        <div class="row2">
+          <label>Keep days <input type="number" min="1" max="3650" step="1" value="${esc(this._hudCal.manageKeepDays)}" data-keep-days></label>
+          <label><input type="checkbox" ${this._hudCal.manageVacuum ? 'checked' : ''} data-vacuum> vacuum</label>
+          <label><input type="checkbox" ${this._hudCal.manageClear ? 'checked' : ''} data-clear> clear on resync</label>
+        </div>
+        <div class="row2">
+          <button type="button" data-action="prune" data-kind="posts" ${busy ? 'disabled' : ''}>Prune posts</button>
+          <button type="button" data-action="prune" data-kind="notifications" ${busy ? 'disabled' : ''}>Prune notifs</button>
+          <button type="button" data-action="prune" data-kind="all" ${busy ? 'disabled' : ''}>Prune all</button>
+        </div>
+        <div class="row2">
+          <button type="button" data-action="resync" data-kind="posts" ${busy ? 'disabled' : ''}>Resync posts</button>
+          <button type="button" data-action="resync" data-kind="notifications" ${busy ? 'disabled' : ''}>Resync notifs</button>
+          <button type="button" data-action="resync" data-kind="all" ${busy ? 'disabled' : ''}>Resync all</button>
+        </div>
+      `;
+
+      const keepDaysEl = manageEl.querySelector('[data-keep-days]');
+      keepDaysEl?.addEventListener('change', () => {
+        const n = Number(keepDaysEl.value);
+        if (Number.isFinite(n) && n > 0) this._hudCal.manageKeepDays = Math.max(1, Math.min(3650, Math.floor(n)));
+      });
+      const vacEl = manageEl.querySelector('[data-vacuum]');
+      vacEl?.addEventListener('change', () => { this._hudCal.manageVacuum = !!vacEl.checked; });
+      const clearEl = manageEl.querySelector('[data-clear]');
+      clearEl?.addEventListener('change', () => { this._hudCal.manageClear = !!clearEl.checked; });
+
+      manageEl.querySelector('[data-action="refresh"]')?.addEventListener('click', async () => {
+        if (busy) return;
+        this._hudCal.manageMsg = '';
+        this.renderHudCacheCalendarModal();
+        await Promise.all([
+          this.reloadHudCacheCalendarMonth(this._hudCal.month),
+          (async () => { await this.loadHudCacheCatalogStatus(); this.renderHudCacheCalendarModal(); })(),
+        ]);
+      });
+
+      manageEl.querySelectorAll('button[data-action="prune"]').forEach((btn) => btn.addEventListener('click', async () => {
+        if (busy) return;
+        const kind = String(btn.getAttribute('data-kind') || 'posts');
+        const keepDays = Math.max(1, Math.min(3650, (this._hudCal.manageKeepDays | 0) || 90));
+        const vacuum = !!this._hudCal.manageVacuum;
+        const ok = confirm(`Prune ${kind} older than ${keepDays} days?${vacuum ? ' (with VACUUM)' : ''}`);
+        if (!ok) return;
+
+        this._hudCal.manageRunning = true;
+        this._hudCal.manageMsg = `Pruning ${kind}…`;
+        this.renderHudCacheCalendarModal();
+        try {
+          const res = await call('cacheCatalogPrune', { kind, keepDays, vacuum });
+          const d = res?.deleted || {};
+          this._hudCal.manageMsg = `Pruned ${kind}: posts ${d.posts ?? 0}, notifs ${d.notifications ?? 0}`;
+        } catch (e) {
+          this._hudCal.manageMsg = `Prune failed: ${e?.message || String(e)}`;
+        } finally {
+          this._hudCal.manageRunning = false;
+          await Promise.all([
+            this.reloadHudCacheCalendarMonth(this._hudCal.month),
+            (async () => { await this.loadHudCacheCatalogStatus(); })(),
+          ]);
+          this.renderHudCacheCalendarModal();
+        }
+      }));
+
+      manageEl.querySelectorAll('button[data-action="resync"]').forEach((btn) => btn.addEventListener('click', async () => {
+        if (busy) return;
+        const kind = String(btn.getAttribute('data-kind') || 'posts');
+        const clear = !!this._hudCal.manageClear;
+        const ok = confirm(`Reset backfill state for ${kind}${clear ? ' and clear cached rows' : ''}?`);
+        if (!ok) return;
+
+        this._hudCal.manageRunning = true;
+        this._hudCal.manageMsg = `Resyncing ${kind}…`;
+        this.renderHudCacheCalendarModal();
+        try {
+          await call('cacheCatalogResync', { kind, clear });
+          this._hudCal.manageMsg = `Resync queued. Use backfill buttons (per-day) to rebuild.`;
+          this._hudCal.selectedDay = null;
+          this._hudCal.dayPosts = null;
+          this._hudCal.dayNotifs = null;
+          this._hudCal.dayError = null;
+        } catch (e) {
+          this._hudCal.manageMsg = `Resync failed: ${e?.message || String(e)}`;
+        } finally {
+          this._hudCal.manageRunning = false;
+          await Promise.all([
+            this.reloadHudCacheCalendarMonth(this._hudCal.month),
+            (async () => { await this.loadHudCacheCatalogStatus(); })(),
+          ]);
+          this.renderHudCacheCalendarModal();
+        }
+      }));
     }
 
     if (!gridEl) return;
@@ -741,7 +1080,7 @@ class BskyProfile extends HTMLElement {
     }
 
     const day = String(this._hudCal.selectedDay);
-    const busy = !!this._hudCal.dayLoading || !!this._hudCal.backfillRunning;
+    const busy = !!this._hudCal.dayLoading || !!this._hudCal.backfillRunning || !!this._hudCal.manageRunning;
     const err = this._hudCal.dayError ? `<div class="muted" style="color:#f88">${esc(this._hudCal.dayError)}</div>` : '';
     const prog = this._hudCal.backfillMsg ? `<div class="muted">${esc(this._hudCal.backfillMsg)}</div>` : '';
 

@@ -113,6 +113,9 @@ export class BskyThreadTree extends HTMLElement {
     // Hide nodes that have been optimistically deleted.
     this._hiddenUris = new Set();
 
+    // uri -> { open, loading, error, to, text }
+    this._translateByUri = new Map();
+
     // Pending optimistic deletion (undo window).
     // { uri, timerId, startedAt, state, error }
     this._pendingDelete = null;
@@ -521,6 +524,72 @@ export class BskyThreadTree extends HTMLElement {
       return;
     }
 
+    const copyTextBtn = e.target?.closest?.('[data-copy-post-text-uri]');
+    if (copyTextBtn) {
+      const uri = String(copyTextBtn.getAttribute('data-copy-post-text-uri') || '').trim();
+      const post = this._findPostByUriInThread(uri);
+      const text = post ? pickText(post) : '';
+      const ok = await this._copyToClipboard(text);
+      dispatchToast(this, {
+        kind: ok ? 'success' : 'error',
+        message: ok ? 'Post text copied.' : 'Could not copy post text.',
+        timeoutMs: 2200,
+      });
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    const copyTrBtn = e.target?.closest?.('[data-copy-translation-uri]');
+    if (copyTrBtn) {
+      const uri = String(copyTrBtn.getAttribute('data-copy-translation-uri') || '').trim();
+      const tr = uri ? (this._translateByUri.get(uri) || null) : null;
+      const ok = await this._copyToClipboard(String(tr?.text || ''));
+      dispatchToast(this, {
+        kind: ok ? 'success' : 'error',
+        message: ok ? 'Translation copied.' : 'Could not copy translation.',
+        timeoutMs: 2200,
+      });
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    const trBtn = e.target?.closest?.('[data-translate-uri]');
+    if (trBtn) {
+      const uri = String(trBtn.getAttribute('data-translate-uri') || '').trim();
+      if (!uri) return;
+
+      const cur = this._translateByUri.get(uri) || null;
+      if (cur && cur.open && !cur.loading) {
+        this._translateByUri.set(uri, { ...cur, open: false });
+        this.render();
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+
+      const post = this._findPostByUriInThread(uri);
+      const text = post ? pickText(post) : '';
+      if (!text.trim()) return;
+
+      const to = String((navigator?.language || 'en').split('-')[0] || 'en').toLowerCase();
+      this._translateByUri.set(uri, { open: true, loading: true, error: null, to, text: '' });
+      this.render();
+
+      try {
+        const out = await call('translateText', { text, to, from: 'auto' });
+        const translatedText = String(out?.translatedText || out?.data?.translatedText || '');
+        this._translateByUri.set(uri, { open: true, loading: false, error: null, to, text: translatedText });
+      } catch (err) {
+        this._translateByUri.set(uri, { open: true, loading: false, error: String(err?.message || err || 'Translate failed'), to, text: '' });
+      }
+      this.render();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
     const shareBtn = e.target?.closest?.('[data-share-url]');
     if (shareBtn) {
       const url = String(shareBtn.getAttribute('data-share-url') || '').trim();
@@ -687,6 +756,23 @@ export class BskyThreadTree extends HTMLElement {
     const text = pickText(post);
     const textHtml = renderPostTextHtml(text);
 
+    const tr = uri ? (this._translateByUri.get(String(uri)) || null) : null;
+    const trBlock = (tr && tr.open) ? (() => {
+      if (tr.loading) return `<div class="translate muted">Translating…</div>`;
+      if (tr.error) return `<div class="translate err">Translate error: ${esc(tr.error)}</div>`;
+      const t = String(tr.text || '');
+      if (!t.trim()) return `<div class="translate muted">No translation returned.</div>`;
+      return `
+        <div class="translate">
+          <div class="translate-top">
+            <div class="muted">Translation (${esc(String(tr.to || ''))})</div>
+            <button class="copy" type="button" data-copy-translation-uri="${esc(uri)}">Copy translation</button>
+          </div>
+          <div class="translate-text">${renderPostTextHtml(t)}</div>
+        </div>
+      `;
+    })() : '';
+
     const open = atUriToWebPost(uri);
     const reposted = !!(post?.viewer && post.viewer.repost);
     const liked = !!(post?.viewer && post.viewer.like);
@@ -726,7 +812,9 @@ export class BskyThreadTree extends HTMLElement {
               ${(open) ? `<a class="open" href="${esc(open)}" target="_blank" rel="noopener">Open</a>` : ''}
               ${(uri) ? `<button class="openpanel" type="button" data-open-panel-uri="${esc(uri)}" data-open-panel-cid="${esc(cid)}">Open in panel</button>` : ''}
               ${(open) ? `<button class="copy" type="button" data-copy-url="${esc(open)}">Copy link</button>` : ''}
+              ${(uri) ? `<button class="copy" type="button" data-copy-post-text-uri="${esc(uri)}">Copy text</button>` : ''}
               ${(open) ? `<button class="share" type="button" data-share-url="${esc(open)}" data-share-title="${esc(who)}">Share</button>` : ''}
+              ${(variant !== 'ancestor' && uri) ? `<button class="share" type="button" data-translate-uri="${esc(uri)}">${(tr && tr.open) ? 'Hide translation' : 'Translate'}</button>` : ''}
               ${hasReplies && uri ? `<button class="collapse" type="button" data-toggle-collapse-uri="${esc(uri)}">${isCollapsed ? `Expand (${esc(repliesLabel)})` : `Collapse (${esc(repliesLabel)})`}</button>` : ''}
               ${(variant !== 'ancestor' && uri) ? `<button class="reply" type="button" data-reply-uri="${esc(uri)}" data-reply-cid="${esc(cid)}" data-reply-author="${esc(who)}">Reply</button>` : ''}
               ${(variant !== 'ancestor' && uri) ? `<button class="repost" type="button" data-repost-uri="${esc(uri)}" data-repost-cid="${esc(cid)}" data-reposted="${reposted ? '1' : '0'}">${reposted ? 'Undo repost' : 'Repost'}</button>` : ''}
@@ -735,6 +823,7 @@ export class BskyThreadTree extends HTMLElement {
             </div>
           </div>
           ${text ? `<div class="text">${textHtml}</div>` : '<div class="text muted">(no text)</div>'}
+          ${trBlock}
           ${embedsHtml ? `<div class="embeds">${embedsHtml}</div>` : ''}
         </div>
         ${hasReplies
@@ -773,6 +862,11 @@ export class BskyThreadTree extends HTMLElement {
         :host, *, *::before, *::after{box-sizing:border-box}
         :host{display:block}
         .muted{color:#aaa}
+        .err{color:#f0a2a2}
+
+        .translate{margin:10px 0 0 0; padding:10px; border:1px solid #2b2b2b; background:#0f0f0f; border-radius:10px}
+        .translate-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+        .translate-text{white-space:normal}
 
         .thread-actions{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
         .act{appearance:none;border:1px solid #333;background:#111;color:#fff;border-radius: var(--bsky-radius, 0px);padding:6px 10px;cursor:pointer}

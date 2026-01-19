@@ -1278,7 +1278,7 @@ class BskyNotifications extends HTMLElement {
     }
   }
 
-  onClick(e){
+  async onClick(e){
     if (e.target.closest('#reload'))      { this.load(true); return; }
     if (e.target.closest('#follow-all'))  { this.followAll(e.target.closest('#follow-all')); return; }
     if (e.target.closest('#mark-all-read')) { this.markAllRead(); return; }

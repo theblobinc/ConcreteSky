@@ -1,11 +1,215 @@
-# ConcreteSky UI API
+# ConcreteSky API Reference
 
-This document describes the public UI/web-component API for the ConcreteSky SPA.
+This document covers:
+
+- **Backend JSON API** (the `/concretesky/api` endpoint used by the SPA)
+- **UI Web Components API** (the public web-component surface used by the SPA)
 
 Related docs:
 
 - Panel-system contract helpers: `PANELS_API.md`
 - Search router (HUD query language + event bus): `SEARCH.md`
+
+## Backend JSON API ("call()")
+
+ConcreteSky uses a single JSON endpoint (ConcreteCMS controller) that behaves like a lightweight JSON-RPC.
+
+- Client wrapper: `packages/concretesky/js/api.js`
+- Server router: `packages/concretesky/controllers/single_page/concretesky/api.php`
+
+### Transport
+
+- **URL**: `window.BSKY.apiPath` (normally `/concretesky/api`)
+- **Method**: `POST`
+- **Cookies**: sent (ConcreteCMS session)
+- **Headers**:
+  - `Content-Type: application/json`
+  - `X-CSRF-Token: <token>` (browser flow)
+  - `Authorization: Bearer <jwt>` (optional automation flow; see below)
+- **Body**: `{ "method": "<name>", "params": { ... } }`
+
+ConcreteSky's JS client sends requests with `credentials: 'include'` and will retry once if it detects an expired token.
+
+Example (browser JS):
+
+```js
+import { call } from './api.js';
+
+const status = await call('authStatus');
+console.log(status);
+```
+
+Example (curl + JWT automation):
+
+```bash
+curl -sS \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer ${CONCRETESKY_JWT}" \
+  -d '{"method":"authStatus","params":{}}' \
+  'https://your-site.example/concretesky/api'
+```
+
+### Auth modes
+
+#### Browser session + CSRF (default)
+
+- You must be logged into ConcreteCMS.
+- Requests must include a valid `X-CSRF-Token` for token handle `bsky_api`.
+- The SPA provides `window.BSKY.csrf` and also attempts to read CSRF from the DOM/cookies.
+
+#### JWT automation (optional)
+
+For scripts and automation (including MCP-style tooling), the API can accept `Authorization: Bearer <jwt>`.
+When a valid JWT is present:
+
+- CSRF validation is skipped.
+- Some admin-only operations still require a superuser (either a superuser JWT or a superuser browser session).
+
+Relevant `.env` keys:
+
+- `CONCRETESKY_JWT_ENABLED` (default `false`)
+- `CONCRETESKY_JWT_SECRET` (min length 16)
+- `CONCRETESKY_JWT_USERS` / `CONCRETESKY_JWT_USER` (comma-separated ConcreteCMS usernames)
+- `CONCRETESKY_JWT_REQUIRE_SUPERUSER` (default `true`)
+- `CONCRETESKY_JWT_ENFORCE` (default `false`; when true, all requests require JWT)
+
+### Errors
+
+- Errors are returned as JSON with an `error` string and an HTTP status code.
+- Rate limiting uses HTTP `429` with a `Retry-After` header.
+- The JS client wraps 429s into a `RateLimitError` (with `retryAfterSeconds`).
+
+### Key methods (documented)
+
+The list below is not exhaustive, but it covers the ConcreteSky-specific integration surface and the methods that are most likely to be called directly.
+
+#### `authStatus`
+
+Returns ConcreteCMS user status and current Bluesky connection status.
+
+- Does **not** require an existing Bluesky session.
+- Hardened to never fatal-loop if the cache DB is unavailable.
+
+Response fields (high level):
+
+- `c5.registered`, `c5.userId`, `c5.userName`
+- `connected`, `did`, `handle`, `displayName`, `avatar`, `pds`, `updatedAt`
+- `activeDid` and `accounts[]` (multi-account support)
+- `cacheAvailable` and `cacheError`
+
+#### Cache calendar + catalogue management
+
+These endpoints operate on the local SQLite cache catalogue for the **currently connected account**.
+
+- `cacheCalendarMonth`
+  - Returns which days in a given month have cached **posts** and/or **notifications**, including counts.
+- `cacheCatalogStatus`
+  - High-level catalogue stats: row counts, min/max timestamps, db size info, and relevant meta keys.
+- `cacheCatalogPrune`
+  - Deletes old cached rows.
+  - Params:
+    - `kind`: `posts|notifications|all` (default `posts`)
+    - `before`: ISO timestamp cutoff (exclusive) *or* `keepDays` (keep last N days)
+    - `vacuum`: boolean (default `false`)
+- `cacheCatalogResync`
+  - Resets backfill state so cache can be re-ingested.
+  - Params:
+    - `kind`: `posts|notifications|all` (default `posts`)
+    - `clear`: boolean (default `true`)
+    - `postsFilter`: optional `app.bsky.feed.getAuthorFeed` filter (e.g. `posts_with_replies`)
+
+#### Translation
+
+- `translateText`
+  - Params: `text` (required), `to` (default `en`), `from` (default `auto`)
+  - Backend is configured via `.env`:
+    - `CONCRETESKY_TRANSLATE_BACKEND` (`libretranslate` or `none`)
+    - `CONCRETESKY_TRANSLATE_LIBRETRANSLATE_URL`
+    - `CONCRETESKY_TRANSLATE_LIBRETRANSLATE_API_KEY` (optional)
+
+#### Post editing
+
+- `editPost`
+  - Overwrites an existing post record in your repo (`com.atproto.repo.putRecord`).
+  - You can only edit posts owned by the connected DID.
+  - Params:
+    - `uri` (optional) and/or `rkey` (required if uri not provided)
+    - `text` (required)
+    - `facets` (optional; to set/clear explicitly)
+    - `langs` (optional; to set/clear explicitly)
+
+#### Scheduled posts
+
+Scheduled posts are stored site-locally (SQLite) as ready-to-publish payloads.
+
+- `schedulePost`
+  - Params:
+    - `scheduledAt` (required; ISO; must be in the future)
+    - `kind`: `post|thread` (default `post`)
+    - For `post`: `post: { text, langs?, facets?, embed? }`
+    - For `thread`: `parts: [{ text, langs?, facets?, embed? }, ...]` (max 10)
+    - Optional: `interactions` (gates)
+- `listScheduledPosts`
+  - Params: `limit` (default 50), `includeDone` (default false)
+- `cancelScheduledPost`
+  - Params: `id` (required)
+- `processScheduledPosts`
+  - Params: `max` (default 25)
+  - Used by UI buttons and by the scheduled-posts job.
+
+#### MCP login helper (optional)
+
+- `mcpLogin`
+  - Converts a valid JWT into a ConcreteCMS logged-in session cookie.
+  - Disabled by default; gated by `CONCRETESKY_MCP_LOGIN_ENABLED`.
+
+### Methods (inventory)
+
+This is a quick index of methods currently implemented by the router.
+
+**Identity / profiles**: `getProfile`, `getProfiles`, `profilesHydrate`, `cacheGetProfiles`, `searchActors`
+
+**Feeds / timelines**: `getTimeline`, `getAuthorFeed`, `getFeed`, `searchPosts`
+
+**Posts / threads**: `getPosts`, `getPostThread`, `createPost`, `editPost`, `deletePost`
+
+**Media**: `uploadBlob`
+
+**Engagement**: `like`, `unlike`, `repost`, `unrepost`, `getLikes`, `getRepostedBy`, `getQuotes`
+
+**Relationships**: `getFollowers`, `getFollows`, `getRelationships`, `follow`, `unfollow`, `followMany`, `queueFollows`, `followQueueStatus`, `processFollowQueue`
+
+**Moderation / graph**: `getBlocks`, `block`, `unblock`, `getMutes`, `mute`, `unmute`
+
+**Lists**: `getLists`
+
+**Notifications**: `listNotifications`, `updateSeenNotifications`, `listNotificationsSince`
+
+**Translation**: `translateText`
+
+**Scheduled posts**: `schedulePost`, `listScheduledPosts`, `cancelScheduledPost`, `processScheduledPosts`
+
+**Cache/backfill (optional)**: `cacheCalendarMonth`, `cacheCatalogStatus`, `cacheCatalogPrune`, `cacheCatalogResync`, and other methods starting with `cache*`
+
+**Groups (site-local)**: `groupsList`, `groupGet`, `groupCreate`, `groupUpdate`, `groupJoin`, `groupInviteJoin`, `groupInviteAccept`, `groupLeave`, `groupAuditList`, `groupMembersList`, `groupMemberApprove`, `groupMemberDeny`, `groupMemberWarn`, `groupMemberSuspend`, `groupMemberUnsuspend`, `groupMemberBan`, `groupMemberUnban`, `groupInviteCreate`, `groupInvitesList`, `groupInviteRevoke`, `groupRulesAccept`, `groupRulesUpdate`
+
+**Groups (post moderation)**: `groupPostSubmit`, `groupPostsList`, `groupPostsPendingList`, `groupPostApprove`, `groupPostDeny`
+
+**Groups (feed suppression)**: `groupHiddenPostsList`, `groupPostHide`, `groupPostUnhide`
+
+**Groups (phrase filters)**: `groupPhraseFiltersList`, `groupPhraseFilterAdd`, `groupPhraseFilterRemove`
+
+**Groups (reports)**: `groupReportCreate`, `groupReportsList`, `groupReportResolve`
+
+**Groups (self-service)**: `groupPostsMineList`
+
+**Groups (posting settings)**: `groupPostingSettingsUpdate`
+
+**Bluesky parity: gates**: `createThreadGate`, `createPostGate`
+
+**Rich-text helpers**: `resolveHandles`, `unfurlUrl`
+
+## UI Web Components API
 
 ## Component Hierarchy
 
@@ -218,61 +422,6 @@ The grid layout depends on a simple contract:
 - The grid container width is set to: `numCols * (cardW + gap) - gap`.
 
 This prevents a “phantom column” gap and keeps columns stable across shadow roots.
-
-## Backend API (`call()`)
-
-ConcreteSky uses a single JSON endpoint (ConcreteCMS controller) that behaves like a lightweight JSON-RPC.
-
-- Client wrapper: `js/api.js`
-- Server router: `controllers/single_page/concretesky/api.php`
-
-
-### Transport
-
-- **URL**: `window.BSKY.apiPath` (defaults to `/api`)
-- **Method**: `POST`
-- **Body**: `{ "method": "<name>", "params": { ... } }`
-- **Errors**: server returns JSON with `error`/`message`; the client throws.
-
-### Methods (current)
-
-**Identity / profiles**: `getProfile`, `getProfiles`, `profilesHydrate`, `cacheGetProfiles`, `searchActors`
-
-**Feeds / timelines**: `getTimeline`, `getAuthorFeed`, `getFeed`, `searchPosts`
-
-**Posts / threads**: `getPosts`, `getPostThread`, `createPost`, `deletePost`
-
-**Media**: `uploadBlob`
-
-**Engagement**: `like`, `unlike`, `repost`, `unrepost`, `getLikes`, `getRepostedBy`, `getQuotes`
-
-**Relationships**: `getFollowers`, `getFollows`, `getRelationships`, `follow`, `unfollow`, `followMany`, `queueFollows`, `followQueueStatus`, `processFollowQueue`
-
-**Moderation / graph**: `getBlocks`, `block`, `unblock`, `getMutes`, `mute`, `unmute`
-
-**Lists**: `getLists`
-
-**Groups (site-local)**: `groupsList`, `groupGet`, `groupCreate`, `groupUpdate`, `groupJoin`, `groupLeave`, `groupAuditList`, `groupMembersList`, `groupMemberApprove`, `groupMemberDeny`, `groupMemberWarn`, `groupMemberSuspend`, `groupMemberUnsuspend`, `groupMemberBan`, `groupMemberUnban`, `groupInviteCreate`, `groupInvitesList`, `groupInviteRevoke`, `groupInviteJoin`, `groupRulesAccept`, `groupRulesUpdate`
-
-**Groups (post moderation)**: `groupPostSubmit`, `groupPostsList`, `groupPostsPendingList`, `groupPostApprove`, `groupPostDeny`
-
-**Groups (feed suppression)**: `groupHiddenPostsList`, `groupPostHide`, `groupPostUnhide`
-
-**Groups (phrase filters)**: `groupPhraseFiltersList`, `groupPhraseFilterAdd`, `groupPhraseFilterRemove`
-
-**Groups (reports)**: `groupReportCreate`, `groupReportsList`, `groupReportResolve`
-
-**Groups (self-service)**: `groupPostsMineList`
-
-**Groups (posting settings)**: `groupPostingSettingsUpdate`
-
-**Bluesky parity: gates**: `createThreadGate`, `createPostGate`
-
-**Rich-text helpers**: `resolveHandles`, `unfurlUrl`
-
-**Notifications**: `listNotifications`, `updateSeenNotifications`, `listNotificationsSince`
-
-**Cache/backfill (optional)**: all methods starting with `cache*`
 
 ## Background follow-queue draining (no browser needed)
 

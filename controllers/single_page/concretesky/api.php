@@ -691,6 +691,8 @@ class Api extends ParentController
                     'handle' => null,
                     'pds' => null,
                     'updatedAt' => null,
+                    'cacheAvailable' => null,
+                    'cacheError' => null,
                 ];
 
                 // Guests can see status (always disconnected) but cannot store sessions.
@@ -698,30 +700,42 @@ class Api extends ParentController
                     return $this->json($out);
                 }
 
-                $pdo = $this->cacheDb();
-                $this->cacheMigrate($pdo);
-                $row = $this->authSessionGet($pdo, $c5UserId);
-                $accounts = $this->authSessionsList($pdo, $c5UserId);
+                try {
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
 
-                $out['connected'] = (bool)($row && !empty($row['did']) && !empty($row['access_jwt']) && !empty($row['refresh_jwt']));
-                $out['did'] = $row['did'] ?? null;
-                $out['handle'] = $row['handle'] ?? null;
-                $out['displayName'] = $row['display_name'] ?? null;
-                $out['avatar'] = $row['avatar'] ?? null;
-                $out['pds'] = $row['pds'] ?? null;
-                $out['updatedAt'] = $row['updated_at'] ?? null;
-                $out['activeDid'] = $this->authActiveDidGet($pdo, $c5UserId);
-                $out['accounts'] = array_map(static function ($a) {
-                    return [
-                        'did' => $a['did'] ?? null,
-                        'handle' => $a['handle'] ?? null,
-                        'displayName' => $a['display_name'] ?? null,
-                        'avatar' => $a['avatar'] ?? null,
-                        'pds' => $a['pds'] ?? null,
-                        'authType' => $a['auth_type'] ?? null,
-                        'updatedAt' => $a['updated_at'] ?? null,
-                    ];
-                }, $accounts);
+                    $out['cacheAvailable'] = true;
+
+                    $row = $this->authSessionGet($pdo, $c5UserId);
+                    $accounts = $this->authSessionsList($pdo, $c5UserId);
+
+                    $out['connected'] = (bool)($row && !empty($row['did']) && !empty($row['access_jwt']) && !empty($row['refresh_jwt']));
+                    $out['did'] = $row['did'] ?? null;
+                    $out['handle'] = $row['handle'] ?? null;
+                    $out['displayName'] = $row['display_name'] ?? null;
+                    $out['avatar'] = $row['avatar'] ?? null;
+                    $out['pds'] = $row['pds'] ?? null;
+                    $out['updatedAt'] = $row['updated_at'] ?? null;
+                    $out['activeDid'] = $this->authActiveDidGet($pdo, $c5UserId);
+                    $out['accounts'] = array_map(static function ($a) {
+                        return [
+                            'did' => $a['did'] ?? null,
+                            'handle' => $a['handle'] ?? null,
+                            'displayName' => $a['display_name'] ?? null,
+                            'avatar' => $a['avatar'] ?? null,
+                            'pds' => $a['pds'] ?? null,
+                            'authType' => $a['auth_type'] ?? null,
+                            'accountCreatedAt' => $a['account_created_at'] ?? null,
+                            'updatedAt' => $a['updated_at'] ?? null,
+                        ];
+                    }, $accounts);
+                } catch (\Throwable $e) {
+                    // Cache DB is optional for status; don't hard-fail the whole UI.
+                    $out['cacheAvailable'] = false;
+                    $out['cacheError'] = $e->getMessage();
+                    $out['connected'] = false;
+                    $out['accounts'] = [];
+                }
                 return $this->json($out);
             }
 
@@ -854,6 +868,7 @@ class Api extends ParentController
                             'avatar' => $a['avatar'] ?? null,
                             'pds' => $a['pds'] ?? null,
                             'authType' => $a['auth_type'] ?? null,
+                            'accountCreatedAt' => $a['account_created_at'] ?? null,
                             'updatedAt' => $a['updated_at'] ?? null,
                         ];
                     }, $accounts),
@@ -1026,7 +1041,8 @@ class Api extends ParentController
                     $c5UserId,
                     (string)($sess['did'] ?? ''),
                     isset($sess['handle']) ? (string)$sess['handle'] : null,
-                    isset($sess['pds']) ? (string)$sess['pds'] : null
+                    isset($sess['pds']) ? (string)$sess['pds'] : null,
+                    null
                 );
 
                 // Return profile so UI can immediately render.
@@ -1034,6 +1050,22 @@ class Api extends ParentController
                 $me = $this->xrpc('GET', 'app.bsky.actor.getProfile', $sess['accessJwt'], ['actor' => $sess['did']]);
                 // Cache it for account manager + identity rendering.
                 $this->cacheUpsertProfile($pdo, is_array($me) ? $me : []);
+
+                // Persist account creation date (profile createdAt) into the Concrete user account list.
+                try {
+                    $createdAt = (is_array($me) && isset($me['createdAt'])) ? trim((string)$me['createdAt']) : '';
+                    $createdAt = $createdAt !== '' ? $createdAt : null;
+                    $this->cacheAccountsUpsert(
+                        $pdo,
+                        $c5UserId,
+                        (string)($sess['did'] ?? ''),
+                        isset($sess['handle']) ? (string)$sess['handle'] : null,
+                        isset($sess['pds']) ? (string)$sess['pds'] : null,
+                        $createdAt
+                    );
+                } catch (\Throwable $e) {
+                    // ignore
+                }
                 return $this->json(['ok' => true, 'session' => ['did' => $sess['did'], 'handle' => $sess['handle'] ?? null, 'pds' => $sess['pds'] ?? null], 'profile' => $me]);
             }
 
@@ -4856,6 +4888,141 @@ class Api extends ParentController
                     return $this->json($this->createRecord($session, 'app.bsky.feed.post', $record));
                 }
 
+                case 'editPost': {
+                    // Overwrite an existing post record in *your* repo.
+                    // NOTE: app.bsky.feed.post has only createdAt; edits are represented by record overwrite.
+                    $uri = trim((string)($params['uri'] ?? ''));
+                    $rkey = trim((string)($params['rkey'] ?? ''));
+                    if ($rkey === '' && $uri !== '') $rkey = (string)$this->rkeyFromAtUri($uri);
+                    if ($rkey === '') return $this->json(['error' => 'Missing rkey/uri'], 400);
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    if ($uri !== '') {
+                        $prefix = 'at://' . $meDid . '/app.bsky.feed.post/';
+                        if (!str_starts_with($uri, $prefix)) {
+                            return $this->json(['error' => 'Can only edit your own posts'], 403);
+                        }
+                    }
+
+                    $text = (string)($params['text'] ?? '');
+                    if (trim($text) === '') return $this->json(['error' => 'Missing text'], 400);
+
+                    // Fetch existing record to preserve reply/embed/createdAt/labels/etc.
+                    $got = $this->xrpcSession('GET', 'com.atproto.repo.getRecord',
+                        $session, [
+                            'repo' => $meDid,
+                            'collection' => 'app.bsky.feed.post',
+                            'rkey' => $rkey,
+                        ]
+                    );
+
+                    $old = null;
+                    if (isset($got['value']) && is_array($got['value'])) $old = $got['value'];
+                    if ($old === null && isset($got['record']) && is_array($got['record'])) $old = $got['record'];
+                    if ($old === null) return $this->json(['error' => 'Post record not found'], 404);
+
+                    $rec = $old;
+                    $rec['$type'] = 'app.bsky.feed.post';
+                    $rec['text'] = $text;
+
+                    // Allow client to set/clear facets/langs explicitly.
+                    if (array_key_exists('facets', $params)) {
+                        if (is_array($params['facets'])) $rec['facets'] = $params['facets'];
+                        else unset($rec['facets']);
+                    }
+                    if (array_key_exists('langs', $params)) {
+                        if (is_array($params['langs'])) $rec['langs'] = array_values($params['langs']);
+                        else unset($rec['langs']);
+                    }
+
+                    // Ensure createdAt exists.
+                    if (empty($rec['createdAt'])) $rec['createdAt'] = gmdate('c');
+
+                    $out = $this->xrpcSession('POST', 'com.atproto.repo.putRecord',
+                        $session, [], [
+                            'repo' => $meDid,
+                            'collection' => 'app.bsky.feed.post',
+                            'rkey' => $rkey,
+                            'record' => $rec,
+                        ]
+                    );
+                    return $this->json($out);
+                }
+
+                case 'translateText': {
+                    $this->loadDotEnvOnce();
+
+                    $backend = strtolower(trim($this->envStr('CONCRETESKY_TRANSLATE_BACKEND', 'none')));
+                    if ($backend === '' || $backend === 'none' || $backend === 'off' || $backend === 'disabled') {
+                        return $this->json([
+                            'error' => 'Translation backend not configured',
+                            'hint' => 'Set CONCRETESKY_TRANSLATE_BACKEND in .env (e.g. libretranslate).',
+                        ], 501);
+                    }
+
+                    $text = (string)($params['text'] ?? '');
+                    if (trim($text) === '') return $this->json(['error' => 'Missing text'], 400);
+                    if (strlen($text) > 10000) return $this->json(['error' => 'Text too long'], 413);
+
+                    $to = strtolower(trim((string)($params['to'] ?? '')));
+                    if ($to === '') $to = 'en';
+                    if (!preg_match('/^[a-z]{2,3}$/', $to)) return $this->json(['error' => 'Invalid target language'], 400);
+
+                    $from = strtolower(trim((string)($params['from'] ?? '')));
+                    if ($from !== '' && $from !== 'auto' && !preg_match('/^[a-z]{2,3}$/', $from)) {
+                        return $this->json(['error' => 'Invalid source language'], 400);
+                    }
+                    if ($from === '') $from = 'auto';
+
+                    if ($backend === 'libretranslate') {
+                        $base = rtrim(trim($this->envStr('CONCRETESKY_TRANSLATE_LIBRETRANSLATE_URL', '')), '/');
+                        if ($base === '') {
+                            return $this->json([
+                                'error' => 'LibreTranslate URL not configured',
+                                'hint' => 'Set CONCRETESKY_TRANSLATE_LIBRETRANSLATE_URL in .env.',
+                            ], 501);
+                        }
+
+                        $apiKey = trim($this->envStr('CONCRETESKY_TRANSLATE_LIBRETRANSLATE_API_KEY', ''));
+                        $payload = [
+                            'q' => $text,
+                            'source' => $from,
+                            'target' => $to,
+                            'format' => 'text',
+                        ];
+                        if ($apiKey !== '') $payload['api_key'] = $apiKey;
+
+                        $r = $this->httpRaw('POST', $base . '/translate', $payload, ['Accept: application/json'], 'application/x-www-form-urlencoded');
+                        if (($r['status'] ?? 500) >= 400) {
+                            $msg = is_array($r['json']) ? ($r['json']['error'] ?? ($r['json']['message'] ?? json_encode($r['json']))) : (string)($r['text'] ?? '');
+                            throw new \RuntimeException('Translate failed (HTTP ' . (int)($r['status'] ?? 500) . '): ' . $msg);
+                        }
+
+                        $translated = '';
+                        if (is_array($r['json'])) {
+                            $translated = (string)($r['json']['translatedText'] ?? '');
+                        }
+                        if (trim($translated) === '') {
+                            // Some instances return different shapes; fall back to raw text if needed.
+                            $translated = is_string($r['text'] ?? null) ? (string)$r['text'] : '';
+                        }
+
+                        return $this->json([
+                            'translatedText' => $translated,
+                            'to' => $to,
+                            'from' => $from,
+                            'backend' => 'libretranslate',
+                        ]);
+                    }
+
+                    return $this->json([
+                        'error' => 'Unsupported translation backend',
+                        'backend' => $backend,
+                    ], 501);
+                }
+
                 case 'schedulePost': {
                     $meDid = (string)($session['did'] ?? '');
                     if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
@@ -6527,6 +6694,243 @@ class Api extends ParentController
                     return $this->json($out);
                 }
 
+                case 'cacheCatalogStatus': {
+                    // Return high-level stats about the cached catalogue for the currently connected account.
+                    // Useful for management UI (prune/resync).
+
+                    $meDid = $session['did'] ?? null;
+                    if (!$meDid) return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $dbPath = $this->cacheDbPath();
+                    $dbDir = $this->cacheDir();
+
+                    $pageCount = null;
+                    $pageSize = null;
+                    $pragmaBytes = null;
+                    try {
+                        $pageCount = (int)$pdo->query('PRAGMA page_count')->fetchColumn();
+                        $pageSize = (int)$pdo->query('PRAGMA page_size')->fetchColumn();
+                        if ($pageCount > 0 && $pageSize > 0) {
+                            $pragmaBytes = $pageCount * $pageSize;
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+
+                    $fileBytes = null;
+                    $walBytes = null;
+                    $shmBytes = null;
+                    try {
+                        if (is_file($dbPath)) $fileBytes = @filesize($dbPath);
+                        if (is_file($dbPath . '-wal')) $walBytes = @filesize($dbPath . '-wal');
+                        if (is_file($dbPath . '-shm')) $shmBytes = @filesize($dbPath . '-shm');
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+
+                    $posts = ['count' => 0, 'minCreatedAt' => null, 'maxCreatedAt' => null];
+                    $notifs = ['count' => 0, 'minIndexedAt' => null, 'maxIndexedAt' => null];
+
+                    try {
+                        $st = $pdo->prepare('SELECT COUNT(1) AS c, MIN(created_at) AS mn, MAX(created_at) AS mx FROM posts WHERE actor_did = :a');
+                        $st->execute([':a' => $meDid]);
+                        $r = $st->fetch(\PDO::FETCH_ASSOC) ?: [];
+                        $posts['count'] = (int)($r['c'] ?? 0);
+                        $posts['minCreatedAt'] = $r['mn'] ?? null;
+                        $posts['maxCreatedAt'] = $r['mx'] ?? null;
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+
+                    try {
+                        $st = $pdo->prepare('SELECT COUNT(1) AS c, MIN(indexed_at) AS mn, MAX(indexed_at) AS mx FROM notifications WHERE actor_did = :a');
+                        $st->execute([':a' => $meDid]);
+                        $r = $st->fetch(\PDO::FETCH_ASSOC) ?: [];
+                        $notifs['count'] = (int)($r['c'] ?? 0);
+                        $notifs['minIndexedAt'] = $r['mn'] ?? null;
+                        $notifs['maxIndexedAt'] = $r['mx'] ?? null;
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+
+                    $metaKeys = [
+                        'posts_backfill_cursor',
+                        'posts_backfill_done',
+                        'posts_backfill_filter',
+                        'posts_backfill_last_stop_before',
+                        'notifications_backfill_cursor',
+                        'notifications_backfill_last_stop_before',
+                        'notifications_backfill_last_cutoff_iso',
+                        'notifications_backfill_last_oldest_seen_iso',
+                        'notifications_backfill_last_retention_limited',
+                        'notifications_backfill_last_done',
+                    ];
+                    $meta = [];
+                    foreach ($metaKeys as $k) {
+                        try {
+                            $meta[$k] = $this->cacheMetaGet($pdo, $meDid, $k);
+                        } catch (\Throwable $e) {
+                            $meta[$k] = null;
+                        }
+                    }
+
+                    return $this->json([
+                        'ok' => true,
+                        'actorDid' => $meDid,
+                        'db' => [
+                            'dir' => $dbDir,
+                            'path' => $dbPath,
+                            'fileBytes' => $fileBytes,
+                            'walBytes' => $walBytes,
+                            'shmBytes' => $shmBytes,
+                            'pageCount' => $pageCount,
+                            'pageSize' => $pageSize,
+                            'pragmaBytes' => $pragmaBytes,
+                        ],
+                        'posts' => $posts,
+                        'notifications' => $notifs,
+                        'meta' => $meta,
+                    ]);
+                }
+
+                case 'cacheCatalogPrune': {
+                    // Prune cached catalogue data for the currently connected account.
+                    // Params:
+                    // - kind: 'posts' | 'notifications' | 'all' (default posts)
+                    // - before: ISO timestamp cutoff (exclusive). Rows older than this will be deleted.
+                    // - keepDays: alternative to before (keep last N days)
+                    // - vacuum: true|false (default false)
+
+                    $meDid = $session['did'] ?? null;
+                    if (!$meDid) return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $kind = (string)($params['kind'] ?? 'posts');
+                    $before = isset($params['before']) ? trim((string)$params['before']) : '';
+                    $keepDays = isset($params['keepDays']) ? (int)$params['keepDays'] : null;
+                    $vacuum = !empty($params['vacuum']);
+
+                    if ($before === '' && ($keepDays === null || $keepDays <= 0)) {
+                        return $this->json(['error' => 'Missing before or keepDays'], 400);
+                    }
+
+                    $cutoffIso = null;
+                    if ($before !== '') {
+                        $t = strtotime($before);
+                        if ($t === false) return $this->json(['error' => 'Invalid before timestamp'], 400);
+                        $cutoffIso = gmdate('c', $t);
+                    } else {
+                        $days = max(1, min(3650, (int)$keepDays));
+                        $cutoffIso = gmdate('c', time() - ($days * 86400));
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $deleted = [
+                        'posts' => 0,
+                        'notifications' => 0,
+                    ];
+
+                    $pdo->beginTransaction();
+                    try {
+                        if ($kind === 'posts' || $kind === 'all') {
+                            $st = $pdo->prepare('DELETE FROM posts WHERE actor_did = :a AND created_at IS NOT NULL AND created_at < :c');
+                            $st->execute([':a' => $meDid, ':c' => $cutoffIso]);
+                            $deleted['posts'] = (int)$st->rowCount();
+                        }
+
+                        if ($kind === 'notifications' || $kind === 'all') {
+                            $st = $pdo->prepare('DELETE FROM notifications WHERE actor_did = :a AND indexed_at IS NOT NULL AND indexed_at < :c');
+                            $st->execute([':a' => $meDid, ':c' => $cutoffIso]);
+                            $deleted['notifications'] = (int)$st->rowCount();
+                        }
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        try { $pdo->rollBack(); } catch (\Throwable $e2) {}
+                        throw $e;
+                    }
+
+                    if ($vacuum) {
+                        // Vacuum can be expensive; keep it opt-in.
+                        try { $pdo->exec('VACUUM'); } catch (\Throwable $e) { /* ignore */ }
+                    }
+
+                    return $this->json([
+                        'ok' => true,
+                        'actorDid' => $meDid,
+                        'kind' => $kind,
+                        'cutoffIso' => $cutoffIso,
+                        'deleted' => $deleted,
+                    ]);
+                }
+
+                case 'cacheCatalogResync': {
+                    // Reset backfill state (and optionally clear cached rows) so the catalogue can be re-ingested.
+                    // Params:
+                    // - kind: 'posts' | 'notifications' | 'all' (default posts)
+                    // - clear: true|false (default true)
+                    // - postsFilter: optional app.bsky.feed.getAuthorFeed filter (e.g. 'posts_with_replies')
+
+                    $meDid = $session['did'] ?? null;
+                    if (!$meDid) return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $kind = (string)($params['kind'] ?? 'posts');
+                    $clear = !array_key_exists('clear', (array)$params) ? true : (bool)$params['clear'];
+                    $postsFilter = isset($params['postsFilter']) ? trim((string)$params['postsFilter']) : '';
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $pdo->beginTransaction();
+                    try {
+                        if ($clear) {
+                            if ($kind === 'posts' || $kind === 'all') {
+                                $st = $pdo->prepare('DELETE FROM posts WHERE actor_did = :a');
+                                $st->execute([':a' => $meDid]);
+                            }
+                            if ($kind === 'notifications' || $kind === 'all') {
+                                $st = $pdo->prepare('DELETE FROM notifications WHERE actor_did = :a');
+                                $st->execute([':a' => $meDid]);
+                            }
+                        }
+
+                        if ($kind === 'posts' || $kind === 'all') {
+                            $this->cacheMetaSet($pdo, $meDid, 'posts_backfill_cursor', '');
+                            $this->cacheMetaSet($pdo, $meDid, 'posts_backfill_done', '');
+                            $this->cacheMetaSet($pdo, $meDid, 'posts_backfill_last_stop_before', '');
+                            if ($postsFilter !== '') {
+                                $this->cacheMetaSet($pdo, $meDid, 'posts_backfill_filter', $postsFilter);
+                            }
+                        }
+
+                        if ($kind === 'notifications' || $kind === 'all') {
+                            $this->cacheMetaSet($pdo, $meDid, 'notifications_backfill_cursor', '');
+                            $this->cacheMetaSet($pdo, $meDid, 'notifications_backfill_last_stop_before', '');
+                            $this->cacheMetaSet($pdo, $meDid, 'notifications_backfill_last_cutoff_iso', '');
+                            $this->cacheMetaSet($pdo, $meDid, 'notifications_backfill_last_oldest_seen_iso', '');
+                            $this->cacheMetaSet($pdo, $meDid, 'notifications_backfill_last_retention_limited', '');
+                            $this->cacheMetaSet($pdo, $meDid, 'notifications_backfill_last_done', '');
+                        }
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        try { $pdo->rollBack(); } catch (\Throwable $e2) {}
+                        throw $e;
+                    }
+
+                    return $this->json([
+                        'ok' => true,
+                        'actorDid' => $meDid,
+                        'kind' => $kind,
+                        'cleared' => $clear,
+                        'postsFilter' => $postsFilter !== '' ? $postsFilter : null,
+                    ]);
+                }
+
                 case 'cacheQueryPeople': {
                     // Query cached followers/following.
                     // Params:
@@ -6706,8 +7110,46 @@ class Api extends ParentController
                         $posts = $this->cacheSyncMyPosts($pdo, $session, $meDid, 24, $pagesMax, null);
                         $this->cacheMetaSet($pdo, $meDid, 'last_posts_sync_at', $now);
 
+                        // Auto-backfill older posts incrementally (resumes via posts_backfill_cursor).
+                        // Small-per-tick to avoid timeouts and rate limit spikes.
+                        $postsBackfill = null;
+                        try {
+                            if ($this->envBool('CONCRETESKY_AUTO_BACKFILL_POSTS', true)) {
+                                $done = $this->cacheMetaGet($pdo, $meDid, 'posts_backfill_done');
+                                if ($done !== '1') {
+                                    $bfPages = (int)(getenv('CONCRETESKY_AUTO_BACKFILL_POSTS_PAGES_PER_SYNC') ?: 1);
+                                    if ($bfPages < 1) $bfPages = 1;
+                                    if ($bfPages > 10) $bfPages = 10;
+
+                                    // Default to include replies as well as posts.
+                                    $filterEnv = getenv('CONCRETESKY_AUTO_BACKFILL_POSTS_FILTER');
+                                    $filter = ($filterEnv !== false && $filterEnv !== null) ? trim((string)$filterEnv) : '';
+                                    if ($filter === '' || $filter === 'all') {
+                                        $filter = 'posts_with_replies';
+                                    }
+
+                                    // If the desired filter changes, reset cursor/done for this DID.
+                                    $prevFilter = $this->cacheMetaGet($pdo, $meDid, 'posts_backfill_filter');
+                                    if ($prevFilter !== $filter) {
+                                        $this->cacheMetaSet($pdo, $meDid, 'posts_backfill_cursor', '');
+                                        $this->cacheMetaSet($pdo, $meDid, 'posts_backfill_done', '');
+                                        $this->cacheMetaSet($pdo, $meDid, 'posts_backfill_filter', $filter);
+                                    }
+
+                                    // If the server rejects the filter for any reason, fall back to default behavior.
+                                    try {
+                                        $postsBackfill = $this->cacheBackfillMyPosts($pdo, $session, $meDid, $bfPages, $filter, false, null);
+                                    } catch (\Throwable $e2) {
+                                        $postsBackfill = $this->cacheBackfillMyPosts($pdo, $session, $meDid, $bfPages, null, false, null);
+                                    }
+                                }
+                            }
+                        } catch (\Throwable $e) {
+                            // ignore
+                        }
+
                         $pdo->commit();
-                        return $this->json(['ok' => true, 'actorDid' => $meDid, 'syncedAt' => $now, 'minutes' => $minutes, 'notifications' => $notif, 'posts' => $posts]);
+                        return $this->json(['ok' => true, 'actorDid' => $meDid, 'syncedAt' => $now, 'minutes' => $minutes, 'notifications' => $notif, 'posts' => $posts, 'postsBackfill' => $postsBackfill]);
                     } catch (\Throwable $e) {
                         $pdo->rollBack();
                         throw $e;
@@ -8471,27 +8913,95 @@ class Api extends ParentController
 
     /* ===================== SQLite cache helpers ===================== */
 
-    protected function cacheDir(): string
+    protected function legacyCacheDbPaths(): array
     {
-        // application/files is typically writable in ConcreteCMS.
         $appDir = defined('DIR_APPLICATION')
             ? (string)DIR_APPLICATION
             : (defined('DIR_BASE') ? (rtrim((string)DIR_BASE, '/') . '/application') : (dirname(__DIR__, 4) . '/application'));
 
-        // Allow admins to relocate/rename the storage subdir later.
-        $subdir = (string)(getenv('BSKY_STORAGE_SUBDIR') ?: 'concretesky');
-        $subdir = trim($subdir, "/\t\n\r\0\x0B/");
-        if ($subdir === '') $subdir = 'concretesky';
+        $paths = [];
 
-        $dir = rtrim($appDir, '/') . '/files/' . $subdir;
+        // Legacy: historical default (bluesky_feed)
+        $paths[] = rtrim($appDir, '/') . '/files/bluesky_feed/cache.sqlite';
 
-        // Backwards-compat: if the new default doesn't exist yet but the legacy dir does, reuse it.
-        if ($subdir === 'concretesky' && !is_dir($dir)) {
-            $legacy = rtrim($appDir, '/') . '/files/bluesky_feed';
-            if (is_dir($legacy)) return $legacy;
+        // Legacy: previous default for this package.
+        $paths[] = rtrim($appDir, '/') . '/files/concretesky/cache.sqlite';
+
+        // Legacy: allow folks who used the old subdir var to still migrate cleanly.
+        $legacySubdir = (string)(getenv('BSKY_STORAGE_SUBDIR') ?: '');
+        $legacySubdir = trim($legacySubdir, "/\t\n\r\0\x0B/");
+        if ($legacySubdir !== '' && $legacySubdir !== 'concretesky' && $legacySubdir !== 'bluesky_feed') {
+            $paths[] = rtrim($appDir, '/') . '/files/' . $legacySubdir . '/cache.sqlite';
         }
 
-        return $dir;
+        // De-dupe
+        $uniq = [];
+        foreach ($paths as $p) {
+            $p = (string)$p;
+            if ($p === '') continue;
+            $uniq[$p] = true;
+        }
+        return array_keys($uniq);
+    }
+
+    protected function migrateLegacyCacheDbIfNeeded(string $targetPath): void
+    {
+        if (is_file($targetPath)) {
+            return;
+        }
+
+        $targetDir = dirname($targetPath);
+        if (!is_dir($targetDir)) {
+            @mkdir($targetDir, 0775, true);
+        }
+
+        foreach ($this->legacyCacheDbPaths() as $legacyPath) {
+            if (!is_file($legacyPath)) continue;
+
+            // Avoid self-migration.
+            if (realpath($legacyPath) && realpath($targetPath) && realpath($legacyPath) === realpath($targetPath)) {
+                return;
+            }
+
+            $copyOrMove = static function (string $from, string $to): void {
+                if (!is_file($from)) return;
+                if (@rename($from, $to)) return;
+                if (@copy($from, $to)) {
+                    try {
+                        $a = @filesize($from);
+                        $b = @filesize($to);
+                        if ($a !== false && $b !== false && (int)$a === (int)$b) {
+                            @unlink($from);
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+                }
+            };
+
+            // Move/copy main DB plus WAL/SHM sidecars if present.
+            $copyOrMove($legacyPath, $targetPath);
+            $copyOrMove($legacyPath . '-wal', $targetPath . '-wal');
+            $copyOrMove($legacyPath . '-shm', $targetPath . '-shm');
+            return;
+        }
+    }
+
+    protected function cacheDir(): string
+    {
+        // Prefer a non-public directory for the SQLite cache.
+        // Default: inside the package (we also drop a deny rule in /db).
+        // Optional override: point this anywhere writable (recommended for production).
+        $override = getenv('CONCRETESKY_CACHE_DIR');
+        if ($override !== false && $override !== null && $override !== '') {
+            $override = trim((string)$override);
+            if ($override !== '') {
+                return rtrim($override, '/');
+            }
+        }
+
+        $packageRoot = dirname(__DIR__, 3);
+        return rtrim((string)$packageRoot, '/') . '/db';
     }
 
     protected function cacheDbPath(): string
@@ -8507,6 +9017,9 @@ class Api extends ParentController
         }
         @chmod($dir, 0775);
         $path = $this->cacheDbPath();
+
+        // If an older install already has a cache.sqlite under application/files, migrate it.
+        $this->migrateLegacyCacheDbIfNeeded($path);
 
         if (!in_array('sqlite', \PDO::getAvailableDrivers(), true)) {
             throw new \RuntimeException('PDO SQLite driver missing (pdo_sqlite)');
@@ -8787,12 +9300,16 @@ class Api extends ParentController
             did TEXT NOT NULL,
             handle TEXT,
             pds TEXT,
+            account_created_at TEXT,
             first_connected_at TEXT,
             last_connected_at TEXT,
             PRIMARY KEY(c5_user_id, did)
         )');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_c5_accounts_user ON c5_accounts(c5_user_id)');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_c5_accounts_did ON c5_accounts(did)');
+
+        // If upgrading an existing DB, ensure new account-related columns exist.
+        $this->cacheEnsureColumn($pdo, 'c5_accounts', 'account_created_at', 'TEXT');
 
         // If upgrading an existing DB, ensure new OAuth-related columns exist.
         $this->cacheEnsureColumn($pdo, 'auth_sessions', 'auth_type', 'TEXT');
@@ -8874,6 +9391,9 @@ class Api extends ParentController
             PRIMARY KEY(snapshot_id, other_did),
             FOREIGN KEY(snapshot_id) REFERENCES snapshots(id) ON DELETE CASCADE
         )');
+
+        // Helps cacheQueryPeople() which filters edges by snapshot_id + kind.
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_edges_snapshot_kind_other ON edges(snapshot_id, kind, other_did)');
 
         // Persisted follow queue (rate-limit friendly bulk follow support).
         $pdo->exec('CREATE TABLE IF NOT EXISTS follow_queue (
@@ -9188,20 +9708,22 @@ class Api extends ParentController
         $this->cacheMetaSet($pdo, null, 'schema_version', self::CACHE_SCHEMA_VERSION);
     }
 
-    protected function cacheAccountsUpsert(\PDO $pdo, int $c5UserId, string $did, ?string $handle, ?string $pds): void
+    protected function cacheAccountsUpsert(\PDO $pdo, int $c5UserId, string $did, ?string $handle, ?string $pds, ?string $accountCreatedAt = null): void
     {
         $now = gmdate('c');
-        $st = $pdo->prepare('INSERT INTO c5_accounts(c5_user_id, did, handle, pds, first_connected_at, last_connected_at)
-            VALUES(:u,:did,:h,:pds,:t,:t)
+        $st = $pdo->prepare('INSERT INTO c5_accounts(c5_user_id, did, handle, pds, account_created_at, first_connected_at, last_connected_at)
+            VALUES(:u,:did,:h,:pds,:ca,:t,:t)
             ON CONFLICT(c5_user_id, did) DO UPDATE SET
               handle=excluded.handle,
               pds=excluded.pds,
+              account_created_at=COALESCE(excluded.account_created_at, c5_accounts.account_created_at),
               last_connected_at=excluded.last_connected_at');
         $st->execute([
             ':u' => $c5UserId,
             ':did' => $did,
             ':h' => $handle,
             ':pds' => $pds,
+            ':ca' => $accountCreatedAt,
             ':t' => $now,
         ]);
     }

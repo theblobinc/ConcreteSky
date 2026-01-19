@@ -136,7 +136,8 @@ class Callback extends ApiController
                 (int)$c5UserId,
                 (string)$did,
                 $handle ? (string)$handle : null,
-                $pds ? (string)$pds : null
+                $pds ? (string)$pds : null,
+                (is_array($profile) && !empty($profile['createdAt'])) ? (string)$profile['createdAt'] : null
             );
             $pdo->prepare('DELETE FROM oauth_states WHERE state = :s')->execute([':s' => $state]);
 

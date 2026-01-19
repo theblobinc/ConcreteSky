@@ -34,28 +34,81 @@ class ConcreteskyFollowQueueProcessor extends Job
 
     protected function cacheDir(): string
     {
-        $appDir = defined('DIR_APPLICATION')
-            ? (string)DIR_APPLICATION
-            : (defined('DIR_BASE') ? (rtrim((string)DIR_BASE, '/') . '/application') : (dirname(__DIR__, 3) . '/application'));
-
-        $subdir = (string)(getenv('BSKY_STORAGE_SUBDIR') ?: 'concretesky');
-        $subdir = trim($subdir, "/\t\n\r\0\x0B/");
-        if ($subdir === '') $subdir = 'concretesky';
-
-        $dir = rtrim($appDir, '/') . '/files/' . $subdir;
-
-        // Back-compat: reuse legacy bluesky_feed dir when upgrading an existing install.
-        if ($subdir === 'concretesky' && !is_dir($dir)) {
-            $legacy = rtrim($appDir, '/') . '/files/bluesky_feed';
-            if (is_dir($legacy)) return $legacy;
+        $override = getenv('CONCRETESKY_CACHE_DIR');
+        if ($override !== false && $override !== null && $override !== '') {
+            $override = trim((string)$override);
+            if ($override !== '') {
+                return rtrim($override, '/');
+            }
         }
 
-        return $dir;
+        $packageRoot = dirname(__DIR__, 1);
+        return rtrim((string)$packageRoot, '/') . '/db';
     }
 
     protected function cacheDbPath(): string
     {
         return $this->cacheDir() . '/cache.sqlite';
+    }
+
+    protected function legacyCacheDbPaths(): array
+    {
+        $appDir = defined('DIR_APPLICATION')
+            ? (string)DIR_APPLICATION
+            : (defined('DIR_BASE') ? (rtrim((string)DIR_BASE, '/') . '/application') : (dirname(__DIR__, 3) . '/application'));
+
+        $paths = [];
+        $paths[] = rtrim($appDir, '/') . '/files/bluesky_feed/cache.sqlite';
+        $paths[] = rtrim($appDir, '/') . '/files/concretesky/cache.sqlite';
+
+        $legacySubdir = (string)(getenv('BSKY_STORAGE_SUBDIR') ?: '');
+        $legacySubdir = trim($legacySubdir, "/\t\n\r\0\x0B/");
+        if ($legacySubdir !== '' && $legacySubdir !== 'concretesky' && $legacySubdir !== 'bluesky_feed') {
+            $paths[] = rtrim($appDir, '/') . '/files/' . $legacySubdir . '/cache.sqlite';
+        }
+
+        $uniq = [];
+        foreach ($paths as $p) {
+            $p = (string)$p;
+            if ($p === '') continue;
+            $uniq[$p] = true;
+        }
+        return array_keys($uniq);
+    }
+
+    protected function migrateLegacyCacheDbIfNeeded(string $targetPath): void
+    {
+        if (is_file($targetPath)) return;
+
+        $targetDir = dirname($targetPath);
+        if (!is_dir($targetDir)) {
+            @mkdir($targetDir, 0775, true);
+        }
+
+        foreach ($this->legacyCacheDbPaths() as $legacyPath) {
+            if (!is_file($legacyPath)) continue;
+
+            $copyOrMove = static function (string $from, string $to): void {
+                if (!is_file($from)) return;
+                if (@rename($from, $to)) return;
+                if (@copy($from, $to)) {
+                    try {
+                        $a = @filesize($from);
+                        $b = @filesize($to);
+                        if ($a !== false && $b !== false && (int)$a === (int)$b) {
+                            @unlink($from);
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+                }
+            };
+
+            $copyOrMove($legacyPath, $targetPath);
+            $copyOrMove($legacyPath . '-wal', $targetPath . '-wal');
+            $copyOrMove($legacyPath . '-shm', $targetPath . '-shm');
+            return;
+        }
     }
 
     protected function metaGet(\PDO $pdo, string $k): ?string
@@ -86,6 +139,7 @@ class ConcreteskyFollowQueueProcessor extends Job
         $lockSeconds = $this->envInt('CONCRETESKY_FOLLOW_JOB_LOCK_SECONDS', 300, 30, 3600);
 
         $path = $this->cacheDbPath();
+        $this->migrateLegacyCacheDbIfNeeded($path);
         if (!is_file($path)) {
             return t('No cache database found (%s). Nothing to do.', $path);
         }

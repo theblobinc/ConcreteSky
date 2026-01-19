@@ -8,6 +8,7 @@ import { BSKY_SEARCH_EVENT } from '../../../search/search_bus.js';
 import { SEARCH_TARGETS } from '../../../search/constants.js';
 import { compileSearchMatcher } from '../../../search/query.js';
 import { renderPostTextHtml } from '../../../components/interactions/utils.js';
+import { copyToClipboard } from '../../../lib/identity.js';
 
 import '../../../components/thread_tree.js';
 import '../../../comment/comment_composer.js';
@@ -341,6 +342,9 @@ class BskyMyPosts extends HTMLElement {
     // Pending scheduled-post toast.
     // { id, scheduledAt, kind, state, error, timerId }
     this._pendingSchedule = null;
+
+    // uri -> { open, loading, error, to, text }
+    this._translateByUri = new Map();
   }
 
   _defaultLangs() {
@@ -753,6 +757,40 @@ class BskyMyPosts extends HTMLElement {
     }
   }
 
+  async _submitEditPost(detail) {
+    if (this._composePosting) return;
+    const uri = String(detail?.uri || '').trim();
+    const text = String(detail?.text || '').trim();
+    if (!uri || !text) return;
+
+    this._composePosting = true;
+    try {
+      const didByHandle = await resolveMentionDidsFromTexts([text]);
+      const facets = buildFacetsSafe(text, didByHandle);
+
+      await call('editPost', {
+        uri,
+        text,
+        langs: this._defaultLangs(),
+        // Always send facets key so edits don't accidentally preserve old facets.
+        facets: facets || null,
+      });
+
+      try {
+        await syncRecent({ minutes: 10, refreshMinutes: 30 });
+      } catch {}
+
+      this.load(true);
+    } finally {
+      this._composePosting = false;
+      this._setComposeQuote(null);
+      try {
+        const dlg = this.shadowRoot.getElementById('compose-dlg');
+        if (dlg?.open) dlg.close();
+      } catch {}
+    }
+  }
+
   async _submitNewThread(detail) {
     if (this._composePosting) return;
     const parts = Array.isArray(detail?.parts) ? detail.parts : [];
@@ -1116,6 +1154,38 @@ class BskyMyPosts extends HTMLElement {
     return null;
   }
 
+  _findPostTextByUri(uri) {
+    const p = this._findCachedPostByUri(uri);
+    return String(p?.record?.text || '');
+  }
+
+  async _translateUri(uri) {
+    const u = String(uri || '').trim();
+    if (!u) return;
+
+    const cur = this._translateByUri.get(u) || null;
+    if (cur && cur.open && !cur.loading) {
+      this._translateByUri.set(u, { ...cur, open: false });
+      this.render();
+      return;
+    }
+
+    const text = this._findPostTextByUri(u);
+    if (!String(text || '').trim()) return;
+
+    const to = String((navigator?.language || 'en').split('-')[0] || 'en').toLowerCase();
+    this._translateByUri.set(u, { open: true, loading: true, error: null, to, text: '' });
+    this.render();
+    try {
+      const out = await call('translateText', { text, to, from: 'auto' });
+      const translatedText = String(out?.translatedText || out?.data?.translatedText || '');
+      this._translateByUri.set(u, { open: true, loading: false, error: null, to, text: translatedText });
+    } catch (e) {
+      this._translateByUri.set(u, { open: true, loading: false, error: String(e?.message || e || 'Translate failed'), to, text: '' });
+    }
+    this.render();
+  }
+
   connectedCallback(){
     this.render();
     this.load(true);
@@ -1176,6 +1246,22 @@ class BskyMyPosts extends HTMLElement {
       const composer = (e?.target && String(e.target.tagName || '').toLowerCase() === 'bsky-comment-composer') ? e.target : null;
       const dlg = composer?.closest?.('#compose-dlg');
       if (dlg) this._submitNewThread(detail);
+    });
+
+    this.shadowRoot.addEventListener('bsky-edit-post', (e) => {
+      // Edits only happen in the top-level composer (compose dialog).
+      const composer = (e?.target && String(e.target.tagName || '').toLowerCase() === 'bsky-comment-composer') ? e.target : null;
+      const dlg = composer?.closest?.('#compose-dlg');
+      if (!dlg) return;
+
+      // Composer cancel emits a null detail.
+      if (!e?.detail) {
+        this._setComposeQuote(null);
+        try { dlg.close(); } catch { dlg.removeAttribute('open'); }
+        return;
+      }
+
+      this._submitEditPost(e.detail);
     });
 
     // List picker support for reply-gating (threadgate listRule).
@@ -1783,6 +1869,48 @@ class BskyMyPosts extends HTMLElement {
   }
 
   async onClick(e){
+    const copyTextBtn = e.target?.closest?.('[data-copy-post-text]');
+    if (copyTextBtn) {
+      const uri = String(copyTextBtn.getAttribute('data-uri') || '').trim();
+      const ok = await copyToClipboard(this._findPostTextByUri(uri));
+      try {
+        copyTextBtn.textContent = ok ? 'Copied' : 'Copy failed';
+        clearTimeout(copyTextBtn.__bskyCopyT);
+        copyTextBtn.__bskyCopyT = setTimeout(() => {
+          try { copyTextBtn.textContent = 'Copy'; } catch {}
+        }, 900);
+      } catch {}
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    const copyTrBtn = e.target?.closest?.('[data-copy-translation]');
+    if (copyTrBtn) {
+      const uri = String(copyTrBtn.getAttribute('data-uri') || '').trim();
+      const tr = uri ? (this._translateByUri.get(uri) || null) : null;
+      const ok = await copyToClipboard(String(tr?.text || ''));
+      try {
+        copyTrBtn.textContent = ok ? 'Copied' : 'Copy failed';
+        clearTimeout(copyTrBtn.__bskyCopyT);
+        copyTrBtn.__bskyCopyT = setTimeout(() => {
+          try { copyTrBtn.textContent = 'Copy translation'; } catch {}
+        }, 900);
+      } catch {}
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    const trBtn = e.target?.closest?.('[data-translate-post]');
+    if (trBtn) {
+      const uri = String(trBtn.getAttribute('data-uri') || '').trim();
+      await this._translateUri(uri);
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
     if (e.target?.closest?.('[data-undo-delete]')) {
       this._undoOptimisticDelete();
       e.preventDefault();
@@ -1996,6 +2124,32 @@ class BskyMyPosts extends HTMLElement {
       this._setComposeQuote({ uri, cid });
       try { dlg.showModal(); } catch { dlg.setAttribute('open', ''); }
       try { dlg.querySelector('bsky-comment-composer')?.focus?.(); } catch {}
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    // Edit (opens compose dialog prefilled)
+    const editBtn = e.target.closest?.('[data-edit-post]');
+    if (editBtn) {
+      const uri = String(editBtn.getAttribute('data-uri') || '').trim();
+      if (!uri) return;
+
+      const p = this._findCachedPostByUri(uri);
+      const rec = p?.record || {};
+      const text = String(rec?.text || '');
+
+      const dlg = this.shadowRoot.querySelector('#compose-dlg');
+      if (!dlg) return;
+
+      this._setComposeQuote(null);
+      try { dlg.showModal(); } catch { dlg.setAttribute('open', ''); }
+      try {
+        const composer = dlg.querySelector('bsky-comment-composer');
+        composer?.setEditTarget?.({ uri, text });
+        composer?.focus?.();
+      } catch {}
+
       e.preventDefault();
       e.stopPropagation();
       return;
@@ -2990,6 +3144,24 @@ class BskyMyPosts extends HTMLElement {
       const p = it.post || {};
       const rec = p.record || {};
       const text = renderPostTextHtml(rec.text || '');
+
+      const uri = p.uri || '';
+      const tr = uri ? (this._translateByUri.get(String(uri)) || null) : null;
+      const trBlock = (tr && tr.open) ? (() => {
+        if (tr.loading) return `<div class="translate muted">Translating…</div>`;
+        if (tr.error) return `<div class="translate err">Translate error: ${esc(tr.error)}</div>`;
+        const t = String(tr.text || '');
+        if (!t.trim()) return `<div class="translate muted">No translation returned.</div>`;
+        return `
+          <div class="translate">
+            <div class="translate-top">
+              <div class="muted">Translation (${esc(String(tr.to || ''))})</div>
+              <button class="act" type="button" data-copy-translation data-uri="${esc(uri)}">Copy translation</button>
+            </div>
+            <div class="translate-text">${renderPostTextHtml(t)}</div>
+          </div>
+        `;
+      })() : '';
       const when = fmtTime(rec.createdAt || p.indexedAt || '');
       const likeCount   = (typeof p.likeCount === 'number') ? p.likeCount : 0;
       const repostCount = (typeof p.repostCount === 'number') ? p.repostCount : 0;
@@ -2998,7 +3170,6 @@ class BskyMyPosts extends HTMLElement {
       const kind = this.itemType(it);
       const embeds = this.renderEmbedsFor(it);
 
-      const uri = p.uri || '';
       const cid = p.cid || '';
 
       const a = p.author || {};
@@ -3008,6 +3179,7 @@ class BskyMyPosts extends HTMLElement {
       const who = display && handle ? `${display} (@${handle})` : (display || (handle ? `@${handle}` : ''));
 
       const isMine = !!(meDid && String(a?.did || '') === meDid);
+      const canEdit = isMine && (String(kind || '') !== 'repost');
       const canDelete = isMine && (String(kind || '') !== 'repost');
       const deletingThis = !!(this._pendingDelete?.uri && String(this._pendingDelete.uri) === String(uri || ''));
 
@@ -3031,6 +3203,7 @@ class BskyMyPosts extends HTMLElement {
             ${open ? `<a class="open" target="_blank" rel="noopener" href="${esc(open)}">Open</a>` : ''}
           </header>
           ${text ? `<div class="text">${text}</div>` : ''}
+          ${trBlock}
           ${embeds ? `<div class="embeds">${embeds}</div>` : ''}
           <footer class="counts">
             <span title="Replies (click to preview thread; Ctrl/Cmd-click to open Content)" class="count" data-open-interactions data-kind="replies" data-uri="${esc(uri)}" data-cid="${esc(cid)}">💬 ${replyCount}</span>
@@ -3040,6 +3213,9 @@ class BskyMyPosts extends HTMLElement {
           <footer class="actions">
             <button class="act" type="button" data-reply data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-author="${esc(handle ? `@${handle}` : '')}">Reply</button>
             <button class="act" type="button" data-quote data-uri="${esc(uri)}" data-cid="${esc(cid)}">Quote</button>
+            ${canEdit ? `<button class="act" type="button" data-edit-post data-uri="${esc(uri)}">Edit</button>` : ''}
+            ${uri ? `<button class="act" type="button" data-copy-post-text data-uri="${esc(uri)}">Copy</button>` : ''}
+            ${uri ? `<button class="act" type="button" data-translate-post data-uri="${esc(uri)}">${(tr && tr.open) ? 'Hide translation' : 'Translate'}</button>` : ''}
             <button class="act" type="button" data-repost data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-reposted="${reposted ? '1' : '0'}">${esc(repostLabel)}</button>
             <button class="act" type="button" data-like data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-liked="${liked ? '1' : '0'}">${esc(likeLabel)}</button>
             ${canDelete ? `<button class="act danger" type="button" data-delete-post data-uri="${esc(uri)}" ${deletingThis ? 'disabled' : ''}>Delete</button>` : ''}
@@ -3401,6 +3577,11 @@ class BskyMyPosts extends HTMLElement {
         button:disabled{opacity:.6;cursor:not-allowed}
         select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:0;padding:6px 10px}
         .muted{color:#aaa}
+        .err{color:#f0a2a2}
+
+        .translate{margin:10px 0 0 0; padding:10px; border:1px solid #2b2b2b; background:#0f0f0f; border-radius:10px}
+        .translate-top{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+        .translate-text{white-space:normal}
         .win-spacer{width:100%;pointer-events:none;contain:layout size style}
         .footer{display:flex;justify-content:center}
 

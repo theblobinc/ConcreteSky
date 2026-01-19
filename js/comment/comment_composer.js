@@ -8,10 +8,11 @@ export class BskyCommentComposer extends HTMLElement {
 		super();
 		this.attachShadow({ mode: 'open' });
 		this._replyTo = null; // { uri, cid, author }
+		this._editTarget = null; // { uri, text }
 		this._submitting = false;
 		this._maxChars = 300;
 		this._threadEnabled = false;
-		this._mode = 'reply'; // 'reply' | 'post'
+		this._mode = 'reply'; // 'reply' | 'post' | 'edit'
 		this._parts = [{ text: '', images: [] }]; // [{ text, images:[{ name, mime, dataBase64, alt }] }]
 		this._activePart = 0;
 		this._imagesTargetPart = 0;
@@ -53,14 +54,51 @@ export class BskyCommentComposer extends HTMLElement {
 		}
 		if (name === 'mode') {
 			const v = String(this.getAttribute('mode') || '').trim().toLowerCase();
-			this._mode = (v === 'post') ? 'post' : 'reply';
+			this._mode = (v === 'post') ? 'post' : (v === 'edit' ? 'edit' : 'reply');
 			this.render();
 			return;
 		}
 	}
 
+	setEditTarget(target) {
+		const uri = String(target?.uri || '').trim();
+		if (!uri) return;
+		const text = String(target?.text || '');
+
+		this._editTarget = { uri, text };
+		this._replyTo = null;
+		this._mode = 'edit';
+		this._parts = [{ text, images: [] }];
+		this._activePart = 0;
+		this._imagesTargetPart = 0;
+		this._emojiOpen = false;
+		this._settingsOpen = false;
+		this._scheduledAtLocal = '';
+		// Don't carry drafts across into edit mode.
+		this._clearDraft();
+		this.render();
+		this.focus();
+	}
+
+	clearEditTarget() {
+		if (!this._editTarget) return;
+		this._editTarget = null;
+		// Restore attribute-driven mode.
+		try { this.attributeChangedCallback('mode'); } catch { this._mode = 'reply'; }
+		this._parts = [{ text: '', images: [] }];
+		this._activePart = 0;
+		this._imagesTargetPart = 0;
+		this._emojiOpen = false;
+		this._settingsOpen = false;
+		this._scheduledAtLocal = '';
+		this._clearDraft();
+		this.render();
+		this.focus();
+	}
+
 	setReplyTo(replyTo) {
 		this._replyTo = replyTo || null;
+		this._editTarget = null;
 		// Reset drafts when switching targets to avoid accidentally posting to the wrong thread.
 		this._parts = [{ text: '', images: [] }];
 		this._activePart = 0;
@@ -75,7 +113,10 @@ export class BskyCommentComposer extends HTMLElement {
 		const scope = String(this.getAttribute('draftscope') || '').trim();
 		const mode = String(this._mode || 'reply');
 		const replyUri = String(this._replyTo?.uri || '').trim();
-		const base = (mode === 'post') ? 'post' : (replyUri ? `reply:${replyUri}` : 'reply');
+		const editUri = String(this._editTarget?.uri || '').trim();
+		const base = (mode === 'post') ? 'post'
+			: (mode === 'edit') ? (editUri ? `edit:${editUri}` : 'edit')
+			: (replyUri ? `reply:${replyUri}` : 'reply');
 		const key = scope ? `${scope}|${base}` : base;
 		return `bsky:draft:${key}`;
 	}
@@ -279,6 +320,12 @@ export class BskyCommentComposer extends HTMLElement {
 	}
 
 	onClick(e) {
+		if (e.target?.closest?.('[data-clear-edit]')) {
+			this.clearEditTarget();
+			this.dispatchEvent(new CustomEvent('bsky-edit-post', { detail: null, bubbles: true, composed: true }));
+			return;
+		}
+
 		if (e.target?.closest?.('[data-clear]')) {
 			this.setReplyTo(null);
 			this.dispatchEvent(new CustomEvent('bsky-reply-to', { detail: null, bubbles: true, composed: true }));
@@ -286,6 +333,7 @@ export class BskyCommentComposer extends HTMLElement {
 		}
 
 		if (e.target?.closest?.('[data-add-images]')) {
+			if (this._mode === 'edit') return;
 			this._imagesTargetPart = this._activePart;
 			const inp = this.shadowRoot.getElementById('imgs');
 			inp?.click?.();
@@ -370,6 +418,7 @@ export class BskyCommentComposer extends HTMLElement {
 		}
 
 		if (e.target?.closest?.('[data-add-part]')) {
+			if (this._mode === 'edit') return;
 			if (!this._threadEnabled) return;
 			if (this._parts.length >= 10) return;
 			const cur = this._parts[this._activePart] || { text: '', images: [] };
@@ -419,12 +468,13 @@ export class BskyCommentComposer extends HTMLElement {
 				.map((p) => ({
 					text: String(p?.text || ''),
 					media: {
-						images: Array.isArray(p?.images) ? p.images.map((i) => ({
+						// Editing preserves existing embeds server-side; ignore media edits for now.
+						images: (this._mode === 'edit') ? [] : (Array.isArray(p?.images) ? p.images.map((i) => ({
 							name: i?.name || '',
 							mime: i?.mime || '',
 							dataBase64: i?.dataBase64 || '',
 							alt: i?.alt || '',
-						})) : [],
+						})) : []),
 					},
 				}))
 				.filter((p) => String(p.text || '').trim());
@@ -434,7 +484,7 @@ export class BskyCommentComposer extends HTMLElement {
 				if (String(p.text || '').length > max) return;
 			}
 
-			// Scheduling is only supported for top-level posts (not replies).
+			// Scheduling is only supported for top-level posts (not replies/edits).
 			let scheduledAt = '';
 			if (this._mode === 'post' && !(this._replyTo && this._replyTo.uri)) {
 				scheduledAt = this._scheduledAtIsoOrEmpty();
@@ -450,8 +500,9 @@ export class BskyCommentComposer extends HTMLElement {
 					}
 				}
 			}
+			if (this._mode === 'edit') scheduledAt = '';
 
-			const replyGateDisabled = !!(this._replyTo && this._replyTo.uri);
+			const replyGateDisabled = (this._mode === 'edit') || !!(this._replyTo && this._replyTo.uri);
 			const replyMode = replyGateDisabled ? 'everyone' : String(this._replyGateMode || 'everyone');
 			const allow = (() => {
 				if (replyMode !== 'custom') return null;
@@ -476,7 +527,18 @@ export class BskyCommentComposer extends HTMLElement {
 				return;
 			}
 
-			if (parts.length === 1 && !this._threadEnabled) {
+			if (this._mode === 'edit') {
+				const uri = String(this._editTarget?.uri || '').trim();
+				if (!uri) return;
+				this.dispatchEvent(new CustomEvent('bsky-edit-post', {
+					detail: {
+						uri,
+						text: String(parts[0].text || '').trim(),
+					},
+					bubbles: true,
+					composed: true,
+				}));
+			} else if (parts.length === 1 && !this._threadEnabled) {
 				this.dispatchEvent(new CustomEvent('bsky-submit-comment', {
 					detail: {
 						text: String(parts[0].text || '').trim(),
@@ -509,6 +571,10 @@ export class BskyCommentComposer extends HTMLElement {
 			this._emojiOpen = false;
 			this._settingsOpen = false;
 			this._scheduledAtLocal = '';
+			if (this._mode === 'edit') {
+				this._editTarget = null;
+				try { this.attributeChangedCallback('mode'); } catch { this._mode = 'reply'; }
+			}
 			this.render();
 		}
 	}
@@ -783,7 +849,9 @@ export class BskyCommentComposer extends HTMLElement {
 
 	render() {
 		const max = Number.isFinite(this._maxChars) && this._maxChars > 0 ? this._maxChars : 300;
-		const who = (this._mode === 'post') ? 'Write a post' : (this._replyTo?.author ? `Reply to ${String(this._replyTo.author || '')}` : 'Reply');
+		const who = (this._mode === 'edit')
+			? 'Edit post'
+			: ((this._mode === 'post') ? 'Write a post' : (this._replyTo?.author ? `Reply to ${String(this._replyTo.author || '')}` : 'Reply'));
 		const cur = this._parts[this._activePart] || { text: '', images: [] };
 		const curText = String(cur.text || '');
 		const curLen = curText.length;
@@ -808,7 +876,7 @@ export class BskyCommentComposer extends HTMLElement {
 			return any;
 		})();
 
-		const replyGateDisabled = !!(this._replyTo && this._replyTo.uri);
+		const replyGateDisabled = (this._mode === 'edit') || !!(this._replyTo && this._replyTo.uri);
 		const mode = String(this._replyGateMode || 'everyone');
 		const allowMentions = !!this._replyAllow?.mentions;
 		const allowFollowers = !!this._replyAllow?.followers;
@@ -879,10 +947,10 @@ export class BskyCommentComposer extends HTMLElement {
 
 			<div class="bar">
 				<div class="who">${esc(who)}</div>
-				${this._replyTo ? `<button type="button" data-clear title="Clear reply target">Clear</button>` : ''}
+				${this._mode === 'edit' ? `<button type="button" data-clear-edit title="Cancel edit">Cancel</button>` : (this._replyTo ? `<button type="button" data-clear title="Clear reply target">Clear</button>` : '')}
 			</div>
 
-			${this._threadEnabled ? `
+			${(this._threadEnabled && this._mode !== 'edit') ? `
 				<div class="parts" aria-label="Thread parts">
 					${this._parts.map((p, i) => {
 						const t = String(p?.text || '').trim();
@@ -902,7 +970,7 @@ export class BskyCommentComposer extends HTMLElement {
 
 			<div class="tools">
 				<div class="toolBtns">
-					<button type="button" class="iconBtn" data-add-images title="Add images">🖼</button>
+					<button type="button" class="iconBtn" data-add-images title="Add images" ${this._mode === 'edit' ? 'disabled' : ''}>🖼</button>
 					<button type="button" class="iconBtn" data-add-gif title="Insert GIF link">GIF</button>
 					<button type="button" class="iconBtn" data-settings-toggle title="Post interaction settings">⚙</button>
 					<span class="emoji">
@@ -933,11 +1001,11 @@ export class BskyCommentComposer extends HTMLElement {
 					<div class="row">
 						<label><input type="checkbox" data-setting="quotesAllowed" ${this._quotesAllowed ? 'checked' : ''}> Allow quote posts</label>
 					</div>
-					<div class="note">Turning this off creates a postgate (disables embedding/quotes).</div>
+					<div class="note">Turning this off creates a postgate (disables embedding/quotes). ${this._mode === 'edit' ? 'Edits do not change existing gates yet.' : ''}</div>
 
 					<h4 style="margin-top:12px">Who can reply</h4>
 					${replyGateDisabled ? `
-						<div class="note">Reply controls apply to new root posts. This composer is replying to an existing post, so reply controls are disabled here.</div>
+						<div class="note">Reply controls apply to new root posts. ${this._mode === 'edit' ? 'This composer is editing an existing post, so reply controls are disabled here.' : 'This composer is replying to an existing post, so reply controls are disabled here.'}</div>
 					` : `
 						<div class="row">
 							<label><input type="radio" name="replymode" data-setting="replyMode" value="everyone" ${mode==='everyone' ? 'checked' : ''}> Everyone</label>
@@ -982,7 +1050,7 @@ export class BskyCommentComposer extends HTMLElement {
 
 					<h4 style="margin-top:12px">Schedule</h4>
 					${!scheduleAllowed ? `
-						<div class="note">Scheduling is available for new posts (not replies).</div>
+						<div class="note">Scheduling is available for new posts (not replies/edits).</div>
 					` : `
 						<div class="row">
 							<label style="width:100%">Publish at
@@ -998,9 +1066,10 @@ export class BskyCommentComposer extends HTMLElement {
 			<div class="media">
 				<div class="bar" style="margin:6px 0 0 0">
 					<div class="who">Media</div>
-					<button type="button" data-add-images ${Array.isArray(cur.images) && cur.images.length >= 4 ? 'disabled' : ''}>Add images</button>
+					<button type="button" data-add-images ${this._mode === 'edit' ? 'disabled' : (Array.isArray(cur.images) && cur.images.length >= 4 ? 'disabled' : '')}>Add images</button>
 				</div>
 				<input id="imgs" type="file" accept="image/*" multiple hidden>
+				${this._mode === 'edit' ? `<div class="muted" style="margin-top:6px">Editing preserves existing media embeds. Changing attachments isn’t supported yet.</div>` : ''}
 
 				${Array.isArray(cur.images) && cur.images.length ? `
 					<div class="thumbs">
@@ -1019,7 +1088,7 @@ export class BskyCommentComposer extends HTMLElement {
 			</div>
 
 			<div class="actions">
-				<button type="button" data-submit ${!canSubmit ? 'disabled' : ''}>Send</button>
+				<button type="button" data-submit ${!canSubmit ? 'disabled' : ''}>${this._mode === 'edit' ? 'Save' : 'Send'}</button>
 			</div>
 		`;
 	}

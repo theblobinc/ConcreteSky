@@ -36,11 +36,73 @@ export class BskyContentPanel extends HTMLElement {
       followMap: {},
     };
 
+    // Keyed by actor DID: { open, loading, error, followers, fetchedAt }
+    this._knownFollowers = new Map();
+
     this._replyPostedHandler = null;
     this._unbindListsRequest = null;
 
     this._postDeletedHandler = null;
     this._selectionDeleted = false;
+  }
+
+  _kfState(key) {
+    const k = String(key || '').trim();
+    if (!k) return { open: false, loading: false, error: '', followers: null, fetchedAt: null };
+    const cur = this._knownFollowers.get(k);
+    if (cur && typeof cur === 'object') return cur;
+    return { open: false, loading: false, error: '', followers: null, fetchedAt: null };
+  }
+
+  _setKfState(key, next) {
+    const k = String(key || '').trim();
+    if (!k) return;
+    this._knownFollowers.set(k, { ...this._kfState(k), ...(next || {}) });
+  }
+
+  _fmtKnownFollowersLine(list) {
+    const items = Array.isArray(list) ? list : [];
+    const names = items
+      .map((p) => p?.displayName || (p?.handle ? `@${p.handle}` : '') || p?.did)
+      .filter(Boolean);
+    if (!names.length) return '';
+    if (names.length === 1) return `Followed by ${names[0]}`;
+    if (names.length === 2) return `Followed by ${names[0]} and ${names[1]}`;
+    return `Followed by ${names[0]}, ${names[1]}, and ${names.length - 2} others`;
+  }
+
+  async _toggleKnownFollowers(actorDid) {
+    const did = String(actorDid || '').trim();
+    if (!did) return;
+
+    const cur = this._kfState(did);
+    const nextOpen = !cur.open;
+    this._setKfState(did, { open: nextOpen, error: cur.error || '' });
+    this.render();
+
+    if (!nextOpen) return;
+    if (cur.loading) return;
+    if (Array.isArray(cur.followers)) return;
+
+    this._setKfState(did, { loading: true, error: '' });
+    this.render();
+
+    try {
+      const res = await call('getKnownFollowers', { actor: did, limit: 10, pagesMax: 10 });
+      const followers = Array.isArray(res?.followers) ? res.followers : [];
+      const mapped = followers.map((p) => ({
+        did: String(p?.did || ''),
+        handle: String(p?.handle || ''),
+        displayName: String(p?.displayName || p?.display_name || ''),
+        avatar: String(p?.avatar || ''),
+      })).filter((p) => p.did || p.handle);
+      this._setKfState(did, { followers: mapped, loading: false, error: '', fetchedAt: new Date().toISOString() });
+    } catch (e) {
+      const msg = e?.message || String(e || 'Failed to load followers you know');
+      this._setKfState(did, { loading: false, error: msg, followers: [] });
+    } finally {
+      this.render();
+    }
   }
 
   pickThreadRootRef(thread) {
@@ -301,6 +363,8 @@ export class BskyContentPanel extends HTMLElement {
   }
 
   onClick(e) {
+    if (e.target && e.target.closest && e.target.closest('a')) return;
+
     if (e.target?.closest?.('[data-close]')) {
       this.dispatchEvent(new CustomEvent('bsky-close-content', { bubbles: true, composed: true }));
       return;
@@ -317,6 +381,16 @@ export class BskyContentPanel extends HTMLElement {
       this.followOne(followDid);
       return;
     }
+
+    const knownBtn = e.target?.closest?.('button[data-action="known-followers"]');
+    if (knownBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const did = String(knownBtn.getAttribute('data-did') || '').trim();
+      this._toggleKnownFollowers(did);
+      return;
+    }
+
     if (e.target?.closest?.('[data-follow-all]')) {
       this.followAll();
       return;
@@ -476,6 +550,40 @@ export class BskyContentPanel extends HTMLElement {
         const did = String(i?.did || '');
         const following = !!m?.[did]?.following;
         const queued = !!m?.[did]?.queued;
+
+        const kf = did ? this._kfState(did) : null;
+
+        const kfBtn = did ? `
+          <button class="btn mini" type="button" data-action="known-followers" data-did="${esc(did)}" ${kf?.loading ? 'disabled' : ''}>
+            ${kf?.open ? 'Hide followers you know' : 'Followers you know'}
+          </button>
+        ` : '';
+
+        const kfWrap = (() => {
+          if (!kf || !kf.open) return '';
+          if (kf.loading) return '<div class="kfWrap"><div class="kf muted">Loading followers you know…</div></div>';
+          if (kf.error) return `<div class="kfWrap"><div class="kf err">${esc(kf.error)}</div></div>`;
+          const items = Array.isArray(kf.followers) ? kf.followers : [];
+          if (!items.length) return '<div class="kfWrap"><div class="kf muted">No followers you know found.</div></div>';
+          const line = this._fmtKnownFollowersLine(items);
+          const list = items.slice(0, 8).map((p) => {
+            const url = p?.did ? `https://bsky.app/profile/${encodeURIComponent(p.did)}` : (p?.handle ? `https://bsky.app/profile/${encodeURIComponent(p.handle)}` : '');
+            const label = p?.displayName || (p?.handle ? `@${p.handle}` : '') || p?.did;
+            return `
+              <a class="kfItem" href="${esc(url)}" target="_blank" rel="noopener">
+                <img class="kfAv" src="${esc(p?.avatar || '')}" alt="" onerror="this.style.display='none'">
+                <span class="kfName">${esc(label)}</span>
+              </a>
+            `;
+          }).join('');
+          return `
+            <div class="kfWrap">
+              ${line ? `<div class="kf muted">${esc(line)}</div>` : ''}
+              <div class="kfList">${list}</div>
+            </div>
+          `;
+        })();
+
         return `
           <div class="row">
             ${i?.avatar ? `<img class="avatar" src="${esc(i.avatar)}" alt="">` : ''}
@@ -488,6 +596,8 @@ export class BskyContentPanel extends HTMLElement {
               : queued
                 ? `<span class="sub">Queued</span>`
                 : `<button class="btn" type="button" data-follow-did="${esc(did)}" title="Follow" aria-label="Follow">➕</button>`}
+            ${kfBtn}
+            ${kfWrap}
           </div>
         `;
       }).join('') || '<div class="muted">No entries.</div>';
@@ -519,6 +629,7 @@ export class BskyContentPanel extends HTMLElement {
         .btn{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius: var(--bsky-radius, 0px); padding:6px 10px; cursor:pointer}
         .btn:hover{border-color:#3b5a8f}
         .btn.link{color:#9cd3ff; text-decoration:none}
+        .btn.mini{padding:4px 8px; font-size:.78rem; font-weight:800}
         .muted{color:#aaa}
         .err{color:#f88}
         .deleted{border:1px solid #3a2b2b;background:#140c0c;color:#f2c9c9;padding:8px;margin:0 0 10px 0}
@@ -531,11 +642,19 @@ export class BskyContentPanel extends HTMLElement {
         .actionsRow{display:flex; gap:8px; align-items:center; justify-content:flex-end; margin:10px 0}
 
         .list{display:grid; gap:6px}
-        .row{display:flex; align-items:center; gap:10px; border:1px solid #222; background:#0b0b0b; padding:6px}
+        .row{display:flex; align-items:center; flex-wrap:wrap; gap:10px; border:1px solid #222; background:#0b0b0b; padding:6px}
         .avatar{width:40px; height:40px; object-fit:cover; flex:0 0 auto; border-radius: var(--bsky-radius, 0px)}
         .who{flex:1 1 auto; min-width:0}
         .name{font-weight:700}
         .sub{color:#bbb; font-size:.9rem; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+
+        .kfWrap{flex:1 1 100%; margin-top:4px; padding-left:10px; border-left:2px solid #2f4b7a}
+        .kf{font-size:.85rem; line-height:1.2}
+        .kfList{display:flex; flex-wrap:wrap; gap:6px; margin-top:6px}
+        .kfItem{display:inline-flex; align-items:center; gap:6px; max-width:100%; border:1px solid #222; border-radius: var(--bsky-radius, 0px); padding:4px 6px; background:rgba(0,0,0,.15); color:#fff; text-decoration:none}
+        .kfItem:hover{border-color:#3b5a8f; background:rgba(0,0,0,.25)}
+        .kfAv{width:18px; height:18px; border-radius: var(--bsky-radius, 0px); object-fit:cover; background:#222}
+        .kfName{font-size:.82rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:220px}
 
         .quotes{display:grid; gap:8px}
         .quote{border:1px solid #222; padding:6px; background:#0a0a0a}

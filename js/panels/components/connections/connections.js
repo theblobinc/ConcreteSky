@@ -72,12 +72,52 @@ class BskyConnections extends HTMLElement {
       renderRow: (p) => {
         const ageDays = daysSince(p?.createdAt);
         const key = String(p?.did || '');
+
+        const did = String(p?.did || '').trim();
+        const kf = did ? this._kfState(did) : null;
+
+        const kfBtn = did ? `
+          <button
+            class="mini"
+            type="button"
+            data-action="known-followers"
+            data-did="${esc(did)}"
+            ${kf?.loading ? 'disabled' : ''}
+          >${kf?.open ? 'Hide followers you know' : 'Followers you know'}</button>
+        ` : '';
+
+        const kfWrap = (() => {
+          if (!kf || !kf.open) return '';
+          if (kf.loading) return '<div class="kfWrap"><div class="kf muted">Loading followers you know…</div></div>';
+          if (kf.error) return `<div class="kfWrap"><div class="kf err">${esc(kf.error)}</div></div>`;
+          const items = Array.isArray(kf.followers) ? kf.followers : [];
+          if (!items.length) return '<div class="kfWrap"><div class="kf muted">No followers you know found.</div></div>';
+          const line = this._fmtKnownFollowersLine(items);
+          const list = items.slice(0, 8).map((x) => {
+            const url = x?.did ? `https://bsky.app/profile/${encodeURIComponent(x.did)}` : (x?.handle ? `https://bsky.app/profile/${encodeURIComponent(x.handle)}` : '');
+            const label = x?.displayName || (x?.handle ? `@${x.handle}` : '') || x?.did;
+            return `
+              <a class="kfItem" href="${esc(url)}" target="_blank" rel="noopener">
+                <img class="kfAv" src="${esc(x?.avatar || '')}" alt="" onerror="this.style.display='none'">
+                <span class="kfName">${esc(label)}</span>
+              </a>
+            `;
+          }).join('');
+          return `
+            <div class="kfWrap">
+              ${line ? `<div class="kf muted">${esc(line)}</div>` : ''}
+              <div class="kfList">${list}</div>
+            </div>
+          `;
+        })();
+
         return `
         <div class="entry" data-did="${esc(key)}">
           <bsky-lazy-img class="av" src="${esc(p?.avatar || '')}" alt="" aspect="1/1"></bsky-lazy-img>
           <div class="main">
             <div class="top">
               ${identityHtml({ did: p?.did, handle: p?.handle, displayName: p?.displayName }, { showHandle: false, showCopyDid: true })}
+              ${kfBtn}
             </div>
             <div class="sub">${p?.handle ? `<a href="${esc(toProfileUrl({ handle: p.handle, did: p.did }))}" target="_blank" rel="noopener">@${esc(p.handle)}</a>` : ''}</div>
             ${p?.description ? `<div class="bio">${esc(p.description)}</div>` : ``}
@@ -87,6 +127,7 @@ class BskyConnections extends HTMLElement {
               <span>Posts: ${esc(p?.postsCount ?? '—')}</span>
               <span>Age: ${ageDays === null ? '—' : `${ageDays}d`}</span>
             </div>
+            ${kfWrap}
           </div>
         </div>
       `;
@@ -106,6 +147,84 @@ class BskyConnections extends HTMLElement {
     this._onProfilesHydrated = null;
     this._hydratedDidSet = new Set();
     this._hydratedTimer = null;
+
+    // Keyed by actor DID: { open, loading, error, followers, fetchedAt }
+    this._knownFollowers = new Map();
+  }
+
+  _kfState(key) {
+    const k = String(key || '').trim();
+    if (!k) return { open: false, loading: false, error: '', followers: null, fetchedAt: null };
+    const cur = this._knownFollowers.get(k);
+    if (cur && typeof cur === 'object') return cur;
+    return { open: false, loading: false, error: '', followers: null, fetchedAt: null };
+  }
+
+  _setKfState(key, next) {
+    const k = String(key || '').trim();
+    if (!k) return;
+    this._knownFollowers.set(k, { ...this._kfState(k), ...(next || {}) });
+  }
+
+  _fmtKnownFollowersLine(list) {
+    const items = Array.isArray(list) ? list : [];
+    const names = items
+      .map((p) => p?.displayName || (p?.handle ? `@${p.handle}` : '') || p?.did)
+      .filter(Boolean);
+    if (!names.length) return '';
+    if (names.length === 1) return `Followed by ${names[0]}`;
+    if (names.length === 2) return `Followed by ${names[0]} and ${names[1]}`;
+    return `Followed by ${names[0]}, ${names[1]}, and ${names.length - 2} others`;
+  }
+
+  _rerenderKnownFollowersUi() {
+    try {
+      const canWindow = !!(this._winCtl && this._winCtl.enabled && this._winCtl.enabled());
+      const total = (this._winCtl?._items || this.items || []).length;
+      const min = Number(this._winCtl?.minItemsToWindow || 0);
+      const shouldWindow = canWindow && total >= min;
+      if (shouldWindow) {
+        this._winCtl.rerenderWindowOnly({ force: true });
+        return;
+      }
+    } catch {
+      // ignore
+    }
+    this.render();
+  }
+
+  async _toggleKnownFollowers(actorDid) {
+    const did = String(actorDid || '').trim();
+    if (!did) return;
+
+    const cur = this._kfState(did);
+    const nextOpen = !cur.open;
+    this._setKfState(did, { open: nextOpen, error: cur.error || '' });
+    this._rerenderKnownFollowersUi();
+
+    if (!nextOpen) return;
+    if (cur.loading) return;
+    if (Array.isArray(cur.followers)) return;
+
+    this._setKfState(did, { loading: true, error: '' });
+    this._rerenderKnownFollowersUi();
+
+    try {
+      const res = await call('getKnownFollowers', { actor: did, limit: 10, pagesMax: 10 });
+      const followers = Array.isArray(res?.followers) ? res.followers : [];
+      const mapped = followers.map((p) => ({
+        did: String(p?.did || ''),
+        handle: String(p?.handle || ''),
+        displayName: String(p?.displayName || p?.display_name || ''),
+        avatar: String(p?.avatar || ''),
+      })).filter((p) => p.did || p.handle);
+      this._setKfState(did, { followers: mapped, loading: false, error: '', fetchedAt: new Date().toISOString() });
+    } catch (e) {
+      const msg = e?.message || String(e || 'Failed to load followers you know');
+      this._setKfState(did, { loading: false, error: msg, followers: [] });
+    } finally {
+      this._rerenderKnownFollowersUi();
+    }
   }
 
   _scheduleMergeHydrated(dids) {
@@ -326,9 +445,20 @@ class BskyConnections extends HTMLElement {
   }
 
   onClick(e){
+    if (e.target && e.target.closest && e.target.closest('a')) return;
+
     if (e.target.closest('#refresh')) { this.load(true); return; }
     if (e.target.closest('#more')) { this.load(false); return; }
     if (e.target.closest('#sync')) { this.sync(); return; }
+
+    const knownBtn = e.target?.closest?.('button[data-action="known-followers"]');
+    if (knownBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const did = String(knownBtn.getAttribute('data-did') || '').trim();
+      this._toggleKnownFollowers(did);
+      return;
+    }
   }
 
   onInput(e){
@@ -530,6 +660,9 @@ class BskyConnections extends HTMLElement {
         label{color:var(--bsky-muted-fg, #ddd);font-size:.95rem;display:flex;gap:6px;align-items:center}
         button{background:var(--bsky-btn-bg, #111);border:1px solid var(--bsky-border-soft, #555);color:var(--bsky-fg, #fff);padding:8px 10px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
         button:disabled{opacity:.6;cursor:not-allowed}
+        .mini{appearance:none;background:transparent;border:1px solid var(--bsky-border-soft, #555);color:var(--bsky-fg, #fff);border-radius: var(--bsky-radius, 0px);padding:4px 8px;cursor:pointer;font-size:.78rem;font-weight:800}
+        .mini:hover{background:#1b1b1b}
+        .mini:disabled{opacity:.6;cursor:not-allowed}
 
         .entries{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--bsky-card-min-w, 350px),1fr));gap:var(--bsky-card-gap, var(--bsky-grid-gutter, 0px));align-items:start;max-width:100%;min-height:0}
 
@@ -547,6 +680,14 @@ class BskyConnections extends HTMLElement {
         .bio{color:var(--bsky-fg, #ddd);margin-top:6px;word-break:break-word;white-space:normal;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3}
         .meta{color:var(--bsky-muted-fg, #bbb);font-size:.85rem;margin-top:6px;display:flex;gap:10px;flex-wrap:wrap}
         .err{color:var(--bsky-danger-fg, #f88)}
+
+        .kfWrap{margin-top:6px;padding-left:8px;border-left:2px solid #2f4b7a}
+        .kf{font-size:.85rem;line-height:1.2}
+        .kfList{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}
+        .kfItem{display:inline-flex;align-items:center;gap:6px;max-width:100%;border:1px solid var(--bsky-border, #333);border-radius: var(--bsky-radius, 0px);padding:4px 6px;background:rgba(0,0,0,.15);color:var(--bsky-fg, #fff);text-decoration:none}
+        .kfItem:hover{background:rgba(0,0,0,.25);border-color:var(--bsky-border-soft, #3a3a3a)}
+        .kfAv{width:18px;height:18px;border-radius: var(--bsky-radius, 0px);object-fit:cover;background:var(--bsky-surface-2, #222)}
+        .kfName{font-size:.82rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
         ${identityCss}
 
         @media (max-width: 380px){
