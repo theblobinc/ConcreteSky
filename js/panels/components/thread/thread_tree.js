@@ -1,5 +1,8 @@
 import { call } from '../../../api.js';
 import { syncRecent } from '../../../controllers/cache_sync_controller.js';
+import { getAuthStatusCached } from '../../../auth_state.js';
+import { dispatchToast, getTabsApi, openContentPanel } from '../../panel_api.js';
+import { renderPostTextHtml } from '../../../components/interactions/utils.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
 
@@ -105,8 +108,233 @@ export class BskyThreadTree extends HTMLElement {
 
     this._hideRoot = false;
 
+    this._meDid = '';
+
+    // Hide nodes that have been optimistically deleted.
+    this._hiddenUris = new Set();
+
+    // Pending optimistic deletion (undo window).
+    // { uri, timerId, startedAt, state, error }
+    this._pendingDelete = null;
+
+    // Collapse state for threads with replies.
+    this._collapsedUris = new Set();
+
     this._likeChangedHandler = null;
     this._repostChangedHandler = null;
+  }
+
+  _walkThread(node, cb) {
+    try {
+      const n = node || null;
+      if (!n) return;
+      cb?.(n);
+      const kids = Array.isArray(n?.replies) ? n.replies : [];
+      for (const r of kids) this._walkThread(r, cb);
+    } catch {
+      // ignore
+    }
+  }
+
+  _collectCollapsibleUris() {
+    const out = new Set();
+    try {
+      const root = this._thread;
+      if (!root) return out;
+
+      const ancestors = this.collectAncestors(root);
+      for (const n of (ancestors || [])) {
+        const p = n?.post || null;
+        const uri = String(p?.uri || '').trim();
+        const replies = Array.isArray(n?.replies) ? n.replies : [];
+        if (uri && replies.length) out.add(uri);
+      }
+
+      this._walkThread(root, (n) => {
+        const p = n?.post || null;
+        const uri = String(p?.uri || '').trim();
+        const replies = Array.isArray(n?.replies) ? n.replies : [];
+        if (uri && replies.length) out.add(uri);
+      });
+    } catch {
+      // ignore
+    }
+    return out;
+  }
+
+  _collapseAll() {
+    this._collapsedUris = this._collectCollapsibleUris();
+    this.render();
+  }
+
+  _expandAll() {
+    try { this._collapsedUris?.clear?.(); } catch {}
+    this.render();
+  }
+
+  _toggleCollapseUri(uri) {
+    const u = String(uri || '').trim();
+    if (!u) return;
+    if (this._collapsedUris.has(u)) this._collapsedUris.delete(u);
+    else this._collapsedUris.add(u);
+    this.render();
+  }
+
+  _openUriInPanel({ uri, cid } = {}) {
+    const u = String(uri || '').trim();
+    if (!u) return;
+    const c = String(cid || '').trim();
+
+    const api = getTabsApi(this);
+    const active = Array.isArray(api?.getActive?.()) ? api.getActive() : [];
+    const base = active.find((n) => n && n !== 'content') || 'posts';
+
+    openContentPanel({
+      uri: u,
+      cid: c,
+      spawnAfter: base,
+      splitFrom: (base === 'posts') ? 'posts' : '',
+      pinOthers: (base === 'posts'),
+    }, this);
+  }
+
+  async _copyToClipboard(text) {
+    const s = String(text || '');
+    if (!s) return false;
+    try {
+      if (navigator?.clipboard?.writeText) {
+        await navigator.clipboard.writeText(s);
+        return true;
+      }
+    } catch {}
+
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = s;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.left = '-9999px';
+      ta.style.top = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return !!ok;
+    } catch {
+      return false;
+    }
+  }
+
+  async _shareOrCopyUrl(url, title = '') {
+    const u = String(url || '').trim();
+    if (!u) return;
+    try {
+      if (navigator?.share) {
+        await navigator.share({ title: String(title || ''), url: u });
+        dispatchToast(this, { kind: 'success', message: 'Share opened.', timeoutMs: 1800 });
+        return;
+      }
+    } catch {
+      // fall back to copy
+    }
+
+    const ok = await this._copyToClipboard(u);
+    dispatchToast(this, {
+      kind: ok ? 'success' : 'error',
+      message: ok ? 'Link copied.' : 'Could not copy link.',
+      timeoutMs: 2200,
+    });
+  }
+
+  _clearPendingDelete() {
+    const pd = this._pendingDelete;
+    if (pd?.timerId) {
+      try { clearTimeout(pd.timerId); } catch {}
+    }
+    this._pendingDelete = null;
+  }
+
+  _renderDeleteToast() {
+    const pd = this._pendingDelete;
+    if (!pd?.uri) return '';
+    const label = (pd.state === 'deleting')
+      ? 'Deleting…'
+      : (pd.state === 'failed')
+        ? `Delete failed: ${esc(pd.error || 'Unknown error')}`
+        : 'Post removed.';
+    const canUndo = (pd.state === 'pending');
+    const canDismiss = (pd.state === 'failed');
+    return `
+      <div class="toast" role="status" aria-live="polite">
+        <div class="toast-msg">${esc(label)}</div>
+        <div class="toast-actions">
+          ${canUndo ? `<button class="toast-btn" type="button" data-undo-delete>Undo</button>` : ''}
+          ${canDismiss ? `<button class="toast-btn" type="button" data-dismiss-toast>Dismiss</button>` : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  _startOptimisticDelete(uri) {
+    const target = String(uri || '').trim();
+    if (!target) return;
+
+    // If a previous delete is pending, undo it before starting another.
+    if (this._pendingDelete?.state === 'pending') {
+      try { this._hiddenUris.delete(String(this._pendingDelete.uri || '')); } catch {}
+      this._clearPendingDelete();
+    } else {
+      this._clearPendingDelete();
+    }
+
+    this._hiddenUris.add(target);
+
+    const pd = {
+      uri: target,
+      timerId: null,
+      startedAt: Date.now(),
+      state: 'pending',
+      error: null,
+    };
+    pd.timerId = setTimeout(() => this._finalizePendingDelete(), 6000);
+    this._pendingDelete = pd;
+    this.render();
+  }
+
+  _undoOptimisticDelete() {
+    const pd = this._pendingDelete;
+    if (!pd?.uri || pd.state !== 'pending') return;
+    try { this._hiddenUris.delete(String(pd.uri)); } catch {}
+    this._clearPendingDelete();
+    this.render();
+  }
+
+  async _finalizePendingDelete() {
+    const pd = this._pendingDelete;
+    if (!pd?.uri || pd.state !== 'pending') return;
+    pd.state = 'deleting';
+    this.render();
+
+    try {
+      await call('deletePost', { uri: pd.uri });
+
+      try {
+        window.dispatchEvent(new CustomEvent('bsky-post-deleted', { detail: { uri: pd.uri } }));
+      } catch {}
+
+      try {
+        await syncRecent({ minutes: 10, refreshMinutes: 30, allowDirectFallback: false });
+      } catch {}
+
+      this._clearPendingDelete();
+      this.render();
+    } catch (e) {
+      // Restore on failure.
+      try { this._hiddenUris.delete(String(pd.uri)); } catch {}
+      pd.state = 'failed';
+      pd.error = e?.message || String(e || 'Delete failed');
+      this.render();
+    }
   }
 
   applyEngagementPatch(patch) {
@@ -204,6 +432,16 @@ export class BskyThreadTree extends HTMLElement {
     this.render();
     this.shadowRoot.addEventListener('click', (e) => this.onClick(e));
 
+    // Best-effort: load current DID so we can show Delete on your own posts.
+    try {
+      getAuthStatusCached(1500)
+        .then((auth) => {
+          this._meDid = String(auth?.activeDid || auth?.did || '');
+          this.render();
+        })
+        .catch(() => {});
+    } catch {}
+
     // Keep this thread view in sync with actions taken elsewhere (Posts panel, modals, etc).
     if (!this._likeChangedHandler) {
       this._likeChangedHandler = (e) => {
@@ -233,9 +471,95 @@ export class BskyThreadTree extends HTMLElement {
   disconnectedCallback() {
     if (this._likeChangedHandler) window.removeEventListener('bsky-like-changed', this._likeChangedHandler);
     if (this._repostChangedHandler) window.removeEventListener('bsky-repost-changed', this._repostChangedHandler);
+    this._clearPendingDelete();
   }
 
   async onClick(e) {
+    if (e.target?.closest?.('[data-collapse-all]')) {
+      this._collapseAll();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (e.target?.closest?.('[data-expand-all]')) {
+      this._expandAll();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    const toggleBtn = e.target?.closest?.('[data-toggle-collapse-uri]');
+    if (toggleBtn) {
+      const uri = String(toggleBtn.getAttribute('data-toggle-collapse-uri') || '').trim();
+      this._toggleCollapseUri(uri);
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    const openBtn = e.target?.closest?.('[data-open-panel-uri]');
+    if (openBtn) {
+      const uri = String(openBtn.getAttribute('data-open-panel-uri') || '').trim();
+      const cid = String(openBtn.getAttribute('data-open-panel-cid') || '').trim();
+      this._openUriInPanel({ uri, cid });
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    const copyBtn = e.target?.closest?.('[data-copy-url]');
+    if (copyBtn) {
+      const url = String(copyBtn.getAttribute('data-copy-url') || '').trim();
+      const ok = await this._copyToClipboard(url);
+      dispatchToast(this, {
+        kind: ok ? 'success' : 'error',
+        message: ok ? 'Link copied.' : 'Could not copy link.',
+        timeoutMs: 2200,
+      });
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    const shareBtn = e.target?.closest?.('[data-share-url]');
+    if (shareBtn) {
+      const url = String(shareBtn.getAttribute('data-share-url') || '').trim();
+      const title = String(shareBtn.getAttribute('data-share-title') || '').trim();
+      await this._shareOrCopyUrl(url, title);
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    if (e.target?.closest?.('[data-undo-delete]')) {
+      this._undoOptimisticDelete();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (e.target?.closest?.('[data-dismiss-toast]')) {
+      this._clearPendingDelete();
+      this.render();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    const delBtn = e.target?.closest?.('[data-delete-uri]');
+    if (delBtn) {
+      const uri = String(delBtn.getAttribute('data-delete-uri') || '').trim();
+      if (!uri) return;
+      if (this._pendingDelete?.state === 'pending' && String(this._pendingDelete.uri) === uri) return;
+
+      const ok = confirm('Delete this post? It will be removed immediately, with a short undo window.');
+      if (!ok) return;
+
+      this._startOptimisticDelete(uri);
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
     const btn = e.target?.closest?.('[data-reply-uri]');
     if (btn) {
       const uri = btn.getAttribute('data-reply-uri') || '';
@@ -354,10 +678,14 @@ export class BskyThreadTree extends HTMLElement {
     const post = node?.post || null;
     const uri = post?.uri || '';
     const cid = post?.cid || '';
+
+    if (uri && this._hiddenUris.has(String(uri))) return '';
+
     const author = pickAuthorParts(post);
     const who = formatAuthor(author);
     const when = pickTime(post);
     const text = pickText(post);
+    const textHtml = renderPostTextHtml(text);
 
     const open = atUriToWebPost(uri);
     const reposted = !!(post?.viewer && post.viewer.repost);
@@ -370,8 +698,17 @@ export class BskyThreadTree extends HTMLElement {
 
     const variant = String(opts?.variant || '');
 
+    const meDid = String(this._meDid || '');
+    const authorDid = String(post?.author?.did || '');
+    const isMine = !!(meDid && authorDid && authorDid === meDid);
+    const canDelete = isMine && (variant !== 'ancestor') && uri;
+    const deletingThis = !!(this._pendingDelete?.uri && String(this._pendingDelete.uri) === String(uri || ''));
+
     const replies = Array.isArray(node?.replies) ? node.replies : [];
     const hasReplies = replies.length > 0;
+
+    const isCollapsed = !!(hasReplies && uri && this._collapsedUris.has(String(uri)));
+    const repliesLabel = hasReplies ? `${replies.length} repl${replies.length === 1 ? 'y' : 'ies'}` : '';
 
     return `
       <div class="node ${esc(variant)}" style="--depth:${depth}">
@@ -387,15 +724,24 @@ export class BskyThreadTree extends HTMLElement {
             <div class="meta-bottom">
               <div class="when">${esc(when)}</div>
               ${(open) ? `<a class="open" href="${esc(open)}" target="_blank" rel="noopener">Open</a>` : ''}
+              ${(uri) ? `<button class="openpanel" type="button" data-open-panel-uri="${esc(uri)}" data-open-panel-cid="${esc(cid)}">Open in panel</button>` : ''}
+              ${(open) ? `<button class="copy" type="button" data-copy-url="${esc(open)}">Copy link</button>` : ''}
+              ${(open) ? `<button class="share" type="button" data-share-url="${esc(open)}" data-share-title="${esc(who)}">Share</button>` : ''}
+              ${hasReplies && uri ? `<button class="collapse" type="button" data-toggle-collapse-uri="${esc(uri)}">${isCollapsed ? `Expand (${esc(repliesLabel)})` : `Collapse (${esc(repliesLabel)})`}</button>` : ''}
               ${(variant !== 'ancestor' && uri) ? `<button class="reply" type="button" data-reply-uri="${esc(uri)}" data-reply-cid="${esc(cid)}" data-reply-author="${esc(who)}">Reply</button>` : ''}
               ${(variant !== 'ancestor' && uri) ? `<button class="repost" type="button" data-repost-uri="${esc(uri)}" data-repost-cid="${esc(cid)}" data-reposted="${reposted ? '1' : '0'}">${reposted ? 'Undo repost' : 'Repost'}</button>` : ''}
               ${(variant !== 'ancestor' && uri) ? `<button class="like" type="button" data-like-uri="${esc(uri)}" data-like-cid="${esc(cid)}" data-liked="${liked ? '1' : '0'}">${liked ? 'Unlike' : 'Like'}</button>` : ''}
+              ${canDelete ? `<button class="delete" type="button" data-delete-uri="${esc(uri)}" ${deletingThis ? 'disabled' : ''}>Delete</button>` : ''}
             </div>
           </div>
-          ${text ? `<div class="text">${esc(text)}</div>` : '<div class="text muted">(no text)</div>'}
+          ${text ? `<div class="text">${textHtml}</div>` : '<div class="text muted">(no text)</div>'}
           ${embedsHtml ? `<div class="embeds">${embedsHtml}</div>` : ''}
         </div>
-        ${hasReplies ? `<div class="replies">${replies.map((r) => this.renderNode(r, depth + 1)).join('')}</div>` : ''}
+        ${hasReplies
+          ? (isCollapsed
+            ? `<div class="replies-collapsed muted">Replies hidden (${esc(repliesLabel)}).</div>`
+            : `<div class="replies">${replies.map((r) => this.renderNode(r, depth + 1)).join('')}</div>`)
+          : ''}
       </div>
     `;
   }
@@ -413,11 +759,29 @@ export class BskyThreadTree extends HTMLElement {
       ? `<div class="replies">${replies.map((r) => this.renderNode(r, 0)).join('')}</div>`
       : '<div class="muted">No replies yet.</div>';
 
+    const toast = this._renderDeleteToast();
+
+    const actions = root ? `
+      <div class="thread-actions" role="toolbar" aria-label="Thread actions">
+        <button type="button" class="act" data-collapse-all>Collapse all</button>
+        <button type="button" class="act" data-expand-all>Expand all</button>
+      </div>
+    ` : '';
+
     this.shadowRoot.innerHTML = `
       <style>
         :host, *, *::before, *::after{box-sizing:border-box}
         :host{display:block}
         .muted{color:#aaa}
+
+        .thread-actions{display:flex;gap:8px;flex-wrap:wrap;margin:8px 0}
+        .act{appearance:none;border:1px solid #333;background:#111;color:#fff;border-radius: var(--bsky-radius, 0px);padding:6px 10px;cursor:pointer}
+        .act:hover{border-color:#3b5a8f}
+
+        .toast{display:flex;gap:10px;align-items:center;justify-content:space-between;margin:10px 0;padding:8px 10px;border:1px solid #333;background:#0f0f0f}
+        .toast-msg{color:#ddd;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .toast-actions{display:flex;gap:8px;flex:0 0 auto}
+        .toast-btn{background:#111;border:1px solid #555;color:#fff;padding:6px 10px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
 
         .node{margin: 0 0 8px 0; padding-left: calc(var(--depth, 0) * 12px); border-left: 2px solid rgba(255,255,255,0.06)}
         .card{border:2px dotted rgba(255,255,255,0.9); border-radius: var(--bsky-radius, 0px); background:#0b0b0b; padding:10px 8px}
@@ -445,12 +809,18 @@ export class BskyThreadTree extends HTMLElement {
         .node.ancestor{border-left: 2px solid rgba(255,255,255,0.12)}
         .node.ancestor .card{background:#090909}
 
-        .reply,.repost,.like{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius: var(--bsky-radius, 0px); padding:4px 10px; cursor:pointer}
-        .reply:hover,.repost:hover,.like:hover{border-color:#3b5a8f}
-        .reply:disabled,.repost:disabled,.like:disabled{opacity:.6; cursor:not-allowed}
+        .reply,.repost,.like,.delete,.copy,.share,.collapse,.openpanel{appearance:none; border:1px solid #333; background:#111; color:#fff; border-radius: var(--bsky-radius, 0px); padding:4px 10px; cursor:pointer}
+        .reply:hover,.repost:hover,.like:hover,.copy:hover,.share:hover,.collapse:hover,.openpanel:hover{border-color:#3b5a8f}
+        .delete{border-color:#7a2b2b}
+        .delete:hover{border-color:#b13a3a}
+        .reply:disabled,.repost:disabled,.like:disabled,.delete:disabled,.copy:disabled,.share:disabled,.collapse:disabled,.openpanel:disabled{opacity:.6; cursor:not-allowed}
+
+        .replies-collapsed{margin-top:8px}
 
         .replies{margin-top:8px}
       </style>
+      ${toast || ''}
+      ${actions || ''}
       ${root ? (hideRoot ? repliesHtml : `${ancestorsHtml}${this.renderNode(root, 0)}`) : '<div class="muted">Select a post to view its thread.</div>'}
     `;
   }

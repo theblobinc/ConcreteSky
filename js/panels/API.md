@@ -64,6 +64,42 @@ Options:
 Return value:
 - Returns an `unbind()` function.
 
+## UX helpers
+
+### `dispatchToast(scope, { message, kind, timeoutMs })`
+Lets any panel/component surface a global toast without importing app internals.
+
+- Emits a bubbling + composed `bsky-toast` event.
+- `kind` is a small string like `info`, `success`, `warn`, or `error`.
+- `timeoutMs` controls auto-dismiss (default `5000`; set `0` to require manual dismiss).
+
+### `bindPersistedScrollTop(scroller, key, opts)`
+Persists `scrollTop` to storage and restores it on mount/re-render.
+
+- Default storage is `sessionStorage`.
+- Pass `opts.storage = 'local'` to use `localStorage`.
+- Designed to be used by `<bsky-panel-shell persist-key="...">`.
+
+### `renderListEndcap(opts)`
+Renders a consistent “endcap” message for list-like UIs:
+
+- Empty: “No results.” (or a caller-supplied message)
+- Loading initial: “Loading…”
+- Loading more: “Loading more…”
+- Exhausted: “You’re all caught up.”
+
+Common options:
+- `count` (number): current number of items rendered/available
+- `loading` (boolean): true when doing initial load
+- `loadingMore` (boolean): true when paging additional results
+- `hasMore` (boolean): whether more results exist
+- `emptyText`, `loadingText`, `loadingMoreText`, `endText` (string overrides)
+- `slot` (string): add a slot attribute (useful for `<bsky-panel-shell>` footers)
+- `className`, `style` (optional)
+
+Return value:
+- Returns an HTML string (empty string when nothing should be shown).
+
 ## Lazy media helpers
 
 Some panels render large amounts of media (avatars, thumbnails, image grids). To keep scroll smooth and memory stable, panels can render media as placeholders and only load the real assets when they’re near the viewport.

@@ -2,7 +2,9 @@ import { call } from '../../../api.js';
 import { getAuthStatusCached, isNotConnectedError } from '../../../auth_state.js';
 import { identityCss, identityHtml, bindCopyClicks, toProfileUrl } from '../../../lib/identity.js';
 import { queueProfiles } from '../../../profile_hydrator.js';
-import { bindInfiniteScroll, captureScrollAnchor, applyScrollAnchor } from '../../panel_api.js';
+import { PanelListController } from '../../../controllers/panel_list_controller.js';
+import { ListWindowingController } from '../../../controllers/list_windowing_controller.js';
+import { renderListEndcap } from '../../panel_api.js';
 import { BSKY_SEARCH_EVENT } from '../../../search/search_bus.js';
 import { SEARCH_TARGETS } from '../../../search/constants.js';
 import { compileSearchMatcher } from '../../../search/query.js';
@@ -44,12 +46,52 @@ class BskyConnections extends HTMLElement {
       showFollowing: true,
     };
 
-    this._unbindInfiniteScroll = null;
-    this._infiniteScrollEl = null;
+    this._listCtl = new PanelListController(this, {
+      itemSelector: '.entry[data-did]',
+      keyAttr: 'data-did',
+      enabled: () => true,
+      isLoading: () => !!this.loading,
+      hasMore: () => !!this.hasMore,
+      onLoadMore: () => this.load(false),
+      threshold: 220,
+      cooldownMs: 250,
+      ensureKeyVisible: (key) => this._winCtl?.ensureKeyVisible?.(key),
+    });
 
-    this._restoreScrollNext = false;
-    this._scrollAnchor = null;
-    this._scrollTop = 0;
+    this._winCtl = new ListWindowingController(this, {
+      listSelector: '.entries',
+      itemSelector: '.entry[data-did]',
+      keyAttr: 'data-did',
+      getScroller: () => this._listCtl?.getScroller?.() || null,
+      enabled: () => true,
+      getLayout: () => 'grid',
+      minItemsToWindow: 240,
+      estimatePx: 130,
+      overscanItems: 48,
+      keyFor: (p) => String(p?.did || ''),
+      renderRow: (p) => {
+        const ageDays = daysSince(p?.createdAt);
+        const key = String(p?.did || '');
+        return `
+        <div class="entry" data-did="${esc(key)}">
+          <bsky-lazy-img class="av" src="${esc(p?.avatar || '')}" alt="" aspect="1/1"></bsky-lazy-img>
+          <div class="main">
+            <div class="top">
+              ${identityHtml({ did: p?.did, handle: p?.handle, displayName: p?.displayName }, { showHandle: false, showCopyDid: true })}
+            </div>
+            <div class="sub">${p?.handle ? `<a href="${esc(toProfileUrl({ handle: p.handle, did: p.did }))}" target="_blank" rel="noopener">@${esc(p.handle)}</a>` : ''}</div>
+            ${p?.description ? `<div class="bio">${esc(p.description)}</div>` : ``}
+            <div class="meta">
+              <span>Followers: ${esc(p?.followersCount ?? '—')}</span>
+              <span>Following: ${esc(p?.followsCount ?? '—')}</span>
+              <span>Posts: ${esc(p?.postsCount ?? '—')}</span>
+              <span>Age: ${ageDays === null ? '—' : `${ageDays}d`}</span>
+            </div>
+          </div>
+        </div>
+      `;
+      },
+    });
 
 
     this._qTimer = null;
@@ -200,8 +242,6 @@ class BskyConnections extends HTMLElement {
 
   connectedCallback(){
     this.render();
-    if (this._unbindInfiniteScroll) { try { this._unbindInfiniteScroll(); } catch {} this._unbindInfiniteScroll = null; }
-    this._infiniteScrollEl = null;
     this.load(true);
     bindCopyClicks(this.shadowRoot);
     this.shadowRoot.addEventListener('click', (e) => this.onClick(e));
@@ -270,8 +310,7 @@ class BskyConnections extends HTMLElement {
   }
 
   disconnectedCallback(){
-    if (this._unbindInfiniteScroll) { try { this._unbindInfiniteScroll(); } catch {} this._unbindInfiniteScroll = null; }
-    this._infiniteScrollEl = null;
+    this._listCtl?.disconnect?.();
 
     if (this._onSearchChanged) {
       try { window.removeEventListener(BSKY_SEARCH_EVENT, this._onSearchChanged); } catch {}
@@ -365,6 +404,7 @@ class BskyConnections extends HTMLElement {
       await this.load(true);
     } catch (e) {
       this.error = isNotConnectedError(e) ? 'Not connected. Use the Connect button.' : e.message;
+      this._listCtl?.toastError?.(this.error, { kind: 'error' });
       this.loading = false;
       this.render();
     }
@@ -390,9 +430,8 @@ class BskyConnections extends HTMLElement {
     if (reset) {
       this.items = [];
       this.offset = 0;
-      this._restoreScrollNext = false;
     }
-    if (!reset) this._restoreScrollNext = true;
+    if (!reset) this._listCtl?.requestRestore?.({ anchor: true });
     this.render();
 
     try {
@@ -444,6 +483,7 @@ class BskyConnections extends HTMLElement {
       } catch {}
     } catch (e) {
       this.error = isNotConnectedError(e) ? 'Not connected. Use the Connect button.' : e.message;
+      this._listCtl?.toastError?.(this.error, { kind: 'error' });
     } finally {
       this.loading = false;
       this.render();
@@ -451,21 +491,7 @@ class BskyConnections extends HTMLElement {
   }
 
   render(){
-    // Preserve scroll position across re-renders.
-    try {
-      const prevScroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.();
-      if (prevScroller) {
-        this._scrollTop = prevScroller.scrollTop || 0;
-        if (this._restoreScrollNext) {
-          this._scrollAnchor = captureScrollAnchor({
-            scroller: prevScroller,
-            root: this.shadowRoot,
-            itemSelector: '.entry[data-did]',
-            keyAttr: 'data-did',
-          });
-        }
-      }
-    } catch {}
+    this._listCtl?.beforeRender?.();
 
     const orderedRaw = (this.items || []);
     const hudQ = String(this._hudSearchSpec?.query || '').trim();
@@ -487,65 +513,47 @@ class BskyConnections extends HTMLElement {
         })
       : orderedRaw;
 
-    const rows = ordered.map((p) => {
-      const ageDays = daysSince(p.createdAt);
-      const key = String(p.did || '');
-      return {
-        key,
-        html: `
-        <div class="entry" data-did="${esc(key)}">
-          <bsky-lazy-img class="av" src="${esc(p.avatar || '')}" alt="" aspect="1/1"></bsky-lazy-img>
-          <div class="main">
-            <div class="top">
-              ${identityHtml({ did: p.did, handle: p.handle, displayName: p.displayName }, { showHandle: false, showCopyDid: true })}
-            </div>
-            <div class="sub">${p.handle ? `<a href="${esc(toProfileUrl({ handle: p.handle, did: p.did }))}" target="_blank" rel="noopener">@${esc(p.handle)}</a>` : ''}</div>
-            ${p.description ? `<div class="bio">${esc(p.description)}</div>` : ``}
-            <div class="meta">
-              <span>Followers: ${esc(p.followersCount ?? '—')}</span>
-              <span>Following: ${esc(p.followsCount ?? '—')}</span>
-              <span>Posts: ${esc(p.postsCount ?? '—')}</span>
-              <span>Age: ${ageDays === null ? '—' : `${ageDays}d`}</span>
-            </div>
-          </div>
-        </div>
-      `
-      };
+    this._winCtl.setItems(ordered);
+    const rowsHtml = this._winCtl.innerHtml({
+      loadingHtml: '<div class="muted">Loading…</div>',
+      emptyHtml: '<div class="muted">No connections loaded.</div>',
     });
-
-    const rowsHtml = rows.map(r => r.html).join('');
 
     this.shadowRoot.innerHTML = `
       <style>
         :host, *, *::before, *::after{box-sizing:border-box}
         :host{display:block;margin:0;--bsky-connections-ui-offset:290px}
-        .muted{color:#aaa}
-        .muted{color:#aaa}
+        .muted{color:var(--bsky-muted-fg, #aaa)}
+        .muted{color:var(--bsky-muted-fg, #aaa)}
         .controls{display:flex;gap:var(--bsky-panel-control-gap-dense, 6px);flex-wrap:wrap;align-items:center}
-        input,select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:8px 10px}
-        label{color:#ddd;font-size:.95rem;display:flex;gap:6px;align-items:center}
-        button{background:#111;border:1px solid #555;color:#fff;padding:8px 10px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
+        input,select{background:var(--bsky-input-bg, #0f0f0f);color:var(--bsky-fg, #fff);border:1px solid var(--bsky-border, #333);border-radius: var(--bsky-radius, 0px);padding:8px 10px}
+        label{color:var(--bsky-muted-fg, #ddd);font-size:.95rem;display:flex;gap:6px;align-items:center}
+        button{background:var(--bsky-btn-bg, #111);border:1px solid var(--bsky-border-soft, #555);color:var(--bsky-fg, #fff);padding:8px 10px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
         button:disabled{opacity:.6;cursor:not-allowed}
 
         .entries{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--bsky-card-min-w, 350px),1fr));gap:var(--bsky-card-gap, var(--bsky-grid-gutter, 0px));align-items:start;max-width:100%;min-height:0}
 
-        .entry{display:flex;gap:8px;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:5px;background:#0f0f0f;width:100%;max-width:100%;min-width:0}
-        .av{width:40px;height:40px;border-radius: var(--bsky-radius, 0px);background:#222;object-fit:cover;flex:0 0 auto}
+        .win-spacer{width:100%;pointer-events:none;contain:layout size style}
+
+        .entry{display:flex;gap:8px;border:1px solid var(--bsky-border, #333);border-radius: var(--bsky-radius, 0px);padding:5px;background:var(--bsky-input-bg, #0f0f0f);width:100%;max-width:100%;min-width:0}
+        /* Lightweight “windowing”: skip rendering offscreen entries (huge perf win on long lists). */
+        .entry{content-visibility:auto;contain-intrinsic-size:350px 120px}
+        .av{width:40px;height:40px;border-radius: var(--bsky-radius, 0px);background:var(--bsky-surface-2, #222);object-fit:cover;flex:0 0 auto}
         .main{min-width:0;flex:1}
         .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-        .sub{color:#bbb;font-size:.9rem;margin-top:2px}
-        .sub a{color:#bbb;text-decoration:underline}
+        .sub{color:var(--bsky-muted-fg, #bbb);font-size:.9rem;margin-top:2px}
+        .sub a{color:var(--bsky-muted-fg, #bbb);text-decoration:underline}
         /* Clamp bio to reduce height variance (less empty space between cards). */
-        .bio{color:#ddd;margin-top:6px;word-break:break-word;white-space:normal;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3}
-        .meta{color:#bbb;font-size:.85rem;margin-top:6px;display:flex;gap:10px;flex-wrap:wrap}
-        .err{color:#f88}
+        .bio{color:var(--bsky-fg, #ddd);margin-top:6px;word-break:break-word;white-space:normal;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:3}
+        .meta{color:var(--bsky-muted-fg, #bbb);font-size:.85rem;margin-top:6px;display:flex;gap:10px;flex-wrap:wrap}
+        .err{color:var(--bsky-danger-fg, #f88)}
         ${identityCss}
 
         @media (max-width: 380px){
           .wrap{padding:8px}
         }
       </style>
-      <bsky-panel-shell title="Connections" dense style="--bsky-panel-ui-offset: var(--bsky-connections-ui-offset)">
+      <bsky-panel-shell title="Connections" dense persist-key="connections" style="--bsky-panel-ui-offset: var(--bsky-connections-ui-offset)">
         <div slot="head-right" class="muted">Showing: ${esc(ordered.length)} · Loaded: ${esc(this.items.length)} / ${esc(this.total)}</div>
 
         <div slot="toolbar" class="controls">
@@ -570,47 +578,20 @@ class BskyConnections extends HTMLElement {
         ${this.error ? `<div class="err">Error: ${esc(this.error)}</div>` : ''}
 
         <div class="entries">
-          ${rowsHtml || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No connections loaded.</div>')}
+          ${rowsHtml}
         </div>
+
+        ${renderListEndcap({
+          loading: this.loading,
+          hasMore: this.hasMore,
+          count: this.items.length,
+          slot: 'footer',
+        })}
       </bsky-panel-shell>
     `;
 
-    // Restore scroll after DOM rebuild.
-    queueMicrotask(() => {
-      requestAnimationFrame(() => {
-        const scroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.();
-        if (!scroller) return;
-        if (this._restoreScrollNext && this._scrollAnchor) {
-          applyScrollAnchor({ scroller, root: this.shadowRoot, anchor: this._scrollAnchor, keyAttr: 'data-did' });
-          setTimeout(() => applyScrollAnchor({ scroller, root: this.shadowRoot, anchor: this._scrollAnchor, keyAttr: 'data-did' }), 160);
-        } else {
-          scroller.scrollTop = Math.max(0, this._scrollTop || 0);
-        }
-        this._restoreScrollNext = false;
-        this._scrollAnchor = null;
-      });
-    });
-
-    // Infinite scroll: load the next page when nearing the bottom (de-duped across renders).
-    const scroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.();
-    if (scroller && scroller !== this._infiniteScrollEl) {
-      try { this._unbindInfiniteScroll?.(); } catch {}
-      this._infiniteScrollEl = scroller;
-      this._unbindInfiniteScroll = bindInfiniteScroll(scroller, () => this.load(false), {
-        threshold: 220,
-        enabled: () => true,
-        isLoading: () => !!this.loading,
-        hasMore: () => !!this.hasMore,
-        cooldownMs: 250,
-        anchor: {
-          getRoot: () => this.shadowRoot,
-          itemSelector: '.entry[data-did]',
-          keyAttr: 'data-did',
-        },
-        // Avoid auto-fetching every page on open ("fill the viewport" loop).
-        initialTick: false,
-      });
-    }
+    this._winCtl.afterRender();
+    this._listCtl?.afterRender?.();
   }
 }
 

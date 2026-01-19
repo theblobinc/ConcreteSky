@@ -2,7 +2,9 @@ import { call } from '../../../api.js';
 import { getAuthStatusCached, isNotConnectedError } from '../../../auth_state.js';
 import { identityCss, identityHtml, bindCopyClicks, toProfileUrl } from '../../../lib/identity.js';
 import { queueProfiles } from '../../../profile_hydrator.js';
-import { resolvePanelScroller, captureScrollAnchor, applyScrollAnchor } from '../../panel_api.js';
+import { PanelListController } from '../../../controllers/panel_list_controller.js';
+import { ListWindowingController } from '../../../controllers/list_windowing_controller.js';
+import { renderListEndcap } from '../../panel_api.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
   ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[m])
@@ -59,9 +61,53 @@ class BskyFollowers extends HTMLElement {
     this._hydratedDidSet = new Set();
     this._hydratedTimer = null;
 
-    this._restoreScrollNext = false;
-    this._scrollAnchor = null;
-    this._scrollTop = 0;
+    this._listCtl = new PanelListController(this, {
+      itemSelector: '.row[data-did]',
+      keyAttr: 'data-did',
+      enabled: () => true,
+      isLoading: () => !!this.loading,
+      hasMore: () => !!this.hasMore,
+      onLoadMore: () => this.load(false),
+      threshold: 220,
+      cooldownMs: 250,
+      ensureKeyVisible: (key) => this._winCtl?.ensureKeyVisible?.(key),
+    });
+
+    this._winCtl = new ListWindowingController(this, {
+      listSelector: '.list',
+      itemSelector: '.row[data-did]',
+      keyAttr: 'data-did',
+      getScroller: () => this._listCtl?.getScroller?.() || null,
+      enabled: () => String(this.view || 'list') === 'list',
+      getLayout: () => 'list',
+      minItemsToWindow: 240,
+      estimatePx: 96,
+      overscanItems: 40,
+      keyFor: (p) => String(p?.did || ''),
+      renderRow: (p) => {
+        const mutual = this.filters.onlyMutuals;
+        const ageDays = daysSince(p?.createdAt);
+        return `
+        <div class="row" data-did="${esc(p?.did || '')}">
+          <img class="av" src="${esc(p?.avatar || '')}" alt="" onerror="this.style.display='none'">
+          <div class="main">
+            <div class="top">
+              ${identityHtml({ did: p?.did, handle: p?.handle, displayName: p?.displayName }, { showHandle: false, showCopyDid: true })}
+              ${mutual ? `<span class="chip">Mutual</span>` : ``}
+            </div>
+            <div class="sub">${p?.handle ? `<a href="${esc(toProfileUrl({ handle: p.handle, did: p.did }))}" target="_blank" rel="noopener">@${esc(p.handle)}</a>` : ''}</div>
+            ${p?.description ? `<div class="bio">${esc(p.description)}</div>` : ``}
+            <div class="meta">
+              <span>Followers: ${esc(p?.followersCount ?? '—')}</span>
+              <span>Following: ${esc(p?.followsCount ?? '—')}</span>
+              <span>Posts: ${esc(p?.postsCount ?? '—')}</span>
+              <span>Age: ${ageDays === null ? '—' : `${ageDays}d`}</span>
+            </div>
+          </div>
+        </div>
+      `;
+      },
+    });
   }
 
   _isRateLimitError(e) {
@@ -152,6 +198,8 @@ class BskyFollowers extends HTMLElement {
   }
 
   disconnectedCallback(){
+    this._listCtl?.disconnect?.();
+    this._winCtl?.disconnect?.();
     if (this._onProfilesHydrated) {
       try { window.removeEventListener('bsky-profiles-hydrated', this._onProfilesHydrated); } catch {}
       this._onProfilesHydrated = null;
@@ -221,9 +269,8 @@ class BskyFollowers extends HTMLElement {
     if (reset) {
       this.items = [];
       this.offset = 0;
-      this._restoreScrollNext = false;
     }
-    if (!reset) this._restoreScrollNext = true;
+    if (!reset) this._listCtl?.requestRestore?.({ anchor: true });
     this.render();
 
     try {
@@ -273,6 +320,7 @@ class BskyFollowers extends HTMLElement {
       } catch {}
     } catch (e) {
       this.error = isNotConnectedError(e) ? 'Not connected. Use the Connect button.' : e.message;
+      this._listCtl?.toastError?.(this.error, { kind: 'error' });
     } finally {
       this.loading = false;
       this.render();
@@ -280,74 +328,44 @@ class BskyFollowers extends HTMLElement {
   }
 
   render(){
-    // Preserve scroll position across re-renders.
-    try {
-      const scroller = resolvePanelScroller(this) || document.scrollingElement;
-      if (scroller) {
-        this._scrollTop = scroller.scrollTop || 0;
-        if (this._restoreScrollNext) {
-          this._scrollAnchor = captureScrollAnchor({
-            scroller,
-            root: this.shadowRoot,
-            itemSelector: '.row[data-did]',
-            keyAttr: 'data-did',
-          });
-        }
-      }
-    } catch {}
+    this._listCtl?.beforeRender?.();
 
-    const rows = (this.items || []).map(p => {
-      // From cache: mutual is not embedded; we approximate by filtering on server when mutuals-only.
-      const mutual = this.filters.onlyMutuals;
-      const ageDays = daysSince(p.createdAt);
-
-      return `
-        <div class="row" data-did="${esc(p.did || '')}">
-          <img class="av" src="${esc(p.avatar || '')}" alt="" onerror="this.style.display='none'">
-          <div class="main">
-            <div class="top">
-              ${identityHtml({ did: p.did, handle: p.handle, displayName: p.displayName }, { showHandle: false, showCopyDid: true })}
-              ${mutual ? `<span class="chip">Mutual</span>` : ``}
-            </div>
-            <div class="sub">${p.handle ? `<a href="${esc(toProfileUrl({ handle: p.handle, did: p.did }))}" target="_blank" rel="noopener">@${esc(p.handle)}</a>` : ''}</div>
-            ${p.description ? `<div class="bio">${esc(p.description)}</div>` : ``}
-            <div class="meta">
-              <span>Followers: ${esc(p.followersCount ?? '—')}</span>
-              <span>Following: ${esc(p.followsCount ?? '—')}</span>
-              <span>Posts: ${esc(p.postsCount ?? '—')}</span>
-              <span>Age: ${ageDays === null ? '—' : `${ageDays}d`}</span>
-            </div>
-          </div>
-        </div>
-      `;
-    }).join('');
+    const rows = (this.items || []).map((p) => this._winCtl.renderRow(p)).join('');
+    this._winCtl.setItems(this.items || []);
+    const listInner = (String(this.view || 'list') === 'list')
+      ? this._winCtl.innerHtml({
+          loadingHtml: '<div class="muted">Loading…</div>',
+          emptyHtml: '<div class="muted">No followers loaded.</div>',
+        })
+      : (rows || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No followers loaded.</div>'));
 
     this.shadowRoot.innerHTML = `
       <style>
         :host{display:block}
-        .wrap{border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:10px;background:#070707;color:#fff}
+        .wrap{border:1px solid var(--bsky-border, #333);border-radius: var(--bsky-radius, 0px);padding:10px;background:var(--bsky-bg, #070707);color:var(--bsky-fg, #fff)}
         .head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
         .title{font-weight:800}
-        .muted{color:#aaa}
+        .muted{color:var(--bsky-muted-fg, #aaa)}
         .controls{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
-        input,select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:8px 10px}
-        label{color:#ddd;font-size:.95rem;display:flex;gap:6px;align-items:center}
-        button{background:#111;border:1px solid #555;color:#fff;padding:8px 10px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
+        input,select{background:var(--bsky-input-bg, #0f0f0f);color:var(--bsky-fg, #fff);border:1px solid var(--bsky-border, #333);border-radius: var(--bsky-radius, 0px);padding:8px 10px}
+        label{color:var(--bsky-muted-fg, #ddd);font-size:.95rem;display:flex;gap:6px;align-items:center}
+        button{background:var(--bsky-btn-bg, #111);border:1px solid var(--bsky-border-soft, #555);color:var(--bsky-fg, #fff);padding:8px 10px;border-radius: var(--bsky-radius, 0px);cursor:pointer}
         button:disabled{opacity:.6;cursor:not-allowed}
         .list{display:flex;flex-direction:column;gap:0}
         .list.masonry{column-width:350px; column-gap:12px; display:block}
-        .list.masonry .row{break-inside:avoid; display:inline-flex; width:100%}
-        .row{display:flex;gap:10px;border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:2px;background:#0f0f0f}
-        .av{width:40px;height:40px;border-radius: var(--bsky-radius, 0px);background:#222;object-fit:cover;flex:0 0 auto}
+            .list.masonry .row{break-inside:avoid; display:inline-flex; width:100%; content-visibility:auto; contain-intrinsic-size:350px 92px;}
+        .win-spacer{width:100%;pointer-events:none;contain:layout size style}
+        .row{display:flex;gap:10px;border:1px solid var(--bsky-border, #333);border-radius: var(--bsky-radius, 0px);padding:2px;background:var(--bsky-input-bg, #0f0f0f)}
+        .av{width:40px;height:40px;border-radius: var(--bsky-radius, 0px);background:var(--bsky-surface-2, #222);object-fit:cover;flex:0 0 auto}
         .main{min-width:0;flex:1}
         .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-        .name{color:#fff;text-decoration:underline;font-weight:700}
-        .sub{color:#bbb;font-size:.9rem;margin-top:2px}
-        .sub a{color:#bbb;text-decoration:underline}
-        .bio{color:#ddd;margin-top:6px;white-space:pre-wrap;word-break:break-word}
-        .meta{color:#bbb;font-size:.85rem;margin-top:6px;display:flex;gap:10px;flex-wrap:wrap}
+        .name{color:var(--bsky-fg, #fff);text-decoration:underline;font-weight:700}
+        .sub{color:var(--bsky-muted-fg, #bbb);font-size:.9rem;margin-top:2px}
+        .sub a{color:var(--bsky-muted-fg, #bbb);text-decoration:underline}
+        .bio{color:var(--bsky-fg, #ddd);margin-top:6px;white-space:pre-wrap;word-break:break-word}
+        .meta{color:var(--bsky-muted-fg, #bbb);font-size:.85rem;margin-top:6px;display:flex;gap:10px;flex-wrap:wrap}
         .chip{background:#1e2e1e;color:#89f0a2;border:1px solid #2e5a3a;border-radius: var(--bsky-radius, 0px);padding:1px 8px;font-size:.75rem}
-        .err{color:#f88}
+        .err{color:var(--bsky-danger-fg, #f88)}
         ${identityCss}
       </style>
       <div class="wrap">
@@ -378,28 +396,20 @@ class BskyFollowers extends HTMLElement {
 
         ${this.error ? `<div class="err">Error: ${esc(this.error)}</div>` : ''}
         <div class="list ${esc(this.view)}">
-          ${rows || (this.loading ? '<div class="muted">Loading…</div>' : '<div class="muted">No followers loaded.</div>')}
+          ${listInner}
         </div>
+
+            ${renderListEndcap({
+              loading: this.loading,
+              hasMore: this.hasMore,
+              count: this.items.length,
+              style: 'margin-top:10px',
+            })}
       </div>
     `;
 
-    // Restore scroll anchor after DOM rebuild.
-    if (this._restoreScrollNext) {
-      queueMicrotask(() => {
-        requestAnimationFrame(() => {
-          const scroller = resolvePanelScroller(this) || document.scrollingElement;
-          if (!scroller) return;
-          if (this._scrollAnchor) {
-            applyScrollAnchor({ scroller, root: this.shadowRoot, anchor: this._scrollAnchor, keyAttr: 'data-did' });
-            setTimeout(() => applyScrollAnchor({ scroller, root: this.shadowRoot, anchor: this._scrollAnchor, keyAttr: 'data-did' }), 160);
-          } else {
-            scroller.scrollTop = Math.max(0, this._scrollTop || 0);
-          }
-          this._restoreScrollNext = false;
-          this._scrollAnchor = null;
-        });
-      });
-    }
+    this._winCtl.afterRender();
+    this._listCtl?.afterRender?.();
   }
 }
 

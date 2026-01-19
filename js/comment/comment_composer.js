@@ -1,4 +1,5 @@
 import { loadJson, saveJson } from '../panels/storage.js';
+import { saveDraftMedia, loadDraftMedia, deleteDraftMedia } from '../panels/draft_media_store.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
 
@@ -25,6 +26,9 @@ export class BskyCommentComposer extends HTMLElement {
 		this._lists = null; // [{ uri, name }]
 		this._listsLoading = false;
 		this._listsError = '';
+
+		// Scheduling (top-level posts only). Stored as a datetime-local string.
+		this._scheduledAtLocal = '';
 
 		// Drafts/autosave
 		this._draftTimer = null;
@@ -99,29 +103,82 @@ export class BskyCommentComposer extends HTMLElement {
 					replyGateMode: String(this._replyGateMode || 'everyone'),
 					replyAllow: { ...this._replyAllow },
 					replyListUri: String(this._replyListUri || ''),
+					scheduledAtLocal: String(this._scheduledAtLocal || ''),
 				},
 			};
 
 			const anyText = draft.parts.some((p) => String(p?.text || '').trim());
-			if (!anyText) {
+			const anyImages = (Array.isArray(this._parts) ? this._parts : []).some((p) => Array.isArray(p?.images) && p.images.length);
+			if (!anyText && !anyImages) {
 				try { localStorage.removeItem(key); } catch {}
+				deleteDraftMedia(key).catch(() => {});
 				return;
 			}
 			saveJson(key, draft);
+			saveDraftMedia(key, this._parts, draft).catch(() => {});
 		} catch {
 			// ignore
 		}
 	}
 
 	_clearDraft() {
-		try { localStorage.removeItem(this._draftStorageKey()); } catch {}
+		const key = this._draftStorageKey();
+		try { localStorage.removeItem(key); } catch {}
+		deleteDraftMedia(key).catch(() => {});
 	}
 
 	_loadDraft() {
 		try {
 			const key = this._draftStorageKey();
 			const d = loadJson(key, null);
-			if (!d || d.v !== 1) return;
+			if (!d || d.v !== 1) {
+				// Recovery path: attempt to restore draft snapshot from IndexedDB.
+				loadDraftMedia(key).then((media) => {
+					try {
+						const snap = media?.draft;
+						if (!snap || snap.v !== 1) return;
+						// Only restore if the snapshot matches our current context.
+						const sMode = String(snap.mode || 'reply');
+						const sReply = String(snap.replyUri || '');
+						if (sMode !== String(this._mode || 'reply')) return;
+						if (sMode !== 'post' && sReply !== String(this._replyTo?.uri || '')) return;
+
+						let parts = Array.isArray(snap.parts) ? snap.parts.map((p) => ({ text: String(p?.text || ''), images: [] })) : [];
+						parts = parts.slice(0, 10);
+						if (!parts.length) parts = [{ text: '', images: [] }];
+						if (!this._threadEnabled && parts.length > 1) parts = [parts[0]];
+						this._parts = parts;
+						this._activePart = Math.max(0, Math.min(Number(snap.activePart || 0), this._parts.length - 1));
+						this._imagesTargetPart = this._activePart;
+
+						const s = snap.settings || {};
+						this._quotesAllowed = (s.quotesAllowed !== undefined) ? !!s.quotesAllowed : this._quotesAllowed;
+						this._replyGateMode = String(s.replyGateMode || this._replyGateMode || 'everyone');
+						if (s.replyAllow && typeof s.replyAllow === 'object') {
+							this._replyAllow = { ...this._replyAllow, ...s.replyAllow };
+						}
+						this._replyListUri = (s.replyListUri !== undefined) ? String(s.replyListUri || '') : this._replyListUri;
+						this._scheduledAtLocal = (s.scheduledAtLocal !== undefined) ? String(s.scheduledAtLocal || '') : this._scheduledAtLocal;
+
+						// Hydrate images from the same record.
+						const mParts = Array.isArray(media?.parts) ? media.parts : [];
+						for (let i = 0; i < this._parts.length; i++) {
+							const imgs = Array.isArray(mParts[i]?.images) ? mParts[i].images : [];
+							this._parts[i].images = imgs.slice(0, 4).map((img) => ({
+								name: String(img?.name || ''),
+								mime: String(img?.mime || ''),
+								dataBase64: String(img?.dataBase64 || ''),
+								alt: String(img?.alt || ''),
+							})).filter((img) => img.dataBase64 && img.mime);
+						}
+
+						this.render();
+					} catch {
+						// ignore
+					}
+				}).catch(() => {});
+				return;
+			}
 
 			// Ensure we're restoring into the same context.
 			const dMode = String(d.mode || 'reply');
@@ -144,6 +201,27 @@ export class BskyCommentComposer extends HTMLElement {
 				this._replyAllow = { ...this._replyAllow, ...s.replyAllow };
 			}
 			this._replyListUri = (s.replyListUri !== undefined) ? String(s.replyListUri || '') : this._replyListUri;
+			this._scheduledAtLocal = (s.scheduledAtLocal !== undefined) ? String(s.scheduledAtLocal || '') : this._scheduledAtLocal;
+
+			// Media is stored separately (IndexedDB) to survive reloads without bloating localStorage.
+			loadDraftMedia(key).then((media) => {
+				try {
+					if (!media || (media.v !== 1 && media.v !== 2)) return;
+					const mParts = Array.isArray(media.parts) ? media.parts : [];
+					for (let i = 0; i < this._parts.length; i++) {
+						const imgs = Array.isArray(mParts[i]?.images) ? mParts[i].images : [];
+						this._parts[i].images = imgs.slice(0, 4).map((img) => ({
+							name: String(img?.name || ''),
+							mime: String(img?.mime || ''),
+							dataBase64: String(img?.dataBase64 || ''),
+							alt: String(img?.alt || ''),
+						})).filter((img) => img.dataBase64 && img.mime);
+					}
+					this.render();
+				} catch {
+					// ignore
+				}
+			}).catch(() => {});
 		} catch {
 			// ignore
 		}
@@ -240,6 +318,32 @@ export class BskyCommentComposer extends HTMLElement {
 			return;
 		}
 
+		if (e.target?.closest?.('[data-action="export-draft"]')) {
+			this._exportDraft().catch(() => {});
+			return;
+		}
+		if (e.target?.closest?.('[data-action="import-draft"]')) {
+			this._importDraft().catch(() => {});
+			return;
+		}
+		if (e.target?.closest?.('[data-action="clear-draft"]')) {
+			if (!confirm('Clear this draft?')) return;
+			this._parts = [{ text: '', images: [] }];
+			this._activePart = 0;
+			this._imagesTargetPart = 0;
+			this._scheduledAtLocal = '';
+			this._clearDraft();
+			this.render();
+			return;
+		}
+
+		if (e.target?.closest?.('[data-clear-schedule]')) {
+			this._scheduledAtLocal = '';
+			this._scheduleDraftSave();
+			this.render();
+			return;
+		}
+
 		const refreshLists = e.target?.closest?.('[data-refresh-lists]');
 		if (refreshLists) {
 			this._requestLists();
@@ -330,6 +434,23 @@ export class BskyCommentComposer extends HTMLElement {
 				if (String(p.text || '').length > max) return;
 			}
 
+			// Scheduling is only supported for top-level posts (not replies).
+			let scheduledAt = '';
+			if (this._mode === 'post' && !(this._replyTo && this._replyTo.uri)) {
+				scheduledAt = this._scheduledAtIsoOrEmpty();
+				if (scheduledAt) {
+					try {
+						const ts = Date.parse(scheduledAt);
+						if (!Number.isFinite(ts) || ts <= (Date.now() + 10_000)) {
+							alert('Scheduled time must be at least ~10 seconds in the future.');
+							return;
+						}
+					} catch {
+						scheduledAt = '';
+					}
+				}
+			}
+
 			const replyGateDisabled = !!(this._replyTo && this._replyTo.uri);
 			const replyMode = replyGateDisabled ? 'everyone' : String(this._replyGateMode || 'everyone');
 			const allow = (() => {
@@ -362,6 +483,7 @@ export class BskyCommentComposer extends HTMLElement {
 						replyTo: this._replyTo,
 						media: parts[0].media,
 						interactions,
+						...(scheduledAt ? { scheduledAt } : {}),
 					},
 					bubbles: true,
 					composed: true,
@@ -373,6 +495,7 @@ export class BskyCommentComposer extends HTMLElement {
 						replyTo: this._replyTo,
 						maxChars: max,
 						interactions,
+						...(scheduledAt ? { scheduledAt } : {}),
 					},
 					bubbles: true,
 					composed: true,
@@ -385,8 +508,105 @@ export class BskyCommentComposer extends HTMLElement {
 			this._imagesTargetPart = 0;
 			this._emojiOpen = false;
 			this._settingsOpen = false;
+			this._scheduledAtLocal = '';
 			this.render();
 		}
+	}
+
+	_exportDraftObj() {
+		return {
+			v: 1,
+			ts: Date.now(),
+			mode: String(this._mode || 'reply'),
+			replyUri: String(this._replyTo?.uri || ''),
+			activePart: Number.isFinite(this._activePart) ? this._activePart : 0,
+			settings: {
+				quotesAllowed: !!this._quotesAllowed,
+				replyGateMode: String(this._replyGateMode || 'everyone'),
+				replyAllow: { ...this._replyAllow },
+				replyListUri: String(this._replyListUri || ''),
+				scheduledAtLocal: String(this._scheduledAtLocal || ''),
+			},
+			parts: (Array.isArray(this._parts) ? this._parts : []).slice(0, 10).map((p) => ({
+				text: String(p?.text || ''),
+				images: (Array.isArray(p?.images) ? p.images : []).slice(0, 4).map((img) => ({
+					name: String(img?.name || ''),
+					mime: String(img?.mime || ''),
+					dataBase64: String(img?.dataBase64 || ''),
+					alt: String(img?.alt || ''),
+				})).filter((img) => img.dataBase64 && img.mime),
+			})),
+		};
+	}
+
+	async _exportDraft() {
+		const json = JSON.stringify(this._exportDraftObj());
+		try {
+			await navigator.clipboard.writeText(json);
+			alert('Draft copied to clipboard.');
+			return;
+		} catch {
+			// Fallback: show in prompt.
+		}
+		try {
+			prompt('Draft JSON (copy/paste):', json);
+		} catch {
+			// ignore
+		}
+	}
+
+	async _importDraft() {
+		let raw = '';
+		try {
+			raw = String(prompt('Paste draft JSON to import:', '') || '').trim();
+		} catch {
+			return;
+		}
+		if (!raw) return;
+
+		let d = null;
+		try {
+			d = JSON.parse(raw);
+		} catch {
+			alert('Invalid JSON.');
+			return;
+		}
+		if (!d || d.v !== 1) {
+			alert('Unsupported draft format.');
+			return;
+		}
+
+		let parts = Array.isArray(d.parts) ? d.parts : [];
+		parts = parts.slice(0, 10).map((p) => ({
+			text: String(p?.text || ''),
+			images: (Array.isArray(p?.images) ? p.images : []).slice(0, 4).map((img) => ({
+				name: String(img?.name || ''),
+				mime: String(img?.mime || ''),
+				dataBase64: String(img?.dataBase64 || ''),
+				alt: String(img?.alt || ''),
+			})).filter((img) => img.dataBase64 && img.mime),
+		}));
+
+		if (!parts.length) parts = [{ text: '', images: [] }];
+		if (!this._threadEnabled && parts.length > 1) parts = [parts[0]];
+		this._parts = parts;
+
+		const ap = Number(d.activePart || 0);
+		this._activePart = Math.max(0, Math.min(Number.isFinite(ap) ? ap : 0, this._parts.length - 1));
+		this._imagesTargetPart = this._activePart;
+
+		const s = (d.settings && typeof d.settings === 'object') ? d.settings : {};
+		this._quotesAllowed = (s.quotesAllowed !== undefined) ? !!s.quotesAllowed : this._quotesAllowed;
+		this._replyGateMode = String(s.replyGateMode || this._replyGateMode || 'everyone');
+		if (s.replyAllow && typeof s.replyAllow === 'object') {
+			this._replyAllow = { ...this._replyAllow, ...s.replyAllow };
+		}
+		this._replyListUri = (s.replyListUri !== undefined) ? String(s.replyListUri || '') : this._replyListUri;
+		this._scheduledAtLocal = (s.scheduledAtLocal !== undefined) ? String(s.scheduledAtLocal || '') : this._scheduledAtLocal;
+
+		this._saveDraftNow();
+		this.render();
+		alert('Draft imported.');
 	}
 
 	onInput(e) {
@@ -461,6 +681,12 @@ export class BskyCommentComposer extends HTMLElement {
 				this._requestLists();
 				return;
 			}
+			this.render();
+			return;
+		}
+		if (name === 'scheduledAt') {
+			this._scheduledAtLocal = String(inp?.value || '');
+			this._scheduleDraftSave();
 			this.render();
 			return;
 		}
@@ -543,6 +769,18 @@ export class BskyCommentComposer extends HTMLElement {
 		}
 	}
 
+	_scheduledAtIsoOrEmpty() {
+		const raw = String(this._scheduledAtLocal || '').trim();
+		if (!raw) return '';
+		try {
+			const d = new Date(raw);
+			if (!Number.isFinite(d.getTime())) return '';
+			return d.toISOString();
+		} catch {
+			return '';
+		}
+	}
+
 	render() {
 		const max = Number.isFinite(this._maxChars) && this._maxChars > 0 ? this._maxChars : 300;
 		const who = (this._mode === 'post') ? 'Write a post' : (this._replyTo?.author ? `Reply to ${String(this._replyTo.author || '')}` : 'Reply');
@@ -580,6 +818,9 @@ export class BskyCommentComposer extends HTMLElement {
 		const lists = Array.isArray(this._lists) ? this._lists : null;
 		const listsLoading = !!this._listsLoading;
 		const listsError = String(this._listsError || '').trim();
+
+		const scheduleAllowed = (this._mode === 'post') && !(this._replyTo && this._replyTo.uri);
+		const scheduledAtLocal = String(this._scheduledAtLocal || '').trim();
 
 		this.shadowRoot.innerHTML = `
 			<style>
@@ -626,7 +867,7 @@ export class BskyCommentComposer extends HTMLElement {
 				.settings .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
 				.settings label{display:flex;gap:6px;align-items:center;color:#ddd}
 				.settings .note{color:#aaa;font-size:12px;margin-top:6px}
-				.settings input[type="text"]{background:#0b0b0b;color:#fff;border:1px solid #222;padding:6px 8px;border-radius:0;min-width:min(420px, 90vw)}
+				.settings input[type="text"], .settings input[type="datetime-local"]{background:#0b0b0b;color:#fff;border:1px solid #222;padding:6px 8px;border-radius:0;min-width:min(420px, 90vw)}
 				.settings select{background:#0b0b0b;color:#fff;border:1px solid #222;padding:6px 8px;border-radius:0;min-width:min(420px, 90vw)}
 
 				.actions{display:flex; justify-content:flex-end; gap:8px; margin-top:8px}
@@ -729,6 +970,27 @@ export class BskyCommentComposer extends HTMLElement {
 							` : ''}
 							<div class="note">Custom reply controls create a threadgate record on the root post. If you select no rules, nobody can reply.</div>
 						` : ''}
+					`}
+
+					<h4 style="margin-top:12px">Draft</h4>
+					<div class="row">
+						<button type="button" class="iconBtn" data-action="export-draft" title="Copy this draft as JSON">Export</button>
+						<button type="button" class="iconBtn" data-action="import-draft" title="Import a draft JSON into this composer">Import</button>
+						<button type="button" class="iconBtn" data-action="clear-draft" title="Clear this draft">Clear</button>
+					</div>
+					<div class="note">Export/import is for power users (JSON). Imported drafts are saved to this context.</div>
+
+					<h4 style="margin-top:12px">Schedule</h4>
+					${!scheduleAllowed ? `
+						<div class="note">Scheduling is available for new posts (not replies).</div>
+					` : `
+						<div class="row">
+							<label style="width:100%">Publish at
+								<input type="datetime-local" data-setting="scheduledAt" value="${esc(scheduledAtLocal)}">
+							</label>
+							<button type="button" class="iconBtn" data-clear-schedule ${scheduledAtLocal ? '' : 'disabled'}>Clear</button>
+						</div>
+						<div class="note">Uses your local timezone. Leave blank to post immediately.</div>
 					`}
 				</div>
 			` : ''}

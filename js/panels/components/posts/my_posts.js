@@ -1,10 +1,13 @@
 // application/single_pages/bluesky_feed/js/components/my_posts.js
 import { call } from '../../../api.js';
 import { getAuthStatusCached, isNotConnectedError } from '../../../auth_state.js';
-import { bindInfiniteScroll, resolvePanelScroller, captureScrollAnchor, applyScrollAnchor } from '../../panel_api.js';
+import { resolvePanelScroller, captureScrollAnchor, applyScrollAnchor, renderListEndcap } from '../../panel_api.js';
+import { PanelListController } from '../../../controllers/panel_list_controller.js';
+import { ListWindowingController } from '../../../controllers/list_windowing_controller.js';
 import { BSKY_SEARCH_EVENT } from '../../../search/search_bus.js';
 import { SEARCH_TARGETS } from '../../../search/constants.js';
 import { compileSearchMatcher } from '../../../search/query.js';
+import { renderPostTextHtml } from '../../../components/interactions/utils.js';
 
 import '../../../components/thread_tree.js';
 import '../../../comment/comment_composer.js';
@@ -250,8 +253,19 @@ class BskyMyPosts extends HTMLElement {
 
     // Incremental paging + backfill.
     this._latestIso = '';
-    this._unbindInfiniteScroll = null;
-    this._infiniteScrollEl = null;
+    this._listCtl = new PanelListController(this, {
+      // My Posts has its own specialized anchoring/restore flows; only centralize
+      // infinite-scroll binding here.
+      itemSelector: '',
+      onLoadMore: () => this.load(false),
+      onExhausted: () => this.queueOlderFromServer(),
+      enabled: () => true,
+      isLoading: () => !!this.loading,
+      hasMore: () => !!this.cursor,
+      threshold: 220,
+      exhaustedCooldownMs: 5000,
+      cooldownMs: 250,
+    });
     this._unbindListsRequest = null;
     this._backfillInFlight = false;
     this._backfillDone = false;
@@ -272,6 +286,7 @@ class BskyMyPosts extends HTMLElement {
     this._lastObservedScrollerW = 0;
 
     this._renderedBatchOrder = [];
+    this._winByBatch = new Map();
     this._autoFillPending = true;
     this._autoFillTries = 0;
 
@@ -315,6 +330,17 @@ class BskyMyPosts extends HTMLElement {
       const mins = Number(e?.detail?.minutes ?? 2);
       this.refreshRecent(mins);
     };
+
+    // Current session DID (used for per-post actions like delete).
+    this._meDid = '';
+
+    // Pending optimistic deletion (undo window).
+    // { uri, removed, restore, timerId, startedAt, state, error }
+    this._pendingDelete = null;
+
+    // Pending scheduled-post toast.
+    // { id, scheduledAt, kind, state, error, timerId }
+    this._pendingSchedule = null;
   }
 
   _defaultLangs() {
@@ -323,6 +349,254 @@ class BskyMyPosts extends HTMLElement {
     } catch {
       return [];
     }
+  }
+
+  _atUriToRkey(uri) {
+    const m = String(uri || '').match(/^at:\/\/[^/]+\/app\.bsky\.feed\.post\/([^/]+)/);
+    return m ? String(m[1] || '') : '';
+  }
+
+  _clearPendingDelete() {
+    const pd = this._pendingDelete;
+    if (pd?.timerId) {
+      try { clearTimeout(pd.timerId); } catch {}
+    }
+    this._pendingDelete = null;
+  }
+
+  _clearPendingSchedule() {
+    const ps = this._pendingSchedule;
+    if (ps?.timerId) {
+      try { clearTimeout(ps.timerId); } catch {}
+    }
+    this._pendingSchedule = null;
+  }
+
+  _formatLocalDateTime(iso) {
+    try {
+      const d = new Date(String(iso || ''));
+      if (!Number.isFinite(d.getTime())) return '';
+      return d.toLocaleString();
+    } catch {
+      return '';
+    }
+  }
+
+  _removeItemByUri(uri) {
+    const target = String(uri || '');
+    if (!target) return null;
+
+    const batches = Array.isArray(this._batches) ? this._batches : [];
+    for (let bi = 0; bi < batches.length; bi++) {
+      const b = batches[bi];
+      const items = Array.isArray(b?.items) ? b.items : [];
+      const idx = items.findIndex((it) => String(it?.post?.uri || '') === target);
+      if (idx < 0) continue;
+
+      const removed = items[idx];
+      const batchId = String(b?.id || '');
+
+      // Remove from the data model.
+      const nextItems = items.slice(0, idx).concat(items.slice(idx + 1));
+      const nextBatches = batches.slice();
+      nextBatches[bi] = { ...b, items: nextItems };
+      this._batches = nextBatches;
+
+      try {
+        if (typeof this.total === 'number' && this.total > 0) this.total = Math.max(0, this.total - 1);
+      } catch {}
+
+      // Clear any inline thread expansion state for this entry.
+      try { this._expandedThreads.delete(target); } catch {}
+      try { this._expandedThreadMode.delete(target); } catch {}
+
+      const restore = () => {
+        const cur = Array.isArray(this._batches) ? this._batches : [];
+        let inserted = false;
+        const nb = cur.map((bb) => {
+          if (String(bb?.id || '') !== batchId) return bb;
+          const arr = Array.isArray(bb?.items) ? bb.items.slice() : [];
+          const safeIdx = Math.max(0, Math.min(idx, arr.length));
+          arr.splice(safeIdx, 0, removed);
+          inserted = true;
+          return { ...bb, items: arr };
+        });
+        if (inserted) {
+          this._batches = nb;
+        } else {
+          this._batches = [{ id: this._newBatchId('undo'), items: [removed] }, ...cur];
+        }
+
+        try {
+          if (typeof this.total === 'number') this.total = this.total + 1;
+        } catch {}
+      };
+
+      return { removed, batchId, idx, restore };
+    }
+    return null;
+  }
+
+  _removeSearchItemByUri(uri) {
+    const target = String(uri || '');
+    if (!target) return null;
+    const arr = Array.isArray(this._searchApiItems) ? this._searchApiItems : null;
+    if (!arr || !arr.length) return null;
+
+    const idx = arr.findIndex((it) => String(it?.post?.uri || '') === target);
+    if (idx < 0) return null;
+
+    const removed = arr[idx];
+    this._searchApiItems = arr.slice(0, idx).concat(arr.slice(idx + 1));
+
+    const restore = () => {
+      const cur = Array.isArray(this._searchApiItems) ? this._searchApiItems.slice() : [];
+      const safeIdx = Math.max(0, Math.min(idx, cur.length));
+      cur.splice(safeIdx, 0, removed);
+      this._searchApiItems = cur;
+    };
+
+    return { removed, idx, restore };
+  }
+
+  _renderDeleteToast() {
+    const pd = this._pendingDelete;
+    if (!pd?.uri) return '';
+    const label = (pd.state === 'deleting')
+      ? 'Deleting…'
+      : (pd.state === 'failed')
+        ? `Delete failed: ${esc(pd.error || 'Unknown error')}`
+        : 'Post removed.';
+    const canUndo = (pd.state === 'pending');
+    const canDismiss = (pd.state === 'failed');
+    return `
+      <div class="toast" role="status" aria-live="polite">
+        <div class="toast-msg">${esc(label)}</div>
+        <div class="toast-actions">
+          ${canUndo ? `<button class="toast-btn" type="button" data-undo-delete>Undo</button>` : ''}
+          ${canDismiss ? `<button class="toast-btn" type="button" data-dismiss-toast>Dismiss</button>` : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  _renderScheduleToast() {
+    const ps = this._pendingSchedule;
+    if (!ps?.id) return '';
+
+    const when = this._formatLocalDateTime(ps.scheduledAt);
+    const label = (ps.state === 'canceling')
+      ? 'Canceling scheduled post…'
+      : (ps.state === 'canceled')
+        ? 'Scheduled post canceled.'
+        : (ps.state === 'failed')
+          ? `Schedule failed: ${String(ps.error || 'Unknown error')}`
+          : `Scheduled${when ? ` for ${when}` : ''}.`;
+
+    const canCancel = (ps.state === 'scheduled');
+    const canDismiss = (ps.state !== 'canceling');
+
+    return `
+      <div class="toast" role="status" aria-live="polite">
+        <div class="toast-msg">${esc(label)}</div>
+        <div class="toast-actions">
+          ${canCancel ? `<button class="toast-btn" type="button" data-cancel-scheduled>Cancel</button>` : ''}
+          ${canDismiss ? `<button class="toast-btn" type="button" data-dismiss-scheduled>Dismiss</button>` : ''}
+        </div>
+      </div>
+    `;
+  }
+
+  async _cancelPendingSchedule() {
+    const ps = this._pendingSchedule;
+    if (!ps?.id || ps.state !== 'scheduled') return;
+    ps.state = 'canceling';
+    this.render();
+    try {
+      const res = await call('cancelScheduledPost', { id: ps.id });
+      const canceled = !!(res?.canceled || res?.data?.canceled);
+      ps.state = canceled ? 'canceled' : 'failed';
+      if (!canceled) ps.error = 'Not canceled (already posted?)';
+    } catch (e) {
+      ps.state = 'failed';
+      ps.error = e?.message || String(e || 'Cancel failed');
+    }
+    try {
+      if (ps.timerId) clearTimeout(ps.timerId);
+    } catch {}
+    ps.timerId = setTimeout(() => {
+      this._clearPendingSchedule();
+      this.render();
+    }, 6000);
+    this.render();
+  }
+
+  async _finalizePendingDelete() {
+    const pd = this._pendingDelete;
+    if (!pd?.uri || pd.state !== 'pending') return;
+    pd.state = 'deleting';
+    this.render();
+
+    try {
+      await call('deletePost', { uri: pd.uri });
+
+      try {
+        window.dispatchEvent(new CustomEvent('bsky-post-deleted', { detail: { uri: pd.uri } }));
+      } catch {}
+
+      try {
+        await syncRecent({ minutes: 10, refreshMinutes: 30, allowDirectFallback: false });
+      } catch {}
+
+      this._clearPendingDelete();
+      this.render();
+    } catch (e) {
+      try { pd.restore?.(); } catch {}
+      pd.state = 'failed';
+      pd.error = e?.message || String(e || 'Delete failed');
+      this.render();
+    }
+  }
+
+  _startOptimisticDelete(uri) {
+    const target = String(uri || '').trim();
+    if (!target) return;
+
+    if (this._pendingDelete?.state === 'pending') {
+      try { this._pendingDelete.restore?.(); } catch {}
+      this._clearPendingDelete();
+    } else {
+      this._clearPendingDelete();
+    }
+
+    const removed = this._removeItemByUri(target);
+    const removedSearch = this._removeSearchItemByUri(target);
+    if (!removed?.removed && !removedSearch?.removed) return;
+
+    const pd = {
+      uri: target,
+      removed,
+      removedSearch,
+      restore: () => {
+        try { removed?.restore?.(); } catch {}
+        try { removedSearch?.restore?.(); } catch {}
+      },
+      timerId: null,
+      startedAt: Date.now(),
+      state: 'pending',
+      error: null,
+    };
+    pd.timerId = setTimeout(() => this._finalizePendingDelete(), 6000);
+    this._pendingDelete = pd;
+    this.render();
+  }
+
+  _undoOptimisticDelete() {
+    const pd = this._pendingDelete;
+    if (!pd?.uri || pd.state !== 'pending') return;
+    try { pd.restore?.(); } catch {}
+    this._clearPendingDelete();
+    this.render();
   }
 
   async _unfurlEmbedFromText(text) {
@@ -434,19 +708,41 @@ class BskyMyPosts extends HTMLElement {
     if (this._composePosting) return;
     const text = String(detail?.text || '').trim();
     if (!text) return;
+    const scheduledAt = String(detail?.scheduledAt || '').trim();
     this._composePosting = true;
     try {
       const didByHandle = await resolveMentionDidsFromTexts([text]);
       const facets = buildFacetsSafe(text, didByHandle);
       const embed = await selectEmbed({ text, images: detail?.media?.images, quote: this._composeQuote });
 
-      const out = await call('createPost', { text, langs: this._defaultLangs(), ...(facets ? { facets } : {}), ...(embed ? { embed } : {}) });
-      const created = this._extractCreatedRef(out);
-      await this._applyInteractionGates(created?.uri, detail?.interactions, { isRootPost: true });
-      try {
-        await syncRecent({ minutes: 10, refreshMinutes: 30 });
-      } catch {}
-      this.load(true);
+      if (scheduledAt) {
+        const res = await call('schedulePost', {
+          scheduledAt,
+          kind: 'post',
+          post: { text, langs: this._defaultLangs(), ...(facets ? { facets } : {}), ...(embed ? { embed } : {}) },
+          interactions: detail?.interactions || null,
+        });
+        const id = Number(res?.id ?? res?.data?.id ?? 0);
+        const when = String(res?.scheduledAt ?? res?.data?.scheduledAt ?? scheduledAt);
+        if (id > 0) {
+          this._clearPendingSchedule();
+          const ps = { id, scheduledAt: when, kind: 'post', state: 'scheduled', error: null, timerId: null };
+          ps.timerId = setTimeout(() => {
+            this._clearPendingSchedule();
+            this.render();
+          }, 10_000);
+          this._pendingSchedule = ps;
+          this.render();
+        }
+      } else {
+        const out = await call('createPost', { text, langs: this._defaultLangs(), ...(facets ? { facets } : {}), ...(embed ? { embed } : {}) });
+        const created = this._extractCreatedRef(out);
+        await this._applyInteractionGates(created?.uri, detail?.interactions, { isRootPost: true });
+        try {
+          await syncRecent({ minutes: 10, refreshMinutes: 30 });
+        } catch {}
+        this.load(true);
+      }
     } finally {
       this._composePosting = false;
       this._setComposeQuote(null);
@@ -465,6 +761,7 @@ class BskyMyPosts extends HTMLElement {
       images: Array.isArray(p?.media?.images) ? p.media.images : [],
     })).filter((p) => p.text);
     if (!clean.length) return;
+    const scheduledAt = String(detail?.scheduledAt || '').trim();
     this._composePosting = true;
     try {
       const interactions = detail?.interactions || null;
@@ -472,31 +769,62 @@ class BskyMyPosts extends HTMLElement {
       let didByHandle = {};
       didByHandle = await resolveMentionDidsFromTexts(clean.map((p) => p.text));
 
-      let rootRef = null;
-      let parentRef = null;
-      for (let i = 0; i < clean.length; i++) {
-        const p = clean[i];
-        const facets = buildFacetsSafe(p.text, didByHandle);
-        const embed = await selectEmbed({ text: p.text, images: p.images, quote: (i === 0) ? this._composeQuote : null });
-
-        const payload = { text: p.text, langs: this._defaultLangs(), ...(facets ? { facets } : {}), ...(embed ? { embed } : {}) };
-        if (i > 0 && rootRef && parentRef?.uri) {
-          payload.reply = {
-            root: { uri: rootRef.uri, cid: String(rootRef.cid || '') },
-            parent: { uri: parentRef.uri, cid: String(parentRef.cid || '') },
-          };
+      if (scheduledAt) {
+        const partsPayload = [];
+        for (let i = 0; i < clean.length; i++) {
+          const p = clean[i];
+          const facets = buildFacetsSafe(p.text, didByHandle);
+          const embed = await selectEmbed({ text: p.text, images: p.images, quote: (i === 0) ? this._composeQuote : null });
+          const payload = { text: p.text, langs: this._defaultLangs(), ...(facets ? { facets } : {}), ...(embed ? { embed } : {}) };
+          partsPayload.push(payload);
         }
-        const out = await call('createPost', payload);
-        const created = this._extractCreatedRef(out);
-        if (i === 0) rootRef = created || rootRef;
-        parentRef = created || parentRef;
 
-        await this._applyInteractionGates(created?.uri, interactions, { isRootPost: i === 0 });
+        const res = await call('schedulePost', {
+          scheduledAt,
+          kind: 'thread',
+          parts: partsPayload,
+          interactions,
+        });
+
+        const id = Number(res?.id ?? res?.data?.id ?? 0);
+        const when = String(res?.scheduledAt ?? res?.data?.scheduledAt ?? scheduledAt);
+        if (id > 0) {
+          this._clearPendingSchedule();
+          const ps = { id, scheduledAt: when, kind: 'thread', state: 'scheduled', error: null, timerId: null };
+          ps.timerId = setTimeout(() => {
+            this._clearPendingSchedule();
+            this.render();
+          }, 10_000);
+          this._pendingSchedule = ps;
+          this.render();
+        }
+      } else {
+        let rootRef = null;
+        let parentRef = null;
+        for (let i = 0; i < clean.length; i++) {
+          const p = clean[i];
+          const facets = buildFacetsSafe(p.text, didByHandle);
+          const embed = await selectEmbed({ text: p.text, images: p.images, quote: (i === 0) ? this._composeQuote : null });
+
+          const payload = { text: p.text, langs: this._defaultLangs(), ...(facets ? { facets } : {}), ...(embed ? { embed } : {}) };
+          if (i > 0 && rootRef && parentRef?.uri) {
+            payload.reply = {
+              root: { uri: rootRef.uri, cid: String(rootRef.cid || '') },
+              parent: { uri: parentRef.uri, cid: String(parentRef.cid || '') },
+            };
+          }
+          const out = await call('createPost', payload);
+          const created = this._extractCreatedRef(out);
+          if (i === 0) rootRef = created || rootRef;
+          parentRef = created || parentRef;
+
+          await this._applyInteractionGates(created?.uri, interactions, { isRootPost: i === 0 });
+        }
+        try {
+          await syncRecent({ minutes: 10, refreshMinutes: 30 });
+        } catch {}
+        this.load(true);
       }
-      try {
-        await syncRecent({ minutes: 10, refreshMinutes: 30 });
-      } catch {}
-      this.load(true);
     } finally {
       this._composePosting = false;
       this._setComposeQuote(null);
@@ -1150,8 +1478,73 @@ class BskyMyPosts extends HTMLElement {
       this._contentClosedHandler = null;
     }
     if (this._unbindListsRequest) { try { this._unbindListsRequest(); } catch {} this._unbindListsRequest = null; }
-    if (this._unbindInfiniteScroll) { try { this._unbindInfiniteScroll(); } catch {} this._unbindInfiniteScroll = null; }
-    this._infiniteScrollEl = null;
+    try { this._listCtl?.disconnect?.(); } catch {}
+
+    try {
+      for (const ctl of Array.from(this._winByBatch?.values?.() || [])) {
+        try { ctl?.disconnect?.(); } catch {}
+      }
+    } catch {}
+    try { this._winByBatch?.clear?.(); } catch {}
+
+    this._clearPendingDelete();
+  }
+
+  _getScroller(){
+    try {
+      return this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.()
+        || resolvePanelScroller(this)
+        || null;
+    } catch {
+      return null;
+    }
+  }
+
+  _computePackCols(){
+    const pxVar = (el, prop, fallback) => {
+      try {
+        const raw = window.getComputedStyle(el).getPropertyValue(prop);
+        const n = Number.parseFloat(String(raw || ''));
+        return Number.isFinite(n) ? n : fallback;
+      } catch {
+        return fallback;
+      }
+    };
+
+    try {
+      const shell = this.shadowRoot.querySelector('bsky-panel-shell');
+      const scroller = shell?.getScroller?.() || null;
+      const fallbackW = this.getBoundingClientRect?.().width || 0;
+      const w = scroller?.clientWidth || scroller?.getBoundingClientRect?.().width || fallbackW || 0;
+      const card = pxVar(this, '--bsky-card-min-w', 350);
+      const gap = pxVar(this, '--bsky-card-gap', pxVar(this, '--bsky-grid-gutter', 0));
+      if (!w || w < 2) return 1;
+      const stride = Math.max(1, card + gap);
+      const cols = Math.max(1, Math.floor((w + gap) / stride));
+      return Math.min(8, cols);
+    } catch {
+      return 1;
+    }
+  }
+
+  _rehydrateExpandedThreadsWithin(scopeEl){
+    try {
+      const scope = scopeEl || this.shadowRoot;
+      const entries = Array.from(scope.querySelectorAll('.entry[data-uri]'));
+      for (const entry of entries) {
+        const uri = String(entry.getAttribute('data-uri') || '');
+        if (!uri || !this._expandedThreads.has(uri)) continue;
+        const cid = String(entry.getAttribute('data-cid') || '');
+        const mode = this._expandedThreadMode.get(uri) || 'full';
+        const host = entry.querySelector('[data-inline-thread]');
+        const hasTree = !!host?.querySelector?.('bsky-thread-tree');
+        if (host && !hasTree) {
+          this._toggleInlineThread(entry, { uri, cid }, { ensureOpen: true, mode });
+        }
+      }
+    } catch {
+      // ignore
+    }
   }
 
   _allItems(){
@@ -1242,6 +1635,16 @@ class BskyMyPosts extends HTMLElement {
         return;
       }
 
+      // If entries are windowed, materialize the anchor key before applying.
+      try {
+        const k = String(a?.key || '').trim();
+        if (k) {
+          for (const ctl of Array.from(this._winByBatch?.values?.() || [])) {
+            try { ctl?.ensureKeyVisible?.(k); } catch {}
+          }
+        }
+      } catch {}
+
       this._scrollAnchorApplyTries++;
 
       const ok = applyScrollAnchor({ scroller, root: this.shadowRoot, anchor: a, keyAttr: 'data-k' });
@@ -1319,6 +1722,8 @@ class BskyMyPosts extends HTMLElement {
       const auth = await getAuthStatusCached();
       if (!auth?.connected) return;
 
+      this._meDid = String(auth?.activeDid || auth?.did || '');
+
       const out = await call('cacheQueryMyPosts', {
         since: sinceIso,
         until: this.currentUntilIso(),
@@ -1378,6 +1783,49 @@ class BskyMyPosts extends HTMLElement {
   }
 
   async onClick(e){
+    if (e.target?.closest?.('[data-undo-delete]')) {
+      this._undoOptimisticDelete();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (e.target?.closest?.('[data-dismiss-toast]')) {
+      this._clearPendingDelete();
+      this.render();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    if (e.target?.closest?.('[data-cancel-scheduled]')) {
+      this._cancelPendingSchedule();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+    if (e.target?.closest?.('[data-dismiss-scheduled]')) {
+      this._clearPendingSchedule();
+      this.render();
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
+    const delBtn = e.target?.closest?.('[data-delete-post]');
+    if (delBtn) {
+      const uri = String(delBtn.getAttribute('data-uri') || '').trim();
+      if (!uri) return;
+      if (this._pendingDelete?.state === 'pending' && String(this._pendingDelete.uri) === uri) return;
+
+      const ok = confirm('Delete this post? It will be removed immediately, with a short undo window.');
+      if (!ok) return;
+
+      this._startOptimisticDelete(uri);
+      e.preventDefault();
+      e.stopPropagation();
+      return;
+    }
+
     if (e.target.id === 'compose') {
       const dlg = this.shadowRoot.querySelector('#compose-dlg');
       if (dlg) {
@@ -2218,6 +2666,8 @@ class BskyMyPosts extends HTMLElement {
         return;
       }
 
+      this._meDid = String(auth?.activeDid || auth?.did || '');
+
       const limit = 100;
       let out = await call('cacheQueryMyPosts', {
         since: this.currentSinceIso(),
@@ -2539,7 +2989,7 @@ class BskyMyPosts extends HTMLElement {
     const renderPostBlock = (it, ord = 0, depth = 0, chron = null) => {
       const p = it.post || {};
       const rec = p.record || {};
-      const text = esc(rec.text || '');
+      const text = renderPostTextHtml(rec.text || '');
       const when = fmtTime(rec.createdAt || p.indexedAt || '');
       const likeCount   = (typeof p.likeCount === 'number') ? p.likeCount : 0;
       const repostCount = (typeof p.repostCount === 'number') ? p.repostCount : 0;
@@ -2552,9 +3002,14 @@ class BskyMyPosts extends HTMLElement {
       const cid = p.cid || '';
 
       const a = p.author || {};
+      const meDid = String(this._meDid || '');
       const handle = String(a?.handle || '');
       const display = String(a?.displayName || '');
       const who = display && handle ? `${display} (@${handle})` : (display || (handle ? `@${handle}` : ''));
+
+      const isMine = !!(meDid && String(a?.did || '') === meDid);
+      const canDelete = isMine && (String(kind || '') !== 'repost');
+      const deletingThis = !!(this._pendingDelete?.uri && String(this._pendingDelete.uri) === String(uri || ''));
 
       const expanded = this._expandedThreads.has(String(uri || ''));
       const icon = expanded ? '−' : '+';
@@ -2587,6 +3042,7 @@ class BskyMyPosts extends HTMLElement {
             <button class="act" type="button" data-quote data-uri="${esc(uri)}" data-cid="${esc(cid)}">Quote</button>
             <button class="act" type="button" data-repost data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-reposted="${reposted ? '1' : '0'}">${esc(repostLabel)}</button>
             <button class="act" type="button" data-like data-uri="${esc(uri)}" data-cid="${esc(cid)}" data-liked="${liked ? '1' : '0'}">${esc(likeLabel)}</button>
+            ${canDelete ? `<button class="act danger" type="button" data-delete-post data-uri="${esc(uri)}" ${deletingThis ? 'disabled' : ''}>Delete</button>` : ''}
           </footer>
         </div>
       `;
@@ -2691,6 +3147,7 @@ class BskyMyPosts extends HTMLElement {
 
       return {
         key,
+        anchorKey,
         html: `
           <article class="${entryClass}" data-k="${esc(anchorKey)}" data-uri="${esc(rootUri)}" data-cid="${esc(rootCid)}">
             ${rootPseudoItem
@@ -2712,40 +3169,25 @@ class BskyMyPosts extends HTMLElement {
       return `<div class="search-status">Search: <b>${esc(searchQ)}</b> · Source: ${esc(src)}${loading}${err}</div>`;
     })();
 
-    const pxVar = (el, prop, fallback) => {
-      try {
-        const raw = window.getComputedStyle(el).getPropertyValue(prop);
-        const n = Number.parseFloat(String(raw || ''));
-        return Number.isFinite(n) ? n : fallback;
-      } catch {
-        return fallback;
-      }
-    };
-
-    const computePackCols = () => {
-      try {
-        const shell = this.shadowRoot.querySelector('bsky-panel-shell');
-        const scroller = shell?.getScroller?.() || null;
-        const fallbackW = this.getBoundingClientRect?.().width || 0;
-        const w = scroller?.clientWidth || scroller?.getBoundingClientRect?.().width || fallbackW || 0;
-        const card = pxVar(this, '--bsky-card-min-w', 350);
-        const gap = pxVar(this, '--bsky-card-gap', pxVar(this, '--bsky-grid-gutter', 0));
-        if (!w || w < 2) return 1;
-        const stride = Math.max(1, card + gap);
-        const cols = Math.max(1, Math.floor((w + gap) / stride));
-        return Math.min(8, cols);
-      } catch {
-        return 1;
-      }
-    };
-
-    const packCols = (layout === 'pack') ? computePackCols() : 1;
-
     const buildPackedColumns = (entriesHost) => {
       if (!entriesHost) return;
-      if (layout !== 'pack') return;
+      if (this.layout !== 'pack') return;
 
-      const cols = Math.max(1, Number(packCols || 1));
+      // Preserve top/bottom window spacers if present.
+      const topSpacer = (() => {
+        try {
+          const el = entriesHost.querySelector(':scope > .win-spacer[data-win-spacer="top"]');
+          return el ? el.cloneNode(true) : null;
+        } catch { return null; }
+      })();
+      const bottomSpacer = (() => {
+        try {
+          const el = entriesHost.querySelector(':scope > .win-spacer[data-win-spacer="bottom"]');
+          return el ? el.cloneNode(true) : null;
+        } catch { return null; }
+      })();
+
+  const cols = Math.max(1, Number(this._computePackCols() || 1));
 
       // Flatten entries from either direct children or an existing .cols wrapper.
       const entries = Array.from(entriesHost.querySelectorAll(':scope > .entry, :scope > .cols .entry'));
@@ -2755,10 +3197,20 @@ class BskyMyPosts extends HTMLElement {
         if (w) {
           try { w.remove(); } catch { try { entriesHost.removeChild(w); } catch {} }
         }
+        try {
+          // If we're windowing, keep spacer nodes so scroll height is preserved.
+          if (topSpacer || bottomSpacer) {
+            entriesHost.textContent = '';
+            if (topSpacer) entriesHost.appendChild(topSpacer);
+            if (bottomSpacer) entriesHost.appendChild(bottomSpacer);
+          }
+        } catch {}
         return;
       }
 
       entriesHost.textContent = '';
+
+      if (topSpacer) entriesHost.appendChild(topSpacer);
       const colsWrap = document.createElement('div');
       colsWrap.className = 'cols';
       colsWrap.setAttribute('data-cols', String(cols));
@@ -2772,6 +3224,7 @@ class BskyMyPosts extends HTMLElement {
       }
 
       entriesHost.appendChild(colsWrap);
+      if (bottomSpacer) entriesHost.appendChild(bottomSpacer);
 
       const heights = new Array(cols).fill(0);
       let tieRot = 0;
@@ -2821,7 +3274,7 @@ class BskyMyPosts extends HTMLElement {
 
       const cards = groups.map((g) => renderThreadEntry(g, bid, ++chron));
       const entriesHtml = cards.map((c) => c.html).join('');
-      return { id: bid, entriesHtml };
+      return { id: bid, cards, entriesHtml };
     });
 
     const ensureStaticDom = () => {
@@ -2845,6 +3298,14 @@ class BskyMyPosts extends HTMLElement {
 
         .search-status{margin:8px 0;color:#bbb;font-size:.9rem}
 
+        .toast{display:flex;gap:10px;align-items:center;justify-content:space-between;margin:10px 0;padding:8px 10px;border:1px solid #333;background:#0f0f0f}
+        .toast-msg{color:#ddd;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+        .toast-actions{display:flex;gap:8px;flex:0 0 auto}
+        .toast-btn{background:#111;border:1px solid #555;color:#fff;padding:6px 10px;border-radius:0;cursor:pointer}
+
+        .act.danger{border-color:#7a2b2b}
+        .act.danger:hover{border-color:#b13a3a}
+
         /* Layout modes (pure CSS; no JS masonry/reparenting).
            - grid: CSS grid (source order).
            - pack: fixed columns filled left→right in source order so the top row is newest.
@@ -2852,6 +3313,8 @@ class BskyMyPosts extends HTMLElement {
         .entries{max-width:100%;min-height:0}
         .entries.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--bsky-card-min-w, 350px),1fr));gap:var(--bsky-card-gap, var(--bsky-grid-gutter, 0px));align-items:start}
         .entries.grid .entry{width:100%;max-width:100%;min-width:0;margin:0;}
+        /* Lightweight “windowing” (grid mode only): skip rendering offscreen entries. */
+        .entries.grid .entry{content-visibility:auto;contain-intrinsic-size:350px 520px}
 
         .entries.pack{display:block}
         .entries.pack .cols{display:flex;gap:var(--bsky-card-gap, var(--bsky-grid-gutter, 0px));align-items:flex-start;width:100%;max-width:100%}
@@ -2938,6 +3401,7 @@ class BskyMyPosts extends HTMLElement {
         button:disabled{opacity:.6;cursor:not-allowed}
         select{background:#0f0f0f;color:#fff;border:1px solid #333;border-radius:0;padding:6px 10px}
         .muted{color:#aaa}
+        .win-spacer{width:100%;pointer-events:none;contain:layout size style}
         .footer{display:flex;justify-content:center}
 
         dialog{border:1px solid #333;border-radius:0;background:#0b0b0b;color:#fff;padding:0;max-width:min(520px, 92vw)}
@@ -2957,10 +3421,11 @@ class BskyMyPosts extends HTMLElement {
         .img-wrap{background:#111;overflow:hidden}
         .img-wrap bsky-lazy-img{width:100%}
       </style>
-      <bsky-panel-shell title="Posts" dense style="--bsky-panel-ui-offset: var(--bsky-posts-ui-offset)">
+      <bsky-panel-shell title="Posts" dense persist-key="posts" style="--bsky-panel-ui-offset: var(--bsky-posts-ui-offset)">
         <div id="head-right" slot="head-right" class="muted"></div>
         <div id="toolbar" slot="toolbar"></div>
         <div id="list">
+          <div id="toast"></div>
           <div id="search-status"></div>
           <div id="batches"></div>
           <div id="empty" class="muted"></div>
@@ -3019,15 +3484,19 @@ class BskyMyPosts extends HTMLElement {
       const listEl = this.shadowRoot.getElementById('list');
       if (listEl) {
         // Ensure incremental sub-structure exists (for older cached DOM).
+        let toastEl = this.shadowRoot.getElementById('toast');
         let statusEl = this.shadowRoot.getElementById('search-status');
         let batchesEl = this.shadowRoot.getElementById('batches');
         let emptyEl = this.shadowRoot.getElementById('empty');
-        if (!statusEl || !batchesEl || !emptyEl) {
-          listEl.innerHTML = '<div id="search-status"></div><div id="batches"></div><div id="empty" class="muted"></div>';
+        if (!toastEl || !statusEl || !batchesEl || !emptyEl) {
+          listEl.innerHTML = '<div id="toast"></div><div id="search-status"></div><div id="batches"></div><div id="empty" class="muted"></div>';
+          toastEl = this.shadowRoot.getElementById('toast');
           statusEl = this.shadowRoot.getElementById('search-status');
           batchesEl = this.shadowRoot.getElementById('batches');
           emptyEl = this.shadowRoot.getElementById('empty');
         }
+
+        if (toastEl) toastEl.innerHTML = `${this._renderDeleteToast()}${this._renderScheduleToast()}`;
 
         if (statusEl) statusEl.innerHTML = searchStatus || '';
 
@@ -3104,17 +3573,49 @@ class BskyMyPosts extends HTMLElement {
                 entriesHost.classList.toggle('pack', layout !== 'grid');
               } catch {}
 
+              // True DOM windowing to prevent massive entry DOM growth.
+              const winCtl = (() => {
+                const id = String(bid || '');
+                let ctl = null;
+                try { ctl = this._winByBatch?.get?.(id) || null; } catch { ctl = null; }
+                if (!ctl) {
+                  ctl = new ListWindowingController(this, {
+                    getRoot: () => this.shadowRoot,
+                    getScroller: () => this._getScroller(),
+                    getListEl: () => entriesHost,
+                    itemSelector: '.entry[data-k]',
+                    keyAttr: 'data-k',
+                    enabled: () => true,
+                    getLayout: () => 'grid',
+                    getColumns: () => (this.layout === 'pack' ? this._computePackCols() : 0),
+                    minItemsToWindow: 90,
+                    estimatePx: 560,
+                    overscanItems: 16,
+                    keyFor: (c) => String(c?.anchorKey || ''),
+                    renderRow: (c) => String(c?.html || ''),
+                    onAfterRender: () => {
+                      // Repack and rehydrate after window-only rerenders.
+                      if (this.layout === 'pack') buildPackedColumns(entriesHost);
+                      this._rehydrateExpandedThreadsWithin(entriesHost);
+                    },
+                  });
+                  try { this._winByBatch?.set?.(id, ctl); } catch {}
+                }
+                return ctl;
+              })();
+
+              try { winCtl.setItems(Array.isArray(b?.cards) ? b.cards : []); } catch {}
+
               // Only update existing batch HTML when we can't safely reuse (e.g. search active).
               if (rebuildAll || !allowReuse) {
-                entriesHost.innerHTML = b.entriesHtml;
+                entriesHost.innerHTML = winCtl.innerHtml({ loadingHtml: '<div class="muted">Loading…</div>', emptyHtml: '' });
               } else if (!sec.dataset.bskyRendered) {
                 // First time created.
-                entriesHost.innerHTML = b.entriesHtml;
+                entriesHost.innerHTML = winCtl.innerHtml({ loadingHtml: '<div class="muted">Loading…</div>', emptyHtml: '' });
               }
 
-              // Always (re)build packed columns so column count tracks panel width changes.
-              // This is safe because it preserves source order and only rewraps existing `.entry` nodes.
-              buildPackedColumns(entriesHost);
+              // Ensure window bindings are live; also repacks/rehydrates via onAfterRender.
+              winCtl.afterRender();
             }
             sec.dataset.bskyRendered = '1';
           }
@@ -3148,13 +3649,15 @@ class BskyMyPosts extends HTMLElement {
         })();
 
         if (emptyEl) {
-          if (batchRenders.length === 0) {
-            emptyEl.textContent = this.loading ? 'Loading…' : 'No posts.';
-          } else if (visibleCount === 0) {
-            emptyEl.textContent = this.loading ? 'Loading…' : 'No posts.';
-          } else {
-            emptyEl.textContent = '';
-          }
+          const anyPosts = (batchRenders.length > 0) && (visibleCount > 0);
+          const hasMore = !!this.cursor || !this._backfillDone;
+          emptyEl.innerHTML = renderListEndcap({
+            loading: !!this.loading && !anyPosts,
+            loadingMore: !!this.loading && anyPosts,
+            hasMore,
+            count: anyPosts ? 1 : 0,
+            emptyText: 'No posts.',
+          });
         }
       }
 
@@ -3171,8 +3674,10 @@ class BskyMyPosts extends HTMLElement {
 
       const moreBtn = this.shadowRoot.getElementById('more');
       if (moreBtn) {
-        moreBtn.disabled = !!(this.loading || (this._backfillDone && !this.cursor));
-        moreBtn.textContent = this.cursor ? 'Load more' : (this._backfillDone ? 'No more' : 'Load more');
+        const hasMore = !!this.cursor || !this._backfillDone;
+        moreBtn.hidden = !hasMore;
+        moreBtn.disabled = !!(this.loading || !hasMore);
+        moreBtn.textContent = 'Load more';
       }
 
       const dlgFrom = this.shadowRoot.getElementById('dlg-from');
@@ -3207,23 +3712,8 @@ class BskyMyPosts extends HTMLElement {
     });
 
     // Infinite scroll: load the next page when nearing the bottom.
-    const scroller = this.shadowRoot.querySelector('bsky-panel-shell')?.getScroller?.();
-    if (scroller && scroller !== this._infiniteScrollEl) {
-      try { this._unbindInfiniteScroll?.(); } catch {}
-      this._infiniteScrollEl = scroller;
-      this._unbindInfiniteScroll = bindInfiniteScroll(scroller, () => this.load(false), {
-        threshold: 220,
-        enabled: () => true,
-        isLoading: () => !!this.loading,
-        hasMore: () => !!this.cursor,
-        onExhausted: () => this.queueOlderFromServer(),
-        exhaustedCooldownMs: 5000,
-        // No anchoring for append-older paging. If we keep the scroller alive and
-        // only add content below the viewport, scroll position should not change.
-        // We do a smarter "fill viewport" loop ourselves.
-        initialTick: false,
-      });
-    }
+    // (Centralized binding + dedupe via shared controller.)
+    this._listCtl.afterRender();
 
     // After initial/reset load, auto-fetch until the viewport is scrollable.
     if (this._autoFillPending) {

@@ -31,6 +31,49 @@ function initTabs(root) {
     requestAnimationFrame(() => window.dispatchEvent(new Event('resize')));
   };
 
+  // Optional debug helper: logs current panel sizing to the console.
+  const logLayout = () => {
+    try {
+      const wrapW = panelsWrap?.getBoundingClientRect?.()?.width || 0;
+      const wrapCS = panelsWrap ? getComputedStyle(panelsWrap) : null;
+      const rootCS = root ? getComputedStyle(root) : null;
+
+      const cssVars = {
+        cardW: rootCS?.getPropertyValue('--bsky-card-w')?.trim() || '',
+        cardGap: rootCS?.getPropertyValue('--bsky-card-gap')?.trim() || '',
+        panelsGap: rootCS?.getPropertyValue('--bsky-panels-gap')?.trim() || '',
+        cardMinW: rootCS?.getPropertyValue('--bsky-card-min-w')?.trim() || '',
+      };
+
+      const rows = panels.map((p) => {
+        const name = p.getAttribute('data-panel') || '';
+        const cs = getComputedStyle(p);
+        const r = p.getBoundingClientRect();
+        return {
+          name,
+          hidden: p.hasAttribute('hidden'),
+          flex: p.style.flex || '',
+          flexBasis: cs.flexBasis,
+          flexGrow: cs.flexGrow,
+          flexShrink: cs.flexShrink,
+          width: Math.round(r.width),
+        };
+      });
+
+      // eslint-disable-next-line no-console
+      console.log('[ConcreteSky panels] layout', {
+        wrapW: Math.round(wrapW),
+        wrapScrollLeft: panelsWrap?.scrollLeft || 0,
+        wrapOverflowX: wrapCS?.overflowX || '',
+        cssVars,
+        panels: rows,
+      });
+    } catch (e) {
+      // eslint-disable-next-line no-console
+      console.log('[ConcreteSky panels] layout debug failed', e);
+    }
+  };
+
   // Back-compat: if a button with this id exists in the DOM, allow clicking it.
   root.addEventListener('click', (e) => {
     const btn = e.target?.closest?.('#bsky-reset-layout');
@@ -43,6 +86,11 @@ function initTabs(root) {
   // Preferred: trigger from anywhere (e.g. notification settings) via a global event.
   window.addEventListener('bsky-reset-layout', () => {
     resetLayout();
+  });
+
+  // Optional debug trigger.
+  window.addEventListener('bsky-log-layout', () => {
+    logLayout();
   });
 
   // Apply saved ordering before we wire events.
@@ -123,8 +171,22 @@ function initTabs(root) {
     if (mobile && panelsWrap) {
       const target = byName.get(activeTabs[0]);
       if (target) {
+        const behavior = (() => {
+          try {
+            const v = getComputedStyle(panelsWrap).getPropertyValue('--bsky-scroll-behavior').trim();
+            if (v === 'auto' || v === 'smooth') return v;
+          } catch {
+            // ignore
+          }
+          try {
+            if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) return 'auto';
+          } catch {
+            // ignore
+          }
+          return 'smooth';
+        })();
         try {
-          panelsWrap.scrollTo({ left: target.offsetLeft, behavior: 'smooth' });
+          panelsWrap.scrollTo({ left: target.offsetLeft, behavior });
         } catch {
           try { panelsWrap.scrollLeft = target.offsetLeft; } catch {}
         }
@@ -271,7 +333,7 @@ function initTabs(root) {
   // Expose an internal API for programmatic panel activation.
   // This stays attached to the tabs root so it works across shadow boundaries.
   try {
-    root.__bskyTabsApi = { setActive, getActive, toggle, activate, deactivate, placeAfter };
+    root.__bskyTabsApi = { setActive, getActive, toggle, activate, deactivate, placeAfter, logLayout, resetLayout };
   } catch {
     // ignore
   }

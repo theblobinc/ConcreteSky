@@ -37,9 +37,24 @@ export class BskyGroupHome extends HTMLElement {
 
     this.inviteToken = '';
 
+    this.meIsSuper = false;
+
+    // Group settings (superuser/admin-only MVP).
+    this.groupSettingsBusy = false;
+    this.groupEditDirty = false;
+    this.groupEditName = '';
+    this.groupEditDescription = '';
+    this.groupEditVisibility = 'public';
+
     // Group posts (MVP): global tag-based feed.
     this.composeText = '';
     this.postBusy = false;
+
+    // Group pinned posts / announcements.
+    this.pinsLoading = false;
+    this.pinsItems = [];
+    this.pinsError = '';
+    this.pinnedPosts = [];
 
     this.feedLoading = false;
     this.feedItems = [];
@@ -159,6 +174,11 @@ export class BskyGroupHome extends HTMLElement {
         this.exportAudit('csv');
         return;
       }
+
+      if (action === 'save-group-settings') {
+        this.saveGroupSettings();
+        return;
+      }
       if (action === 'post') {
         this.submitPost();
         return;
@@ -210,6 +230,39 @@ export class BskyGroupHome extends HTMLElement {
       if (action === 'report-post') {
         const uri = String(btn.getAttribute('data-uri') || '').trim();
         if (uri) this.reportPost(uri);
+        return;
+      }
+
+      if (action === 'refresh-pins') {
+        this.loadPins(true);
+        return;
+      }
+      if (action === 'pin-post') {
+        const uri = String(btn.getAttribute('data-uri') || '').trim();
+        const isAnnouncement = String(btn.getAttribute('data-ann') || '') === '1';
+        if (uri) this.pinPost(uri, isAnnouncement);
+        return;
+      }
+      if (action === 'unpin-post') {
+        const uri = String(btn.getAttribute('data-uri') || '').trim();
+        if (uri) this.unpinPost(uri);
+        return;
+      }
+
+      if (action === 'pin-move') {
+        const uri = String(btn.getAttribute('data-uri') || '').trim();
+        const dir = String(btn.getAttribute('data-dir') || '').trim();
+        if (uri && (dir === 'up' || dir === 'down')) this.movePin(uri, dir);
+        return;
+      }
+      if (action === 'pin-edit-note') {
+        const uri = String(btn.getAttribute('data-uri') || '').trim();
+        if (uri) this.editPinNote(uri);
+        return;
+      }
+      if (action === 'pin-toggle-ann') {
+        const uri = String(btn.getAttribute('data-uri') || '').trim();
+        if (uri) this.togglePinAnnouncement(uri);
         return;
       }
 
@@ -285,6 +338,21 @@ export class BskyGroupHome extends HTMLElement {
         if (did) this.unbanMember(did);
         return;
       }
+      if (action === 'invite-member') {
+        this.inviteMember();
+        return;
+      }
+      if (action === 'revoke-invite') {
+        const did = String(btn.getAttribute('data-member-did') || '').trim();
+        if (did) this.revokeInvite(did);
+        return;
+      }
+      if (action === 'set-role') {
+        const did = String(btn.getAttribute('data-member-did') || '').trim();
+        const role = String(btn.getAttribute('data-role') || '').trim();
+        if (did && role) this.setMemberRole(did, role);
+        return;
+      }
       if (action === 'accept-rules') {
         this.acceptRules();
         return;
@@ -299,6 +367,10 @@ export class BskyGroupHome extends HTMLElement {
       }
       if (action === 'join') {
         this.join();
+        return;
+      }
+      if (action === 'accept-invite') {
+        this.acceptInvite();
         return;
       }
       if (action === 'leave') {
@@ -340,6 +412,23 @@ export class BskyGroupHome extends HTMLElement {
         const n = Number(el.value || 0);
         this.postCooldownSeconds = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
         this.postCooldownDirty = true;
+      }
+
+      if (el.matches('input[name="group_name"]')) {
+        this.groupEditName = String(el.value || '');
+        this.groupEditDirty = true;
+        this.render();
+      }
+      if (el.matches('textarea[name="group_description"]')) {
+        this.groupEditDescription = String(el.value || '');
+        this.groupEditDirty = true;
+        this.render();
+      }
+      if (el.matches('select[name="group_visibility"]')) {
+        const v = String(el.value || 'public');
+        this.groupEditVisibility = (v === 'closed' || v === 'secret') ? v : 'public';
+        this.groupEditDirty = true;
+        this.render();
       }
 
       if (el.matches('input[name="audit_search"]')) {
@@ -389,6 +478,20 @@ export class BskyGroupHome extends HTMLElement {
       const res = await call('groupGet', { groupId: this.groupId });
       this.group = res?.group || null;
 
+      try {
+        const me = await call('groupsList', {});
+        this.meIsSuper = !!me?.meIsSuper;
+      } catch {
+        this.meIsSuper = false;
+      }
+
+      if (this.group && !this.groupEditDirty) {
+        this.groupEditName = String(this.group.name || '');
+        this.groupEditDescription = String(this.group.description || '');
+        const v = String(this.group.visibility || 'public');
+        this.groupEditVisibility = (v === 'closed' || v === 'secret') ? v : 'public';
+      }
+
       if (this.group && !this.rulesDirty) {
         this.rulesEditText = String(this.group.rules_md || '');
       }
@@ -397,6 +500,7 @@ export class BskyGroupHome extends HTMLElement {
         this.postCooldownSeconds = Number.isFinite(n) ? Math.max(0, Math.floor(n)) : 0;
       }
       await this.loadAudit(true);
+      await this.loadPins(true);
       await this.loadFeed(true);
       await this.loadPending(true);
       await this.loadMine(true);
@@ -433,6 +537,220 @@ export class BskyGroupHome extends HTMLElement {
     } finally {
       this.membersLoading = false;
       this.render();
+    }
+  }
+
+  async inviteMember() {
+    const g = this.group;
+    if (!this.groupId || !g) return;
+    const myRole = String(g?.my_role || '');
+    const isMod = (myRole === 'admin' || myRole === 'moderator');
+    if (!isMod) return;
+
+    const memberDid = String(prompt('Invite DID (did:plc:...)') || '').trim();
+    if (!memberDid) return;
+
+    this.setError('');
+    this.setNotice('');
+    try {
+      await call('groupMemberInvite', { groupId: this.groupId, memberDid });
+      await this.loadMembers(true);
+      await this.loadAudit(true);
+      this.setNotice('Invite created.');
+    } catch (e) {
+      this.setError(e?.message || String(e));
+    }
+  }
+
+  async revokeInvite(memberDid) {
+    const g = this.group;
+    if (!this.groupId || !g) return;
+    const myRole = String(g?.my_role || '');
+    const isMod = (myRole === 'admin' || myRole === 'moderator');
+    if (!isMod) return;
+    if (!confirm(`Revoke invite for ${memberDid}?`)) return;
+
+    this.setError('');
+    this.setNotice('');
+    try {
+      await call('groupMemberInviteRevoke', { groupId: this.groupId, memberDid });
+      await this.loadMembers(true);
+      await this.loadAudit(true);
+      this.setNotice('Invite revoked.');
+    } catch (e) {
+      this.setError(e?.message || String(e));
+    }
+  }
+
+  async setMemberRole(memberDid, role) {
+    const g = this.group;
+    if (!this.groupId || !g) return;
+    const myRole = String(g?.my_role || '');
+    const isAdmin = (myRole === 'admin');
+    if (!isAdmin) return;
+    const r = (role === 'moderator') ? 'moderator' : 'member';
+    if (!confirm(`Set role for ${memberDid} → ${r}?`)) return;
+
+    this.setError('');
+    this.setNotice('');
+    try {
+      await call('groupMemberSetRole', { groupId: this.groupId, memberDid, role: r });
+      await this.loadMembers(true);
+      await this.loadAudit(true);
+      this.setNotice('Role updated.');
+    } catch (e) {
+      this.setError(e?.message || String(e));
+    }
+  }
+
+  async loadPins(reset = false) {
+    if (!this.groupId || !this.group) return;
+    if (this.pinsLoading) return;
+    this.pinsLoading = true;
+    this.pinsError = '';
+    if (reset) {
+      this.pinsItems = [];
+      this.pinnedPosts = [];
+    }
+    this.render();
+    try {
+      const res = await call('groupPinsList', { groupId: this.groupId });
+      const items = Array.isArray(res?.items) ? res.items : [];
+      this.pinsItems = items;
+      const uris = items.map((x) => String(x?.post_uri || '')).filter(Boolean);
+      if (uris.length) {
+        try {
+          const pr = await call('getPosts', { uris });
+          const posts = Array.isArray(pr?.posts) ? pr.posts : [];
+          const pos = new Map(uris.map((u, i) => [u, i]));
+          posts.sort((a, b) => {
+            const ua = String(a?.uri || '');
+            const ub = String(b?.uri || '');
+            const ia = pos.has(ua) ? pos.get(ua) : 1e9;
+            const ib = pos.has(ub) ? pos.get(ub) : 1e9;
+            return ia - ib;
+          });
+          this.pinnedPosts = posts;
+        } catch {
+          this.pinnedPosts = [];
+        }
+      } else {
+        this.pinnedPosts = [];
+      }
+    } catch (e) {
+      this.pinsError = e?.message || String(e);
+      this.pinsItems = [];
+      this.pinnedPosts = [];
+    } finally {
+      this.pinsLoading = false;
+      this.render();
+    }
+  }
+
+  async pinPost(uri, isAnnouncement) {
+    const g = this.group;
+    if (!this.groupId || !g) return;
+    const myRole = String(g?.my_role || '');
+    const isMod = (myRole === 'admin' || myRole === 'moderator');
+    if (!isMod) return;
+
+    this.setError('');
+    this.setNotice('');
+    try {
+      await call('groupPinAdd', { groupId: this.groupId, postUri: uri, ...(isAnnouncement ? { isAnnouncement: true } : {}) });
+      await this.loadPins(true);
+      await this.loadAudit(true);
+      this.setNotice(isAnnouncement ? 'Pinned as announcement.' : 'Pinned.');
+    } catch (e) {
+      this.setError(e?.message || String(e));
+    }
+  }
+
+  async unpinPost(uri) {
+    const g = this.group;
+    if (!this.groupId || !g) return;
+    const myRole = String(g?.my_role || '');
+    const isMod = (myRole === 'admin' || myRole === 'moderator');
+    if (!isMod) return;
+    if (!confirm('Unpin this post?')) return;
+
+    this.setError('');
+    this.setNotice('');
+    try {
+      await call('groupPinRemove', { groupId: this.groupId, postUri: uri });
+      await this.loadPins(true);
+      await this.loadAudit(true);
+      this.setNotice('Unpinned.');
+    } catch (e) {
+      this.setError(e?.message || String(e));
+    }
+  }
+
+  async movePin(uri, dir) {
+    const pins = Array.isArray(this.pinsItems) ? this.pinsItems : [];
+    const uris = pins.map((x) => String(x?.post_uri || '')).filter(Boolean);
+    const idx = uris.indexOf(uri);
+    if (idx < 0) return;
+
+    const j = (dir === 'up') ? (idx - 1) : (idx + 1);
+    if (j < 0 || j >= uris.length) return;
+
+    const next = [...uris];
+    const tmp = next[idx];
+    next[idx] = next[j];
+    next[j] = tmp;
+
+    this.setError('');
+    this.setNotice('');
+    try {
+      await call('groupPinsReorder', { groupId: this.groupId, order: next });
+      await this.loadPins(true);
+      await this.loadAudit(true);
+    } catch (e) {
+      this.setError(e?.message || String(e));
+    }
+  }
+
+  async editPinNote(uri) {
+    const pins = Array.isArray(this.pinsItems) ? this.pinsItems : [];
+    const meta = pins.find((x) => String(x?.post_uri || '') === uri) || null;
+    const cur = String(meta?.note || '');
+    const next = prompt('Pin note (optional):', cur);
+    if (next === null) return;
+
+    this.setError('');
+    this.setNotice('');
+    try {
+      await call('groupPinUpdate', { groupId: this.groupId, postUri: uri, note: String(next) });
+      await this.loadPins(true);
+      await this.loadAudit(true);
+      this.setNotice('Pin updated.');
+    } catch (e) {
+      this.setError(e?.message || String(e));
+    }
+  }
+
+  async togglePinAnnouncement(uri) {
+    const g = this.group;
+    if (!this.groupId || !g) return;
+    const myRole = String(g?.my_role || '');
+    if (myRole !== 'admin') return;
+
+    const pins = Array.isArray(this.pinsItems) ? this.pinsItems : [];
+    const meta = pins.find((x) => String(x?.post_uri || '') === uri) || null;
+    const cur = !!Number(meta?.is_announcement || 0);
+    const next = !cur;
+    if (!confirm(next ? 'Mark as announcement?' : 'Remove announcement marker?')) return;
+
+    this.setError('');
+    this.setNotice('');
+    try {
+      await call('groupPinUpdate', { groupId: this.groupId, postUri: uri, isAnnouncement: next });
+      await this.loadPins(true);
+      await this.loadAudit(true);
+      this.setNotice(next ? 'Marked as announcement.' : 'Announcement marker removed.');
+    } catch (e) {
+      this.setError(e?.message || String(e));
     }
   }
 
@@ -748,6 +1066,41 @@ export class BskyGroupHome extends HTMLElement {
       this.setError(e?.message || String(e));
     } finally {
       this.postingSettingsBusy = false;
+      this.render();
+    }
+  }
+
+  async saveGroupSettings() {
+    const g = this.group;
+    if (!this.groupId || !g) return;
+    if (!this.meIsSuper) {
+      this.setError('Super user required to change group settings.');
+      return;
+    }
+    if (this.groupSettingsBusy) return;
+
+    const name = String(this.groupEditName || '').trim();
+    const description = String(this.groupEditDescription || '');
+    const visibility = String(this.groupEditVisibility || 'public');
+    const vis = (visibility === 'closed' || visibility === 'secret') ? visibility : 'public';
+    if (!name) {
+      this.setError('Group name is required.');
+      return;
+    }
+
+    this.groupSettingsBusy = true;
+    this.setError('');
+    this.setNotice('');
+    this.render();
+    try {
+      await call('groupUpdate', { groupId: this.groupId, name, description, visibility: vis });
+      this.groupEditDirty = false;
+      await this.load();
+      this.setNotice('Group settings saved.');
+    } catch (e) {
+      this.setError(e?.message || String(e));
+    } finally {
+      this.groupSettingsBusy = false;
       this.render();
     }
   }
@@ -1163,6 +1516,23 @@ export class BskyGroupHome extends HTMLElement {
     }
   }
 
+  async acceptInvite() {
+    if (!this.groupId) return;
+    if (this.busy) return;
+    this.busy = true;
+    this.setError('');
+    this.render();
+    try {
+      await call('groupInviteAccept', { groupId: this.groupId });
+      await this.load();
+    } catch (e) {
+      this.setError(e?.message || String(e));
+    } finally {
+      this.busy = false;
+      this.render();
+    }
+  }
+
   async leave() {
     if (!this.groupId) return;
     if (this.busy) return;
@@ -1203,11 +1573,16 @@ export class BskyGroupHome extends HTMLElement {
     const myRulesAcceptedAt = g ? String(g.my_rules_accepted_at || '') : '';
     const cooldownSeconds = g ? Number(g.post_cooldown_seconds || 0) : 0;
 
+    const canAcceptInvite = g && (myState === 'invited');
     const canJoin = g && !myState;
-    const canLeave = g && (myState === 'member' || myState === 'pending');
+    const canLeave = g && (myState === 'member' || myState === 'pending' || myState === 'invited');
     const canPost = g && (myState === 'member') && (!hasRules || !!myRulesAcceptedAt) && !isSuspended && !isBanned;
     const canReport = g && (myState === 'member' || vis === 'public');
     const groupTag = g ? groupTagFromSlug(slug) : '';
+
+    const pins = Array.isArray(this.pinsItems) ? this.pinsItems : [];
+    const pinnedSet = new Set(pins.map((x) => String(x?.post_uri || '')).filter(Boolean));
+    const pinnedByUri = new Map(pins.map((x) => [String(x?.post_uri || ''), x]));
 
     const statusBits = g ? [
       vis ? `Visibility: ${vis}` : '',
@@ -1221,6 +1596,34 @@ export class BskyGroupHome extends HTMLElement {
         <div class="muted">This is a secret group. You need an invite token to join.</div>
         <label>Invite token</label>
         <input name="invite_token" placeholder="paste token" value="${escAttr(this.inviteToken)}" ${this.busy ? 'disabled' : ''} />
+      </div>
+    ` : '';
+
+    const groupSettings = (g && this.meIsSuper) ? `
+      <div class="card">
+        <div class="title">Group settings (superuser)</div>
+        <div class="muted">Changes here are site-local (name/description/visibility).</div>
+
+        <label>Slug</label>
+        <div class="rulesBox"><span class="mono">/${esc(slug || '')}</span></div>
+
+        <label>Name</label>
+        <input name="group_name" value="${escAttr(this.groupEditName)}" ${this.groupSettingsBusy ? 'disabled' : ''} />
+
+        <label>Description</label>
+        <textarea name="group_description" rows="3" ${this.groupSettingsBusy ? 'disabled' : ''}>${esc(this.groupEditDescription)}</textarea>
+
+        <label>Visibility</label>
+        <select name="group_visibility" ${this.groupSettingsBusy ? 'disabled' : ''}>
+          <option value="public" ${this.groupEditVisibility === 'public' ? 'selected' : ''}>public</option>
+          <option value="closed" ${this.groupEditVisibility === 'closed' ? 'selected' : ''}>closed</option>
+          <option value="secret" ${this.groupEditVisibility === 'secret' ? 'selected' : ''}>secret</option>
+        </select>
+
+        <div class="actions">
+          <button class="btn" type="button" data-action="save-group-settings" ${(!this.groupEditDirty || this.groupSettingsBusy) ? 'disabled' : ''}>Save</button>
+          ${this.groupEditDirty ? `<div class="muted">Unsaved changes.</div>` : `<div class="muted">Up to date.</div>`}
+        </div>
       </div>
     ` : '';
 
@@ -1398,6 +1801,52 @@ export class BskyGroupHome extends HTMLElement {
       if (!g) return '';
       if (!groupTag) return `<div class="muted">No group tag available for this group.</div>`;
 
+      const pins = Array.isArray(this.pinsItems) ? this.pinsItems : [];
+      const pinnedByUri = new Map(pins.map((x) => [String(x?.post_uri || ''), x]));
+      const pinnedSet = new Set(pins.map((x) => String(x?.post_uri || '')).filter(Boolean));
+      const pinnedPosts = Array.isArray(this.pinnedPosts) ? this.pinnedPosts : [];
+      const pinnedPostsByUri = new Map(pinnedPosts.map((p) => [String(p?.uri || ''), p]));
+
+      const pinsHeader = `
+        <div class="feedMeta">
+          <div class="muted">Pinned</div>
+          <div style="flex:1"></div>
+          <button class="btn" type="button" data-action="refresh-pins" ${this.pinsLoading ? 'disabled' : ''}>Refresh</button>
+        </div>
+      `;
+      const pinsErr = this.pinsError ? `<div class="err">${esc(this.pinsError)}</div>` : '';
+      const pinsList = (pins.length === 0)
+        ? `<div class="muted">${this.pinsLoading ? 'Loading pins…' : 'No pinned posts.'}</div>`
+        : `<div class="feedList">${pins.map((pin, idx) => {
+            const uri = String(pin?.post_uri || '');
+            const meta = pinnedByUri.get(uri) || null;
+            const isAnn = !!Number(meta?.is_announcement || 0);
+            const note = String(meta?.note || '');
+            const hydrated = pinnedPostsByUri.get(uri) || null;
+            const card = hydrated?.record ? renderPostCard(hydrated) : `<div class="muted">URI: <span class="mono">${esc(uri)}</span></div>`;
+
+            const canMoveUp = idx > 0;
+            const canMoveDown = idx < (pins.length - 1);
+
+            let controls = '';
+            if (isMod && uri) {
+              const dis = this.pinsLoading ? 'disabled' : '';
+              const disUp = (!canMoveUp || this.pinsLoading) ? 'disabled' : '';
+              const disDown = (!canMoveDown || this.pinsLoading) ? 'disabled' : '';
+              const annLabel = isAnn ? 'Unannounce' : 'Announce';
+              controls = `<div class="postActions">
+                <button class="btn" type="button" data-action="unpin-post" data-uri="${escAttr(uri)}" ${dis}>Unpin</button>
+                <button class="btn" type="button" data-action="pin-move" data-uri="${escAttr(uri)}" data-dir="up" ${disUp}>Up</button>
+                <button class="btn" type="button" data-action="pin-move" data-uri="${escAttr(uri)}" data-dir="down" ${disDown}>Down</button>
+                <button class="btn" type="button" data-action="pin-edit-note" data-uri="${escAttr(uri)}" ${dis}>Note</button>
+                ${(myRole === 'admin') ? `<button class="btn" type="button" data-action="pin-toggle-ann" data-uri="${escAttr(uri)}" ${dis}>${annLabel}</button>` : ''}
+              </div>`;
+            }
+            const badge = isAnn ? `<div class="badges"><span class="badge badgeWarn">announcement</span></div>` : '';
+            const noteRow = note ? `<div class="muted" style="margin:6px 0;">${esc(note)}</div>` : '';
+            return `<div class="post">${controls}${badge}${noteRow}${card}</div>`;
+          }).join('')}</div>`;
+
       const raw = Array.isArray(this.feedItems) ? this.feedItems : [];
       const hidden = this.hiddenSet instanceof Set ? this.hiddenSet : new Set();
       const items = isMod
@@ -1417,12 +1866,33 @@ export class BskyGroupHome extends HTMLElement {
         : `<div class="feedList">${items.map((p) => {
             const uri = String(p?.uri || '');
             const isHidden = uri && hidden.has(uri);
-            const controls = uri ? `<div class="postActions">
-                ${isMod ? (isHidden
-                  ? `<button class="btn" type="button" data-action="unhide-post" data-uri="${escAttr(uri)}" ${this.hiddenLoading ? 'disabled' : ''}>Unhide</button>`
-                  : `<button class="btn" type="button" data-action="hide-post" data-uri="${escAttr(uri)}" ${this.hiddenLoading ? 'disabled' : ''}>Hide</button>`) : ''}
-                ${canReport ? `<button class="btn" type="button" data-action="report-post" data-uri="${escAttr(uri)}">Report</button>` : ''}
-              </div>` : '';
+            const isPinned = uri && pinnedSet.has(uri);
+            let controls = '';
+            if (uri) {
+              const disPins = this.pinsLoading ? 'disabled' : '';
+              const disHidden = this.hiddenLoading ? 'disabled' : '';
+              let btns = '';
+              if (isMod) {
+                if (isPinned) {
+                  btns += `<button class="btn" type="button" data-action="unpin-post" data-uri="${escAttr(uri)}" ${disPins}>Unpin</button>`;
+                } else {
+                  btns += `<button class="btn" type="button" data-action="pin-post" data-uri="${escAttr(uri)}" ${disPins}>Pin</button>`;
+                  if (myRole === 'admin') {
+                    btns += `<button class="btn" type="button" data-action="pin-post" data-uri="${escAttr(uri)}" data-ann="1" ${disPins}>Announce</button>`;
+                  }
+                }
+
+                if (isHidden) {
+                  btns += `<button class="btn" type="button" data-action="unhide-post" data-uri="${escAttr(uri)}" ${disHidden}>Unhide</button>`;
+                } else {
+                  btns += `<button class="btn" type="button" data-action="hide-post" data-uri="${escAttr(uri)}" ${disHidden}>Hide</button>`;
+                }
+              }
+              if (canReport) {
+                btns += `<button class="btn" type="button" data-action="report-post" data-uri="${escAttr(uri)}">Report</button>`;
+              }
+              controls = btns ? `<div class="postActions">${btns}</div>` : '';
+            }
             const badge = (isMod && isHidden) ? `<div class="muted" style="margin-bottom:6px;">Hidden from group feed</div>` : '';
             return `<div class="post ${isHidden ? 'postHidden' : ''}">${badge}${controls}${renderPostCard(p)}</div>`;
           }).join('')}</div>`;
@@ -1431,7 +1901,7 @@ export class BskyGroupHome extends HTMLElement {
         ? `<div class="moreRow"><button class="btn" type="button" data-action="more-feed" ${this.feedLoading ? 'disabled' : ''}>Load more</button></div>`
         : '';
 
-      return `${header}${list}${more}`;
+      return `${pinsErr}${pinsHeader}${pinsList}<div style="height:10px"></div>${header}${list}${more}`;
     })();
 
     const postingSettings = (() => {
@@ -1501,12 +1971,26 @@ export class BskyGroupHome extends HTMLElement {
             const who = String(r.reporter_did || '');
             const reason = String(r.reason || '');
             const at = String(r.created_at || '');
+            const isPinned = uri && pinnedSet.has(uri);
+            let pinBtns = '';
+            if (uri) {
+              const disPins = this.pinsLoading ? 'disabled' : '';
+              if (isPinned) {
+                pinBtns = `<button class="btn" type="button" data-action="unpin-post" data-uri="${escAttr(uri)}" ${disPins}>Unpin</button>`;
+              } else {
+                pinBtns = `<button class="btn" type="button" data-action="pin-post" data-uri="${escAttr(uri)}" ${disPins}>Pin</button>`;
+                if (myRole === 'admin') {
+                  pinBtns += `<button class="btn" type="button" data-action="pin-post" data-uri="${escAttr(uri)}" data-ann="1" ${disPins}>Announce</button>`;
+                }
+              }
+            }
             return `
               <div class="pendingRow">
                 <div class="muted">#${esc(rid)} • ${esc(at)} • <span class="mono">${esc(who)}</span></div>
                 <div class="muted">URI: <span class="mono">${esc(uri)}</span></div>
                 ${reason ? `<div class="pendingText">${esc(reason)}</div>` : ''}
                 <div class="actions">
+                  ${pinBtns}
                   ${this.reportsState === 'open'
                     ? `<button class="btn" type="button" data-action="resolve-report" data-report-id="${escAttr(rid)}" ${this.reportsLoading ? 'disabled' : ''}>Resolve</button>
                        <button class="btn" type="button" data-action="resolve-hide-report" data-report-id="${escAttr(rid)}" ${this.reportsLoading ? 'disabled' : ''}>Resolve + Hide</button>`
@@ -1540,6 +2024,7 @@ export class BskyGroupHome extends HTMLElement {
       if (!g || !isMod) return '';
       const items = Array.isArray(this.membersItems) ? this.membersItems : [];
       const err = this.membersError ? `<div class="err">${esc(this.membersError)}</div>` : '';
+      const isAdmin = (myRole === 'admin');
       const header = `
         <div class="feedMeta">
           <div class="muted">Members</div>
@@ -1551,6 +2036,7 @@ export class BskyGroupHome extends HTMLElement {
             <option value="blocked" ${this.membersState === 'blocked' ? 'selected' : ''}>Blocked</option>
             <option value="invited" ${this.membersState === 'invited' ? 'selected' : ''}>Invited</option>
           </select>
+          <button class="btn" type="button" data-action="invite-member" ${this.membersLoading ? 'disabled' : ''}>Invite</button>
           <button class="btn" type="button" data-action="refresh-members" ${this.membersLoading ? 'disabled' : ''}>Refresh</button>
         </div>
       `;
@@ -1576,18 +2062,33 @@ export class BskyGroupHome extends HTMLElement {
               banned ? `<span class="badge badgeBan">banned</span>` : '',
             ].filter(Boolean).join(' ');
 
-            const approveBtns = (state === 'pending')
+            const approveBtns = (state === 'pending' || state === 'invited')
               ? `<button class="btn" type="button" data-action="approve-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Approve</button>
-                 <button class="btn" type="button" data-action="deny-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Deny</button>`
+                 ${state === 'pending' ? `<button class="btn" type="button" data-action="deny-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Deny</button>` : ''}`
               : '';
 
-            const sanctionBtns = `
-              <button class="btn" type="button" data-action="warn-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Warn</button>
-              ${suspended ? `<button class="btn" type="button" data-action="unsuspend-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Unsuspend</button>`
-                : `<button class="btn" type="button" data-action="suspend-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Suspend</button>`}
-              ${banned ? `<button class="btn" type="button" data-action="unban-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Unban</button>`
-                : `<button class="btn" type="button" data-action="ban-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Ban</button>`}
-            `;
+            const inviteBtns = (state === 'invited')
+              ? `<button class="btn" type="button" data-action="revoke-invite" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Revoke invite</button>`
+              : '';
+
+            const roleBtns = (isAdmin && state === 'member' && !banned)
+              ? (role === 'member'
+                ? `<button class="btn" type="button" data-action="set-role" data-member-did="${escAttr(did)}" data-role="moderator" ${this.membersLoading ? 'disabled' : ''}>Make mod</button>`
+                : (role === 'moderator'
+                  ? `<button class="btn" type="button" data-action="set-role" data-member-did="${escAttr(did)}" data-role="member" ${this.membersLoading ? 'disabled' : ''}>Make member</button>`
+                  : ''))
+              : '';
+
+            const sanctionBtns = (state === 'invited')
+              ? `${banned ? `<button class="btn" type="button" data-action="unban-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Unban</button>`
+                  : `<button class="btn" type="button" data-action="ban-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Ban</button>`}`
+              : `
+                  <button class="btn" type="button" data-action="warn-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Warn</button>
+                  ${suspended ? `<button class="btn" type="button" data-action="unsuspend-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Unsuspend</button>`
+                    : `<button class="btn" type="button" data-action="suspend-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Suspend</button>`}
+                  ${banned ? `<button class="btn" type="button" data-action="unban-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Unban</button>`
+                    : `<button class="btn" type="button" data-action="ban-member" data-member-did="${escAttr(did)}" ${this.membersLoading ? 'disabled' : ''}>Ban</button>`}
+                `;
 
             return `
               <div class="pendingRow">
@@ -1597,6 +2098,8 @@ export class BskyGroupHome extends HTMLElement {
                 ${bannedAt ? `<div class="muted">Banned at: <span class="mono">${esc(bannedAt)}</span></div>` : ''}
                 <div class="actions">
                   ${approveBtns}
+                  ${inviteBtns}
+                  ${roleBtns}
                   ${sanctionBtns}
                 </div>
               </div>
@@ -1624,13 +2127,31 @@ export class BskyGroupHome extends HTMLElement {
             const createdAt = String(p.created_at || '');
             const decidedAt = String(p.decided_at || '');
             const note = String(p.decision_note || '');
+            const decidedBy = p.decided_by_did ? ` by <span class="mono">${esc(p.decided_by_did)}</span>` : '';
+            const decidedRow = decidedAt ? `<div class="muted">Decided: ${esc(decidedAt)}${decidedBy}</div>` : '';
+            const isPinned = uri && pinnedSet.has(uri);
+            let pinControls = '';
+            if (isMod && uri) {
+              const disPins = this.pinsLoading ? 'disabled' : '';
+              let btns = '';
+              if (isPinned) {
+                btns = `<button class="btn" type="button" data-action="unpin-post" data-uri="${escAttr(uri)}" ${disPins}>Unpin</button>`;
+              } else {
+                btns = `<button class="btn" type="button" data-action="pin-post" data-uri="${escAttr(uri)}" ${disPins}>Pin</button>`;
+                if (myRole === 'admin') {
+                  btns += `<button class="btn" type="button" data-action="pin-post" data-uri="${escAttr(uri)}" data-ann="1" ${disPins}>Announce</button>`;
+                }
+              }
+              pinControls = `<div class="actions" style="margin-top:6px;">${btns}</div>`;
+            }
             return `
               <div class="pendingRow">
                 <div class="muted">State: <span class="mono">${esc(state || '—')}</span> • ${esc(createdAt)}</div>
                 ${p.text ? `<div class="pendingText">${esc(p.text)}</div>` : ''}
                 ${uri ? `<div class="muted">URI: <span class="mono">${esc(uri)}</span></div>` : ''}
-                ${decidedAt ? `<div class="muted">Decided: ${esc(decidedAt)}${p.decided_by_did ? ` by <span class=\"mono\">${esc(p.decided_by_did)}</span>` : ''}</div>` : ''}
+                ${decidedRow}
                 ${note ? `<div class="muted">Note: ${esc(note)}</div>` : ''}
+                ${pinControls}
               </div>
             `;
           }).join('')}</div>`;
@@ -1686,10 +2207,13 @@ export class BskyGroupHome extends HTMLElement {
                   ${secretInvite}
                   <div class="actions">
                     ${canJoin ? `<button class="btn" type="button" data-action="join" ${this.busy ? 'disabled' : ''}>Join</button>` : ''}
-                    ${canLeave ? `<button class="btn" type="button" data-action="leave" ${this.busy ? 'disabled' : ''}>Leave</button>` : ''}
+                    ${canAcceptInvite ? `<button class="btn" type="button" data-action="accept-invite" ${this.busy ? 'disabled' : ''}>Accept invite</button>` : ''}
+                    ${canLeave ? `<button class="btn" type="button" data-action="leave" ${this.busy ? 'disabled' : ''}>${myState === 'invited' ? 'Decline invite' : 'Leave'}</button>` : ''}
                     <button class="btn" type="button" data-action="refresh" ${this.loading || this.busy ? 'disabled' : ''}>Refresh</button>
                   </div>
                 </div>
+
+                ${groupSettings}
 
                 ${rulesBlock}
 
@@ -1759,14 +2283,14 @@ export class BskyGroupHome extends HTMLElement {
 
     this.shadowRoot.innerHTML = `
       <style>
-        :host{display:block;color:#fff}
-        .btn{background:#111;border:1px solid #333;color:#fff;padding:6px 10px;cursor:pointer}
+        :host{display:block;color:var(--bsky-fg,#fff);font-family:var(--bsky-font-family,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif)}
+        .btn{background:var(--bsky-btn-bg,#111);border:1px solid var(--bsky-border,#333);color:var(--bsky-fg,#fff);padding:6px 10px;cursor:pointer}
         .btn[disabled]{opacity:.6;cursor:not-allowed}
-        .muted{opacity:.75;font-size:12px}
-        .err{background:#2a0c0c;border:1px solid #5a1c1c;padding:8px 10px;margin:8px 0}
-        .ok{background:#0c2a14;border:1px solid #1c5a2c;padding:8px 10px;margin:8px 0}
+        .muted{color:var(--bsky-muted-fg,rgba(255,255,255,.75));font-size:12px}
+        .err{background:var(--bsky-danger-bg,#2a0c0c);border:1px solid var(--bsky-danger-border,#5a1c1c);padding:8px 10px;margin:8px 0}
+        .ok{background:var(--bsky-success-bg,#0c2a14);border:1px solid var(--bsky-success-border,#1c5a2c);padding:8px 10px;margin:8px 0}
         .empty{opacity:.75;padding:10px}
-        .card{border:1px solid #222;background:#0b0b0b;margin:8px 0;padding:10px}
+        .card{border:1px solid var(--bsky-border-soft,#222);background:var(--bsky-surface,#0b0b0b);margin:8px 0;padding:10px}
         .title{font-weight:800}
         .slug{opacity:.7;font-weight:400;font-size:12px}
         .desc{margin-top:6px;opacity:.9;white-space:pre-wrap}
@@ -1774,11 +2298,11 @@ export class BskyGroupHome extends HTMLElement {
         .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
         .invite{margin-top:10px}
         label{display:block;font-size:12px;opacity:.8;margin-top:8px}
-        input{width:100%;background:#000;border:1px solid #333;color:#fff;padding:8px}
-        select{width:100%;background:#000;border:1px solid #333;color:#fff;padding:8px}
-        textarea{width:100%;background:#000;border:1px solid #333;color:#fff;padding:8px;resize:vertical}
-        .rulesBox{white-space:pre-wrap;background:#050505;border:1px solid #222;padding:10px;border-radius:10px;line-height:1.4;margin-top:8px}
-        .feed{border:1px solid #111;background:#060606;margin:10px 0;padding:10px}
+        input{width:100%;background:var(--bsky-input-bg,#000);border:1px solid var(--bsky-border,#333);color:var(--bsky-fg,#fff);padding:8px}
+        select{width:100%;background:var(--bsky-input-bg,#000);border:1px solid var(--bsky-border,#333);color:var(--bsky-fg,#fff);padding:8px}
+        textarea{width:100%;background:var(--bsky-input-bg,#000);border:1px solid var(--bsky-border,#333);color:var(--bsky-fg,#fff);padding:8px;resize:vertical}
+        .rulesBox{white-space:pre-wrap;background:var(--bsky-surface-2,#060606);border:1px solid var(--bsky-border-soft,#222);padding:10px;border-radius:10px;line-height:1.4;margin-top:8px}
+        .feed{border:1px solid var(--bsky-border-subtle,#111);background:var(--bsky-surface-2,#060606);margin:10px 0;padding:10px}
         .feedTitle{font-weight:800;margin-bottom:6px}
 
         .split{display:grid;grid-template-columns: 1fr 1fr;gap:10px}
@@ -1786,13 +2310,13 @@ export class BskyGroupHome extends HTMLElement {
         .miniTitle{font-weight:800;font-size:12px;opacity:.9;margin:6px 0}
         .feedMeta{display:flex;align-items:center;gap:8px;margin:8px 0}
         .feedList{display:flex;flex-direction:column;gap:10px}
-        .post{border-top:1px solid #111;padding-top:10px}
+        .post{border-top:1px solid var(--bsky-border-subtle,#111);padding-top:10px}
         .post:first-child{border-top:0;padding-top:0}
         .postActions{display:flex;gap:8px;justify-content:flex-end;margin:6px 0}
         .postHidden{opacity:.65}
 
         .activity{display:flex;flex-direction:column;gap:10px;margin-top:8px}
-        .actRow{display:flex;gap:10px;justify-content:space-between;align-items:flex-start;border-top:1px solid #111;padding-top:10px}
+        .actRow{display:flex;gap:10px;justify-content:space-between;align-items:flex-start;border-top:1px solid var(--bsky-border-subtle,#111);padding-top:10px}
         .actRow:first-child{border-top:0;padding-top:0}
         .actMain{min-width:0}
         .actAction{font-size:12px}
@@ -1804,7 +2328,7 @@ export class BskyGroupHome extends HTMLElement {
         .auditControls{display:grid;grid-template-columns: 1fr 200px 160px;gap:10px;margin-top:8px}
         .auditCtl{min-width:0}
         .auditList{display:flex;flex-direction:column;gap:10px}
-        .auditRow{border-top:1px solid #111;padding-top:10px}
+        .auditRow{border-top:1px solid var(--bsky-border-subtle,#111);padding-top:10px}
         .auditRow:first-child{border-top:0;padding-top:0}
         .auditTop{display:flex;gap:10px;justify-content:space-between;align-items:flex-start}
         .auditWhen{font-size:11px;opacity:.6;white-space:nowrap}
@@ -1813,12 +2337,12 @@ export class BskyGroupHome extends HTMLElement {
         .auditDetail{margin-top:4px;font-size:12px;opacity:.85;white-space:pre-wrap;word-break:break-word}
 
         .pendingList{display:flex;flex-direction:column;gap:10px}
-        .pendingRow{border-top:1px solid #111;padding-top:10px}
+        .pendingRow{border-top:1px solid var(--bsky-border-subtle,#111);padding-top:10px}
         .pendingRow:first-child{border-top:0;padding-top:0}
         .pendingText{margin-top:6px;white-space:pre-wrap;word-break:break-word}
 
         .badges{margin-top:6px;display:flex;gap:6px;flex-wrap:wrap}
-        .badge{font-size:11px;border:1px solid #222;border-radius:999px;padding:2px 8px;background:#080808;opacity:.95}
+        .badge{font-size:11px;border:1px solid var(--bsky-border-soft,#222);border-radius:999px;padding:2px 8px;background:var(--bsky-surface,#0b0b0b);opacity:.95}
         .badgeDim{opacity:.7}
         .badgeWarn{border-color:#604a00;color:#ffd27a}
         .badgeSusp{border-color:#1f4b62;color:#98d8ff}

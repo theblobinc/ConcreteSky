@@ -2,6 +2,10 @@ import { call } from '../api.js';
 import { bootTabs } from '../tabs.js';
 import { getPanelTemplates, getDefaultActiveTabs } from '../panels/panel_api.js';
 import { isMobilePanelsViewport } from '../panels/panel_api.js';
+import { BSKY_SEARCH_EVENT } from '../search/search_bus.js';
+
+// Apply saved theme variables early.
+import '../theme/app_theme.js';
 
 // Side-effect imports: define custom elements used in the shell.
 import '../panels/components/index.js';
@@ -36,10 +40,73 @@ class BskyApp extends HTMLElement {
     this._fixedColsPrev = new Map(); // panelName -> previous string|null
     this._fixedPxPrev = new Map();   // panelName -> previous string|null
     this._fixedPinPrev = new Map();  // panelName -> previous string|null
+
+    // Global toast stack (fed by `bsky-toast` events).
+    this._toastSeq = 0;
+    this._toasts = [];
+    this._toastTimers = new Map();
+    this._onToast = (e) => {
+      try {
+        const d = e?.detail || {};
+        const msg = String(d.message || '').trim();
+        if (!msg) return;
+        const kind = String(d.kind || 'info').trim() || 'info';
+        const id = ++this._toastSeq;
+        const item = { id, kind, message: msg };
+
+        const prev = Array.isArray(this._toasts) ? this._toasts : [];
+        this._toasts = prev.slice(-2).concat([item]);
+        this._renderToasts();
+
+        const ms = Number(d.timeoutMs ?? 5000);
+        const ttl = Number.isFinite(ms) ? ms : 5000;
+        if (ttl > 0) {
+          const tid = setTimeout(() => this._dismissToast(id), ttl);
+          this._toastTimers.set(id, tid);
+        }
+      } catch {
+        // ignore
+      }
+    };
   }
 
   connectedCallback() {
     this.render();
+
+    // Hashtag browsing: clicking a hashtag anywhere should open Search and run a posts search.
+    // Because clicks cross shadow boundaries with retargeting, use composedPath().
+    this.addEventListener('click', (e) => {
+      try {
+        const path = (typeof e?.composedPath === 'function') ? e.composedPath() : [];
+        const el = (path || []).find((n) => {
+          try {
+            return n && n.nodeType === 1 && typeof n.getAttribute === 'function' && n.getAttribute('data-hashtag');
+          } catch {
+            return false;
+          }
+        });
+        if (!el) return;
+
+        const tag = String(el.getAttribute('data-hashtag') || '').trim();
+        if (!tag) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+
+        this.openSearch({ query: `#${tag}`, mode: 'network', targets: ['posts'], limit: 25 });
+      } catch {
+        // ignore
+      }
+    }, { capture: true });
+
+    // Global toasts.
+    this.addEventListener('bsky-toast', this._onToast, { capture: true });
+    this.shadowRoot.addEventListener('click', (e) => {
+      const btn = e?.target?.closest?.('[data-app-toast-dismiss]');
+      if (!btn) return;
+      const id = Number(btn.getAttribute('data-app-toast-dismiss') || 0);
+      if (id > 0) this._dismissToast(id);
+    });
 
     // Group selector changes.
     this.shadowRoot.addEventListener('change', (e) => {
@@ -103,9 +170,68 @@ class BskyApp extends HTMLElement {
     });
   }
 
+  openSearch(detail = {}) {
+    try {
+      this.ensureTabsBooted();
+      const root = this.shadowRoot.querySelector('[data-bsky-tabs]');
+      const api = root?.__bskyTabsApi;
+      api?.activate?.('search');
+
+      const payload = {
+        query: String(detail?.query || '').trim(),
+        mode: String(detail?.mode || 'network'),
+        targets: Array.isArray(detail?.targets) ? detail.targets : ['posts'],
+        limit: Number(detail?.limit || 25),
+      };
+
+      // Give the Search panel a frame to mount before we broadcast.
+      requestAnimationFrame(() => {
+        try {
+          window.dispatchEvent(new CustomEvent(BSKY_SEARCH_EVENT, { detail: payload }));
+        } catch {
+          // ignore
+        }
+      });
+    } catch {
+      // ignore
+    }
+  }
+
   disconnectedCallback() {
     try {
       window.removeEventListener('bsky-groups-changed', this._onGroupsChanged);
+    } catch {
+      // ignore
+    }
+  }
+
+  _dismissToast(id) {
+    const tid = this._toastTimers.get(id);
+    if (tid) {
+      try { clearTimeout(tid); } catch {}
+      this._toastTimers.delete(id);
+    }
+    const prev = Array.isArray(this._toasts) ? this._toasts : [];
+    this._toasts = prev.filter((t) => Number(t?.id || 0) !== Number(id || 0));
+    this._renderToasts();
+  }
+
+  _renderToasts() {
+    try {
+      const host = this.shadowRoot.getElementById('toast-stack');
+      if (!host) return;
+      const items = Array.isArray(this._toasts) ? this._toasts : [];
+      const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
+      host.innerHTML = items.map((t) => {
+        const kind = String(t?.kind || 'info');
+        const msg = String(t?.message || '');
+        return `
+          <div class="toast toast-${esc(kind)}" role="status" aria-live="polite">
+            <div class="toastMsg">${esc(msg)}</div>
+            <button class="toastBtn" type="button" title="Dismiss" data-app-toast-dismiss="${Number(t?.id || 0)}">×</button>
+          </div>
+        `;
+      }).join('');
     } catch {
       // ignore
     }
@@ -670,7 +796,7 @@ class BskyApp extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         :host, *, *::before, *::after{box-sizing:border-box}
-        :host{display:block;background:#000;color:#fff}
+        :host{display:block;background:var(--bsky-bg,#000);color:var(--bsky-fg,#fff);font-family:var(--bsky-font-family,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif);font-size:var(--bsky-font-size,16px)}
 
         /* Card sizing: shared by panel resize logic + card components */
         :host{
@@ -707,9 +833,11 @@ class BskyApp extends HTMLElement {
         .root{background:#000;color:#fff;width:100%;max-width:100%;margin:0;border:0;border-radius:0;overflow-x:hidden;
           padding:0 0 0 5px;
         }
+        .root{background:var(--bsky-bg,#000);color:var(--bsky-fg,#fff)}
 
         /* Tabs */
         .bsky-tabs{width:100%; background:#000}
+        .bsky-tabs{background:var(--bsky-bg,#000)}
 
         /* Hide the taskbar + panels until connected (JS clears data-bsky-locked). */
         .bsky-tabs[data-bsky-locked="1"] .tabsbar,
@@ -721,8 +849,8 @@ class BskyApp extends HTMLElement {
           flex-wrap:wrap;
           align-items:center;
           padding:8px;
-          background:#0b0b0b;
-          border:1px solid #222;
+          background:var(--bsky-surface,#0b0b0b);
+          border:1px solid var(--bsky-border-soft,#222);
           border-radius:0;
           position:relative;
           z-index:10;
@@ -737,9 +865,9 @@ class BskyApp extends HTMLElement {
         }
         .tab{
           appearance:none;
-          background:#111;
-          color:#fff;
-          border:1px solid #333;
+          background:var(--bsky-btn-bg,#111);
+          color:var(--bsky-fg,#fff);
+          border:1px solid var(--bsky-border,#333);
           border-radius:0;
           padding:8px 12px;
           cursor:grab;
@@ -748,11 +876,11 @@ class BskyApp extends HTMLElement {
         .tab:active{cursor:grabbing}
         .tab[aria-pressed="true"]{background:#1d2a41;border-color:#2f4b7a;}
         .tab:focus{outline:2px solid #2f4b7a; outline-offset:2px}
-        .tabhint{color:#aaa;font-size:.9rem;margin-left:auto;white-space:nowrap}
+        .tabhint{color:var(--bsky-muted-fg,#aaa);font-size:.9rem;margin-left:auto;white-space:nowrap}
 
         .groupWrap{display:flex;align-items:center;gap:8px;flex:0 0 auto}
-        .groupLabel{font-size:12px;opacity:.8;white-space:nowrap}
-        .groupSelect{background:#000;border:1px solid #333;color:#fff;padding:7px 10px;min-width:240px}
+        .groupLabel{font-size:12px;opacity:.8;white-space:nowrap;color:var(--bsky-muted-fg,rgba(255,255,255,.75))}
+        .groupSelect{background:var(--bsky-input-bg,#000);border:1px solid var(--bsky-border,#333);color:var(--bsky-fg,#fff);padding:7px 10px;min-width:240px}
 
         .panels{
           margin-top:12px;
@@ -772,10 +900,10 @@ class BskyApp extends HTMLElement {
           min-width:0;
           flex: 1 1 calc(var(--bsky-card-min-w) + 40px);
           position:relative;
-          background:#000;
+          background:var(--bsky-bg,#000);
           padding: 0px;
           box-sizing: border-box;
-          border: 1px solid #111;
+          border: 1px solid var(--bsky-border-subtle,#111);
           border-radius:0;
           scroll-snap-align: start;
           scroll-snap-stop: always;
@@ -811,7 +939,7 @@ class BskyApp extends HTMLElement {
             gap:0;
             overflow-x:auto;
             scroll-snap-type:x mandatory;
-            scroll-behavior: smooth;
+            scroll-behavior: var(--bsky-scroll-behavior, smooth);
             overscroll-behavior-x: contain;
             -webkit-overflow-scrolling: touch;
             position:relative;
@@ -832,6 +960,11 @@ class BskyApp extends HTMLElement {
           }
         }
 
+        /* Reduced-motion: default to no smooth scrolling unless explicitly overridden. */
+        @media (prefers-reduced-motion: reduce) and (max-width: 767px){
+          .panels{ scroll-behavior: var(--bsky-scroll-behavior, auto); }
+        }
+
         /* Avoid wrapping panels into multiple rows; prefer swipe/scroll instead. */
         @media (max-width: 900px){
           .panels{flex-wrap:nowrap; overflow-x:hidden;}
@@ -840,6 +973,49 @@ class BskyApp extends HTMLElement {
         /* Ensure media inside components scale */
         .root img, .root video{ max-width:100%; height:auto; display:block }
         bsky-my-posts, bsky-connections { display:block; width:100% }
+
+        /* Toast stack */
+        #toast-stack{
+          position:fixed;
+          right:12px;
+          bottom:12px;
+          z-index:1000;
+          display:flex;
+          flex-direction:column;
+          gap:8px;
+          width:min(420px, calc(100vw - 24px));
+          pointer-events:none;
+        }
+        .toast{
+          pointer-events:auto;
+          display:flex;
+          align-items:flex-start;
+          gap:10px;
+          padding:10px 12px;
+          border-radius:0;
+          border:1px solid var(--bsky-border,#333);
+          background:var(--bsky-surface,#0b0b0b);
+          color:var(--bsky-fg,#fff);
+          box-shadow:0 10px 30px rgba(0,0,0,.55);
+        }
+        .toast-info{border-color:#2f4b7a;}
+        .toast-success{border-color:#1f7a3a;}
+        .toast-warn{border-color:#7a5a1f;}
+        .toast-error{border-color:#7a1f1f;}
+        .toastMsg{flex:1 1 auto; min-width:0; line-height:1.25; word-break:break-word}
+        .toastBtn{
+          appearance:none;
+          background:transparent;
+          color:inherit;
+          border:1px solid var(--bsky-border-soft,#222);
+          width:28px;
+          height:28px;
+          padding:0;
+          cursor:pointer;
+          display:grid;
+          place-items:center;
+        }
+        .toastBtn:focus{outline:2px solid #2f4b7a; outline-offset:2px}
       </style>
 
       <div class="root">
@@ -866,8 +1042,11 @@ class BskyApp extends HTMLElement {
         </div>
 
         <bsky-notification-bar></bsky-notification-bar>
+        <div id="toast-stack" aria-live="polite" aria-relevant="additions removals"></div>
       </div>
     `;
+
+    this._renderToasts();
   }
 }
 

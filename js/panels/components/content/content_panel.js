@@ -38,6 +38,9 @@ export class BskyContentPanel extends HTMLElement {
 
     this._replyPostedHandler = null;
     this._unbindListsRequest = null;
+
+    this._postDeletedHandler = null;
+    this._selectionDeleted = false;
   }
 
   pickThreadRootRef(thread) {
@@ -58,6 +61,7 @@ export class BskyContentPanel extends HTMLElement {
     const cid = String(sel?.cid || '');
     const view = String(sel?.view || sel?.tab || '');
     this._selection = uri ? { uri, cid } : null;
+    this._selectionDeleted = false;
     this._replyTo = null;
     this._thread = null;
     this._error = null;
@@ -111,6 +115,26 @@ export class BskyContentPanel extends HTMLElement {
       };
     }
     window.addEventListener('bsky-reply-posted', this._replyPostedHandler);
+
+    // If the selected post is deleted elsewhere (or here), close this panel.
+    if (!this._postDeletedHandler) {
+      this._postDeletedHandler = (e) => {
+        const uri = String(e?.detail?.uri || '');
+        const cur = String(this._selection?.uri || '');
+        if (!uri || !cur) return;
+        if (uri !== cur) return;
+
+        // Keep the panel open, but show a placeholder instead of a dead thread.
+        this._selectionDeleted = true;
+        this._thread = null;
+        this._replyTo = null;
+        this._posting = false;
+        this._loading = false;
+        this._error = null;
+        this.render();
+      };
+    }
+    window.addEventListener('bsky-post-deleted', this._postDeletedHandler);
   }
 
   _defaultLangs() {
@@ -120,6 +144,7 @@ export class BskyContentPanel extends HTMLElement {
   disconnectedCallback() {
     if (this._unbindListsRequest) { try { this._unbindListsRequest(); } catch {} this._unbindListsRequest = null; }
     if (this._replyPostedHandler) window.removeEventListener('bsky-reply-posted', this._replyPostedHandler);
+    if (this._postDeletedHandler) window.removeEventListener('bsky-post-deleted', this._postDeletedHandler);
   }
 
   async submitComment(detail) {
@@ -300,6 +325,7 @@ export class BskyContentPanel extends HTMLElement {
 
   async load() {
     if (!this._selection?.uri || this._loading) return;
+    if (this._selectionDeleted) return;
     this._loading = true;
     this._error = null;
     this.render();
@@ -481,6 +507,10 @@ export class BskyContentPanel extends HTMLElement {
       return '';
     })();
 
+    const deletedBanner = (this._selectionDeleted && uri)
+      ? `<div class="deleted">This post was deleted. You can close this panel or pick another post.</div>`
+      : '';
+
     this.shadowRoot.innerHTML = `
       <style>
         :host, *, *::before, *::after{box-sizing:border-box}
@@ -491,6 +521,7 @@ export class BskyContentPanel extends HTMLElement {
         .btn.link{color:#9cd3ff; text-decoration:none}
         .muted{color:#aaa}
         .err{color:#f88}
+        .deleted{border:1px solid #3a2b2b;background:#140c0c;color:#f2c9c9;padding:8px;margin:0 0 10px 0}
         .section{margin-bottom:10px}
 
         .tabs{display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin-bottom:10px}
@@ -527,6 +558,7 @@ export class BskyContentPanel extends HTMLElement {
         </div>
 
         <div class="section">
+          ${deletedBanner}
           ${this._loading ? '<div class="muted">Loading thread…</div>' : ''}
           ${this._posting ? '<div class="muted">Posting…</div>' : ''}
           ${this._error ? `<div class="err">Error: ${esc(this._error)}</div>` : ''}
@@ -534,7 +566,7 @@ export class BskyContentPanel extends HTMLElement {
 
         <div class="section">
           ${view === 'replies'
-            ? '<bsky-thread-tree></bsky-thread-tree>'
+            ? (this._selectionDeleted ? '<div class="muted">(Thread unavailable)</div>' : '<bsky-thread-tree></bsky-thread-tree>')
             : `
               <div class="actionsRow">
                 <button class="btn" type="button" data-follow-all ${followAllDisabled ? 'disabled' : ''} title="Follow all" aria-label="Follow all">➕</button>
@@ -544,7 +576,7 @@ export class BskyContentPanel extends HTMLElement {
           }
         </div>
 
-        ${view === 'replies' ? `
+        ${(view === 'replies' && !this._selectionDeleted) ? `
           <div class="section">
             <bsky-comment-composer maxchars="300" thread="1"></bsky-comment-composer>
           </div>

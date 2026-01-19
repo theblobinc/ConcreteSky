@@ -7,6 +7,34 @@ export const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
 export const fmtTime = (iso) => { try { return new Date(iso).toLocaleString(); } catch { return ''; } };
 export const safeHost = (url) => { try { return new URL(url).host; } catch { return ''; } };
 
+export function renderPostTextHtml(text) {
+  const s = String(text || '');
+  if (!s) return '';
+
+  let out = '';
+  let last = 0;
+
+  // Basic hashtag linkification.
+  // Keep it conservative for broad browser compatibility.
+  // (ASCII word-ish characters only, up to 64.)
+  const re = /#([A-Za-z0-9_]{1,64})/g;
+  for (const m of s.matchAll(re)) {
+    const idx = Number(m.index || 0);
+    const tag = String(m[1] || '');
+    if (!tag) continue;
+    const prev = idx > 0 ? s[idx - 1] : '';
+    if (prev && /[A-Za-z0-9_]/.test(prev)) continue;
+
+    out += esc(s.slice(last, idx));
+    const full = `#${tag}`;
+    out += `<a class="hashtag" href="#" data-hashtag="${esc(tag)}" title="Search ${esc(full)}">${esc(full)}</a>`;
+    last = idx + String(m[0] || '').length;
+  }
+
+  out += esc(s.slice(last));
+  return out;
+}
+
 export function countsOf(post) {
   if (!post) return { replies: 0, likes: 0, reposts: 0, reach: 0 };
   const r = Number(post.replyCount ?? 0);
@@ -125,7 +153,7 @@ export function renderPostCard(p){
   const rec = p.record || {};
   const when = fmtTime(rec.createdAt || p.indexedAt || '');
   const open = atUriToWebPost(p.uri);
-  const text = esc(rec.text || '');
+  const text = renderPostTextHtml(rec.text || '');
 
   const imgs  = extractImagesFromEmbed(p.embed);
   const vid   = extractVideoFromEmbed(p.embed);

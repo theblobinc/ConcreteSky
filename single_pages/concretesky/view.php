@@ -44,6 +44,16 @@ try {
   $pkg = \Concrete\Core\Package\Package::getByHandle('concretesky');
   if ($pkg) $pkgVersion = (string)$pkg->getPackageVersion();
 } catch (\Throwable $e) { /* ignore */ }
+
+// Site-wide theme (stored server-side).
+$siteTheme = null;
+try {
+  $rawTheme = (string)(\Concrete\Core\Support\Facade\Config::get('concretesky.theme_json') ?? '');
+  if ($rawTheme !== '') {
+    $decoded = json_decode($rawTheme, true);
+    if (is_array($decoded)) $siteTheme = $decoded;
+  }
+} catch (\Throwable $e) { /* ignore */ }
 ?>
 <section>
   <?php
@@ -67,6 +77,7 @@ try {
   window.BSKY = {
     csrf: '<?= h($csrfToken) ?>',
     apiPath: '<?= h($apiPath) ?>',
+    siteTheme: <?= json_encode($siteTheme, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?>,
     c5User: {
       id: <?= (int)$c5UserId ?>,
       name: '<?= h($c5UserName) ?>',
@@ -94,7 +105,8 @@ try {
     left: 50%;
     margin-left: -50vw;
     margin-right: -50vw;
-    background:#000;
+    background: var(--bsky-bg, #000);
+    color: var(--bsky-fg, #fff);
     overflow-x:hidden;
   }
 

@@ -94,18 +94,18 @@ function ensureHudCacheCalendarModal() {
       #bsky-hud-cache-calendar{position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center}
       #bsky-hud-cache-calendar[hidden]{display:none}
       #bsky-hud-cache-calendar .backdrop{position:absolute;inset:0;background:rgba(0,0,0,.7)}
-      #bsky-hud-cache-calendar .card{position:relative;max-width:720px;width:calc(100vw - 24px);background:#0b0b0b;color:#fff;border:1px solid #333;border-radius: var(--bsky-radius, 0px);box-shadow:0 20px 60px rgba(0,0,0,.6)}
+      #bsky-hud-cache-calendar .card{position:relative;max-width:720px;width:calc(100vw - 24px);background:var(--bsky-surface, #0b0b0b);color:var(--bsky-fg, #fff);border:1px solid var(--bsky-border, #333);border-radius: var(--bsky-radius, 0px);box-shadow:0 20px 60px rgba(0,0,0,.6)}
       #bsky-hud-cache-calendar .hd{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid rgba(255,255,255,.10);gap:10px}
       #bsky-hud-cache-calendar .hd .t{font-weight:800}
-      #bsky-hud-cache-calendar .hd .close{appearance:none;background:transparent;border:1px solid #333;color:#fff;border-radius: var(--bsky-radius, 0px);padding:6px 10px;cursor:pointer}
+      #bsky-hud-cache-calendar .hd .close{appearance:none;background:transparent;border:1px solid var(--bsky-border, #333);color:var(--bsky-fg, #fff);border-radius: var(--bsky-radius, 0px);padding:6px 10px;cursor:pointer}
       #bsky-hud-cache-calendar .hd .close:hover{background:#1b1b1b}
       #bsky-hud-cache-calendar .bd{padding:12px 14px;display:flex;flex-direction:column;gap:10px}
       #bsky-hud-cache-calendar .row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
       #bsky-hud-cache-calendar .nav{display:flex;align-items:center;gap:8px}
-      #bsky-hud-cache-calendar .nav button{appearance:none;background:#111;border:1px solid #333;color:#fff;border-radius: var(--bsky-radius, 0px);padding:6px 10px;cursor:pointer;font-weight:800}
+      #bsky-hud-cache-calendar .nav button{appearance:none;background:var(--bsky-btn-bg, #111);border:1px solid var(--bsky-border, #333);color:var(--bsky-fg, #fff);border-radius: var(--bsky-radius, 0px);padding:6px 10px;cursor:pointer;font-weight:800}
       #bsky-hud-cache-calendar .nav button:hover{background:#1b1b1b}
       #bsky-hud-cache-calendar .month{font-weight:800}
-      #bsky-hud-cache-calendar .legend{display:flex;gap:10px;flex-wrap:wrap;color:#bbb;font-size:.9rem}
+      #bsky-hud-cache-calendar .legend{display:flex;gap:10px;flex-wrap:wrap;color:var(--bsky-muted-fg, #bbb);font-size:.9rem}
       #bsky-hud-cache-calendar .legend .item{display:flex;gap:6px;align-items:center}
       #bsky-hud-cache-calendar .dot{display:inline-block;width:10px;height:10px;border-radius:999px;border:1px solid rgba(255,255,255,.22)}
       #bsky-hud-cache-calendar .dot.full{background:#19b34a}
@@ -113,9 +113,9 @@ function ensureHudCacheCalendarModal() {
       #bsky-hud-cache-calendar .dot.empty{background:#ef4444}
       #bsky-hud-cache-calendar .dot.pre{background:#444;opacity:.65}
       #bsky-hud-cache-calendar .grid{display:grid;grid-template-columns:repeat(7, 1fr);gap:8px}
-      #bsky-hud-cache-calendar .dow{color:#aaa;font-size:.8rem;text-align:center}
-      #bsky-hud-cache-calendar .day{display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:6px;padding:6px 4px;border:1px solid #333;border-radius: var(--bsky-radius, 0px);background:#0f0f0f;min-height:64px;cursor:pointer;user-select:none}
-      #bsky-hud-cache-calendar .day:hover{border-color:#555;background:#121212}
+      #bsky-hud-cache-calendar .dow{color:var(--bsky-muted-fg, #aaa);font-size:.8rem;text-align:center}
+      #bsky-hud-cache-calendar .day{display:flex;flex-direction:column;align-items:center;justify-content:flex-start;gap:6px;padding:6px 4px;border:1px solid var(--bsky-border, #333);border-radius: var(--bsky-radius, 0px);background:var(--bsky-input-bg, #0f0f0f);min-height:64px;cursor:pointer;user-select:none}
+      #bsky-hud-cache-calendar .day:hover{border-color:var(--bsky-border-soft, #555);background:var(--bsky-btn-bg, #121212)}
       #bsky-hud-cache-calendar .day.pre{opacity:.45;background:#050505;cursor:default}
       #bsky-hud-cache-calendar .day.future{opacity:.6}
       #bsky-hud-cache-calendar .ring{width:28px;height:28px;border-radius:999px;display:flex;align-items:center;justify-content:center;font-weight:900;color:#ddd;border:3px solid #666;background:rgba(0,0,0,.15)}
@@ -123,30 +123,30 @@ function ensureHudCacheCalendarModal() {
       #bsky-hud-cache-calendar .ring.orange{border-color:#f59e0b}
       #bsky-hud-cache-calendar .ring.red{border-color:#ef4444}
       #bsky-hud-cache-calendar .ring.pre{border-color:#222;color:#777;background:#000}
-      #bsky-hud-cache-calendar .counts{color:#aaa;font-size:.75rem;line-height:1.05;text-align:center}
-      #bsky-hud-cache-calendar .counts b{color:#ddd}
-      #bsky-hud-cache-calendar .msg{color:#bbb;font-size:.9rem}
-      #bsky-hud-cache-calendar .err{color:#f88}
+      #bsky-hud-cache-calendar .counts{color:var(--bsky-muted-fg, #aaa);font-size:.75rem;line-height:1.05;text-align:center}
+      #bsky-hud-cache-calendar .counts b{color:var(--bsky-fg, #ddd)}
+      #bsky-hud-cache-calendar .msg{color:var(--bsky-muted-fg, #bbb);font-size:.9rem}
+      #bsky-hud-cache-calendar .err{color:var(--bsky-danger-fg, #f88)}
 
       #bsky-hud-cache-calendar .daypanel{border-top:1px solid rgba(255,255,255,.10);padding-top:10px;margin-top:2px}
       #bsky-hud-cache-calendar .daypanel[hidden]{display:none}
       #bsky-hud-cache-calendar .daypanel .hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap}
       #bsky-hud-cache-calendar .daypanel .hdr .dt{font-weight:900}
       #bsky-hud-cache-calendar .daypanel .btns{display:flex;gap:8px;flex-wrap:wrap}
-      #bsky-hud-cache-calendar .daypanel button{appearance:none;background:#111;border:1px solid #333;color:#fff;border-radius: var(--bsky-radius, 0px);padding:8px 10px;cursor:pointer;font-weight:900}
+      #bsky-hud-cache-calendar .daypanel button{appearance:none;background:var(--bsky-btn-bg, #111);border:1px solid var(--bsky-border, #333);color:var(--bsky-fg, #fff);border-radius: var(--bsky-radius, 0px);padding:8px 10px;cursor:pointer;font-weight:900}
       #bsky-hud-cache-calendar .daypanel button:hover{background:#1b1b1b}
       #bsky-hud-cache-calendar .daypanel button:disabled{opacity:.6;cursor:not-allowed}
       #bsky-hud-cache-calendar .cols{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:10px;margin-top:10px}
-      #bsky-hud-cache-calendar .card2{border:1px solid #333;border-radius: var(--bsky-radius, 0px);padding:10px;background:#0f0f0f}
+      #bsky-hud-cache-calendar .card2{border:1px solid var(--bsky-border, #333);border-radius: var(--bsky-radius, 0px);padding:10px;background:var(--bsky-input-bg, #0f0f0f)}
       #bsky-hud-cache-calendar .card2 h4{margin:0 0 6px 0;font-size:1rem}
       #bsky-hud-cache-calendar .list{display:flex;flex-direction:column;gap:6px;max-height:280px;overflow:auto;padding-right:4px}
-      #bsky-hud-cache-calendar .item{display:flex;gap:8px;align-items:flex-start;border:1px solid #2b2b2b;border-radius: var(--bsky-radius, 0px);padding:6px;background:#101010}
-      #bsky-hud-cache-calendar .item .t{color:#ddd;font-weight:900}
-      #bsky-hud-cache-calendar .item .s{color:#bbb;font-size:.85rem;line-height:1.2}
+      #bsky-hud-cache-calendar .item{display:flex;gap:8px;align-items:flex-start;border:1px solid var(--bsky-border, #2b2b2b);border-radius: var(--bsky-radius, 0px);padding:6px;background:var(--bsky-surface-2, #101010)}
+      #bsky-hud-cache-calendar .item .t{color:var(--bsky-fg, #ddd);font-weight:900}
+      #bsky-hud-cache-calendar .item .s{color:var(--bsky-muted-fg, #bbb);font-size:.85rem;line-height:1.2}
       #bsky-hud-cache-calendar .item a{color:#9cd3ff;text-decoration:none}
       #bsky-hud-cache-calendar .item a:hover{text-decoration:underline}
-      #bsky-hud-cache-calendar .av{width:28px;height:28px;border-radius: var(--bsky-radius, 0px);background:#222;object-fit:cover;flex:0 0 auto}
-      #bsky-hud-cache-calendar .muted{color:#aaa}
+      #bsky-hud-cache-calendar .av{width:28px;height:28px;border-radius: var(--bsky-radius, 0px);background:var(--bsky-surface-2, #222);object-fit:cover;flex:0 0 auto}
+      #bsky-hud-cache-calendar .muted{color:var(--bsky-muted-fg, #aaa)}
       #bsky-hud-cache-calendar .chip{background:#1d2a41;color:#cfe5ff;border:1px solid #2f4b7a;border-radius: var(--bsky-radius, 0px);padding:1px 6px;font-size:.72rem;font-weight:900;margin-left:6px}
     `;
     document.head.appendChild(style);

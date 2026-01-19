@@ -250,7 +250,7 @@ class BskyCacheStatus extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         :host{display:block;margin-bottom:${(compact || summary) ? '0' : '16px'}}
-        .card{background:#0b0b0b;border:1px solid #333;border-radius:10px;padding:${compact ? '8px' : '10px'};color:#fff}
+        .card{background:var(--bsky-surface, #0b0b0b);border:1px solid var(--bsky-border, #333);border-radius:10px;padding:${compact ? '8px' : '10px'};color:var(--bsky-fg, #fff)}
         .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
         .row.compact{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:8px;align-items:stretch}
         .row.compact .title{grid-column:1/-1}
@@ -258,21 +258,21 @@ class BskyCacheStatus extends HTMLElement {
         .row.compact .pill{grid-column:1/2}
         .row.compact .btn{width:100%}
         .title{font-weight:800}
-        .muted{color:#bbb}
+        .muted{color:var(--bsky-muted-fg, #bbb)}
         .countdown{display:inline-flex;gap:8px;align-items:center}
         /* Always 2 columns (fits 350px mobile) */
         .grid{display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:10px;margin-top:10px}
-        .box{border:1px solid #222;border-radius:10px;padding:10px;background:#090909}
-        .k{font-size:.85rem;color:#aaa}
+        .box{border:1px solid var(--bsky-border-subtle, #222);border-radius:10px;padding:10px;background:var(--bsky-surface-2, #090909)}
+        .k{font-size:.85rem;color:var(--bsky-muted-fg, #aaa)}
         .v{font-weight:700;margin-top:2px}
-        .pill{display:inline-flex;gap:6px;align-items:center;border:1px solid #222;border-radius:999px;padding:4px 10px;background:#111;color:#ddd;font-size:.9rem}
-        .btn{appearance:none;border:1px solid #333;background:#111;color:#fff;border-radius:999px;padding:8px 12px;font-weight:700;cursor:pointer}
+        .pill{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--bsky-border-subtle, #222);border-radius:999px;padding:4px 10px;background:var(--bsky-btn-bg, #111);color:var(--bsky-muted-fg, #ddd);font-size:.9rem}
+        .btn{appearance:none;border:1px solid var(--bsky-border, #333);background:var(--bsky-btn-bg, #111);color:var(--bsky-fg, #fff);border-radius:999px;padding:8px 12px;font-weight:700;cursor:pointer}
         .btn[disabled]{opacity:.6;cursor:not-allowed}
         .btn.primary{background:#1d2a41;border-color:#2f4b7a}
         .flash{margin-top:10px;border-radius:10px;padding:8px 10px;font-weight:700}
         .flash[data-kind="ok"]{background:#0f1d12;border:1px solid #2a6b3a;color:#bff2c8}
         .flash[data-kind="error"]{background:#2a0f10;border:1px solid #6b2a2a;color:#ffc7c7}
-        .spinner{display:inline-block;width:12px;height:12px;border:2px solid #555;border-top-color:#fff;border-radius:50%;animation:spin .9s linear infinite}
+        .spinner{display:inline-block;width:12px;height:12px;border:2px solid var(--bsky-border-soft, #555);border-top-color:var(--bsky-fg, #fff);border-radius:50%;animation:var(--bsky-spinner-animation, spin .9s linear infinite)}
         @keyframes spin{to{transform:rotate(360deg)}}
       </style>
       <div class="card">

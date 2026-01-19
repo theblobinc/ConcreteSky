@@ -50,6 +50,98 @@ export function debounce(fn, ms = 200) {
   };
 }
 
+// Centralized toast reporting hook.
+// Panels/components can emit a toast without importing app internals.
+export function dispatchToast(scope, { message, kind = 'info', timeoutMs = 5000 } = {}) {
+  try {
+    const msg = String(message || '').trim();
+    if (!msg) return;
+    const k = String(kind || 'info').trim() || 'info';
+    const ms = Number(timeoutMs);
+    scope?.dispatchEvent?.(new CustomEvent('bsky-toast', {
+      detail: {
+        message: msg,
+        kind: k,
+        timeoutMs: Number.isFinite(ms) ? ms : 5000,
+      },
+      bubbles: true,
+      composed: true,
+    }));
+  } catch {
+    // ignore
+  }
+}
+
+// Persist/restore scrollTop for a given scroller.
+// Useful when components re-render (shadowRoot.innerHTML) or when users switch tabs.
+// Default persistence is sessionStorage; opt into localStorage via opts.storage = 'local'.
+export function bindPersistedScrollTop(scroller, key, opts = {}) {
+  if (!scroller || !key) return () => {};
+
+  const storageMode = String(opts.storage || 'session');
+  const storage = (storageMode === 'local')
+    ? (typeof localStorage !== 'undefined' ? localStorage : null)
+    : (storageMode === 'session')
+      ? (typeof sessionStorage !== 'undefined' ? sessionStorage : null)
+      : null;
+
+  const storageKey = String(opts.storageKey || `bsky_panel_scroll_${String(key)}`);
+  const enabled = (typeof opts.enabled === 'function') ? opts.enabled : () => true;
+  const restore = (opts.restore !== false);
+  const debounceMs = Math.max(0, Number(opts.debounceMs ?? 120));
+
+  let t = null;
+
+  const read = () => {
+    try {
+      if (!storage) return null;
+      return storage.getItem(storageKey);
+    } catch {
+      return null;
+    }
+  };
+
+  const write = (v) => {
+    try {
+      if (!storage) return;
+      storage.setItem(storageKey, String(v));
+    } catch {
+      // ignore
+    }
+  };
+
+  if (restore) {
+    const raw = read();
+    const n = Number.parseInt(String(raw || ''), 10);
+    if (Number.isFinite(n) && n >= 0) {
+      requestAnimationFrame(() => {
+        try { scroller.scrollTop = Math.max(0, n); } catch {}
+        setTimeout(() => { try { scroller.scrollTop = Math.max(0, n); } catch {} }, 120);
+      });
+    }
+  }
+
+  const onScroll = () => {
+    try {
+      if (!enabled()) return;
+      if (!storage) return;
+      if (t) clearTimeout(t);
+      t = setTimeout(() => {
+        t = null;
+        write(scroller.scrollTop || 0);
+      }, debounceMs);
+    } catch {
+      // ignore
+    }
+  };
+
+  scroller.addEventListener('scroll', onScroll, { passive: true });
+  return () => {
+    try { scroller.removeEventListener('scroll', onScroll); } catch {}
+    if (t) { try { clearTimeout(t); } catch {} t = null; }
+  };
+}
+
 export function bindNearBottom(scroller, onNearBottom, opts = {}) {
   if (!scroller) return () => {};
   const threshold = Math.max(0, Number(opts.threshold ?? 220));
@@ -211,6 +303,37 @@ export function bindInfiniteScroll(scroller, loadMore, opts = {}) {
     try { unbind?.(); } catch {}
     try { anchorTracker?.disconnect?.(); } catch {}
   };
+}
+
+// Shared “list endcap” renderer used by panels to standardize:
+// - empty state
+// - loading-more state
+// - exhausted/end-of-list state
+export function renderListEndcap(opts = {}) {
+  const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[m]));
+
+  const loading = !!opts.loading;
+  const loadingMore = !!opts.loadingMore;
+  const hasMore = (opts.hasMore === undefined) ? true : !!opts.hasMore;
+  const count = Math.max(0, Number(opts.count || 0));
+
+  const emptyText = (opts.emptyText !== undefined) ? String(opts.emptyText) : 'No results.';
+  const loadingText = (opts.loadingText !== undefined) ? String(opts.loadingText) : 'Loading…';
+  const loadingMoreText = (opts.loadingMoreText !== undefined) ? String(opts.loadingMoreText) : 'Loading more…';
+  const endText = (opts.endText !== undefined) ? String(opts.endText) : "You're all caught up.";
+
+  const slot = opts.slot ? ` slot="${esc(String(opts.slot))}"` : '';
+  const cls = esc(String(opts.className || 'muted endcap'));
+  const style = opts.style ? ` style="${esc(String(opts.style))}"` : '';
+
+  let msg = '';
+  if (loadingMore) msg = loadingMoreText;
+  else if (count === 0) msg = loading ? loadingText : emptyText;
+  else if (!hasMore) msg = endText;
+  else msg = '';
+
+  if (!msg) return '';
+  return `<div${slot} class="${cls}" role="status" aria-live="polite"${style}>${esc(msg)}</div>`;
 }
 
 // --- Scroll stability helpers (shared across panels, cards, and bars) ---
@@ -559,5 +682,6 @@ import content from './templates/content.js';
 import people from './templates/people.js';
 import groups from './templates/groups.js';
 import group from './templates/group.js';
+import search from './templates/search.js';
 
-[posts, connections, notifications, content, people, groups, group].forEach(registerPanelTemplate);
+[posts, connections, notifications, content, people, groups, group, search].forEach(registerPanelTemplate);

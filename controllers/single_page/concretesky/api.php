@@ -27,7 +27,7 @@ class Api extends ParentController
      * Bump this when the cache schema/migration logic changes.
      * Stored in meta as __global__:schema_version so we can skip costly PRAGMA checks on every request.
      */
-    protected const CACHE_SCHEMA_VERSION = '2026-01-18-9';
+    protected const CACHE_SCHEMA_VERSION = '2026-01-19-1';
 
     protected static bool $envLoaded = false;
 
@@ -1501,6 +1501,17 @@ class Api extends ParentController
                     $pdo = $this->cacheDb();
                     $this->cacheMigrate($pdo);
 
+                    // If user was directly invited, joining should accept that invite.
+                    $wasInvited = false;
+                    try {
+                        $stCur = $pdo->prepare('SELECT state FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stCur->execute([':g' => $groupId, ':did' => $meDid]);
+                        $curState = (string)($stCur->fetchColumn() ?: '');
+                        if ($curState === 'invited') $wasInvited = true;
+                    } catch (\Throwable $e) {
+                        $wasInvited = false;
+                    }
+
                     // Banned users cannot re-join.
                     try {
                         $stBan = $pdo->prepare('SELECT state, banned_at FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
@@ -1542,6 +1553,10 @@ class Api extends ParentController
                         // Invite bypasses pending (MVP).
                         $state = 'member';
                     }
+                    if ($wasInvited) {
+                        // Direct invitation (site-local) bypasses pending.
+                        $state = 'member';
+                    }
 
                     $pdo->beginTransaction();
                     try {
@@ -1578,12 +1593,71 @@ class Api extends ParentController
                             ]);
                         }
 
+                        if ($wasInvited) {
+                            $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                                VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                                ':g' => $groupId,
+                                ':a' => $meDid,
+                                ':act' => 'group.invite.accept',
+                                ':sub' => $meDid,
+                                ':det' => json_encode(['via' => 'direct'], JSON_UNESCAPED_SLASHES),
+                                ':t' => $now,
+                            ]);
+                        }
+
                         $pdo->commit();
                     } catch (\Throwable $e) {
                         $pdo->rollBack();
                         throw $e;
                     }
                     return $this->json(['ok' => true, 'state' => $state]);
+                }
+
+                case 'groupInviteAccept': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    if ($groupId <= 0) return $this->json(['error' => 'Missing groupId'], 400);
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $stG = $pdo->prepare('SELECT 1 FROM groups WHERE group_id = :g LIMIT 1');
+                    $stG->execute([':g' => $groupId]);
+                    if (!$stG->fetchColumn()) return $this->json(['error' => 'Group not found'], 404);
+
+                    $stHave = $pdo->prepare('SELECT state, banned_at FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                    $stHave->execute([':g' => $groupId, ':did' => $meDid]);
+                    $row = $stHave->fetch(\PDO::FETCH_ASSOC);
+                    if (!$row) return $this->json(['error' => 'Invite not found'], 404);
+                    $state = (string)($row['state'] ?? '');
+                    $bannedAt = (string)($row['banned_at'] ?? '');
+                    if ($state === 'blocked' || $bannedAt !== '') return $this->json(['error' => 'You are banned from this group'], 403);
+                    if ($state !== 'invited') return $this->json(['error' => 'No pending invite to accept'], 409);
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $pdo->prepare('UPDATE group_members SET state = "member", joined_at = COALESCE(joined_at, :t), updated_at = :t WHERE group_id = :g AND member_did = :did')
+                            ->execute([':t' => $now, ':g' => $groupId, ':did' => $meDid]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $meDid,
+                            ':act' => 'group.invite.accept',
+                            ':sub' => $meDid,
+                            ':det' => json_encode(['via' => 'direct'], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true, 'groupId' => $groupId, 'state' => 'member']);
                 }
 
                 case 'groupLeave': {
@@ -1794,6 +1868,408 @@ class Api extends ParentController
                     }
 
                     return $this->json(['ok' => true, 'groupId' => $groupId, 'format' => 'json', 'filename' => $filename, 'items' => $items, 'count' => count($items)]);
+                }
+
+                case 'groupPinsList': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    if ($groupId <= 0) return $this->json(['error' => 'Missing groupId'], 400);
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $stG = $pdo->prepare('SELECT g.visibility,
+                        (SELECT gm.state FROM group_members gm WHERE gm.group_id = g.group_id AND gm.member_did = :me LIMIT 1) AS my_state
+                        FROM groups g WHERE g.group_id = :g LIMIT 1');
+                    $stG->execute([':g' => $groupId, ':me' => $meDid]);
+                    $g = $stG->fetch(\PDO::FETCH_ASSOC);
+                    if (!$g) return $this->json(['error' => 'Group not found'], 404);
+                    $vis = (string)($g['visibility'] ?? 'public');
+                    if (!in_array($vis, ['public', 'closed', 'secret'], true)) $vis = 'public';
+                    $myState = (string)($g['my_state'] ?? '');
+                    if (!$meIsSuper && $vis !== 'public' && $myState !== 'member') {
+                        return $this->json(['error' => 'Membership required'], 403);
+                    }
+
+                    $st = $pdo->prepare('SELECT post_uri, pinned_by_did, pinned_at, sort_order, is_announcement, note
+                        FROM group_pins
+                        WHERE group_id = :g
+                        ORDER BY COALESCE(sort_order, 0) ASC, pinned_at DESC');
+                    $st->execute([':g' => $groupId]);
+                    $items = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+                    return $this->json(['ok' => true, 'groupId' => $groupId, 'items' => $items]);
+                }
+
+                case 'groupPinAdd': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $postUri = trim((string)($params['postUri'] ?? ''));
+                    $isAnnouncement = !empty($params['isAnnouncement']);
+                    $note = trim((string)($params['note'] ?? ''));
+                    if ($groupId <= 0 || $postUri === '') return $this->json(['error' => 'Missing groupId or postUri'], 400);
+                    if (strlen($postUri) > 1024) return $this->json(['error' => 'postUri too long'], 400);
+                    if (strlen($note) > 2000) $note = substr($note, 0, 2000);
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $stG = $pdo->prepare('SELECT 1 FROM groups WHERE group_id = :g LIMIT 1');
+                    $stG->execute([':g' => $groupId]);
+                    if (!$stG->fetchColumn()) return $this->json(['error' => 'Group not found'], 404);
+
+                    $myRole = '';
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $myRole = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($myRole, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Moderator required'], 403);
+                        }
+                        if ($isAnnouncement && $myRole !== 'admin') {
+                            return $this->json(['error' => 'Admin required for announcements'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $stCount = $pdo->prepare('SELECT COUNT(1) FROM group_pins WHERE group_id = :g');
+                        $stCount->execute([':g' => $groupId]);
+                        $cnt = (int)($stCount->fetchColumn() ?: 0);
+
+                        $stMax = $pdo->prepare('SELECT COALESCE(MAX(sort_order), -1) FROM group_pins WHERE group_id = :g');
+                        $stMax->execute([':g' => $groupId]);
+                        $nextOrder = (int)($stMax->fetchColumn() ?: -1) + 1;
+
+                        $stExists = $pdo->prepare('SELECT 1 FROM group_pins WHERE group_id = :g AND post_uri = :u LIMIT 1');
+                        $stExists->execute([':g' => $groupId, ':u' => $postUri]);
+                        $exists = (bool)$stExists->fetchColumn();
+                        if (!$exists && $cnt >= 5) {
+                            $pdo->rollBack();
+                            return $this->json(['error' => 'Pin limit reached (5)'], 409);
+                        }
+
+                        $pdo->prepare('INSERT INTO group_pins(group_id, post_uri, pinned_by_did, pinned_at, sort_order, is_announcement, note)
+                            VALUES(:g,:u,:by,:t,:ord,:ann,:note)
+                            ON CONFLICT(group_id, post_uri) DO UPDATE SET pinned_by_did=excluded.pinned_by_did, pinned_at=excluded.pinned_at, sort_order=excluded.sort_order, is_announcement=excluded.is_announcement, note=excluded.note')
+                            ->execute([
+                                ':g' => $groupId,
+                                ':u' => $postUri,
+                                ':by' => $actorDid,
+                                ':t' => $now,
+                                ':ord' => $nextOrder,
+                                ':ann' => $isAnnouncement ? 1 : 0,
+                                ':note' => ($note === '' ? null : $note),
+                            ]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $actorDid,
+                            ':act' => 'group.pin.add',
+                            ':sub' => $postUri,
+                            ':det' => json_encode(['isAnnouncement' => $isAnnouncement ? true : false], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true]);
+                }
+
+                case 'groupPinUpdate': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $postUri = trim((string)($params['postUri'] ?? ''));
+                    $note = array_key_exists('note', $params) ? (string)($params['note'] ?? '') : null;
+                    $setAnnouncement = array_key_exists('isAnnouncement', $params);
+                    $isAnnouncement = !empty($params['isAnnouncement']);
+                    if ($groupId <= 0 || $postUri === '') return $this->json(['error' => 'Missing groupId or postUri'], 400);
+                    if ($note !== null && strlen($note) > 2000) $note = substr($note, 0, 2000);
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $stG = $pdo->prepare('SELECT 1 FROM groups WHERE group_id = :g LIMIT 1');
+                    $stG->execute([':g' => $groupId]);
+                    if (!$stG->fetchColumn()) return $this->json(['error' => 'Group not found'], 404);
+
+                    $myRole = '';
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $myRole = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($myRole, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Moderator required'], 403);
+                        }
+                        if ($setAnnouncement && $myRole !== 'admin') {
+                            return $this->json(['error' => 'Admin required for announcements'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $stHave = $pdo->prepare('SELECT is_announcement, note FROM group_pins WHERE group_id = :g AND post_uri = :u LIMIT 1');
+                        $stHave->execute([':g' => $groupId, ':u' => $postUri]);
+                        $row = $stHave->fetch(\PDO::FETCH_ASSOC);
+                        if (!$row) {
+                            $pdo->rollBack();
+                            return $this->json(['error' => 'Pin not found'], 404);
+                        }
+
+                        $parts = [];
+                        $bind = [':g' => $groupId, ':u' => $postUri];
+                        if ($note !== null) {
+                            $parts[] = 'note = :note';
+                            $bind[':note'] = (trim($note) === '') ? null : $note;
+                        }
+                        if ($setAnnouncement) {
+                            $parts[] = 'is_announcement = :ann';
+                            $bind[':ann'] = $isAnnouncement ? 1 : 0;
+                        }
+                        if (!$parts) {
+                            $pdo->rollBack();
+                            return $this->json(['ok' => true, 'updated' => 0]);
+                        }
+
+                        $sql = 'UPDATE group_pins SET ' . implode(', ', $parts) . ' WHERE group_id = :g AND post_uri = :u';
+                        $pdo->prepare($sql)->execute($bind);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $actorDid,
+                            ':act' => 'group.pin.update',
+                            ':sub' => $postUri,
+                            ':det' => json_encode(['note' => $note, 'setAnnouncement' => $setAnnouncement ? true : false], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true, 'updated' => 1]);
+                }
+
+                case 'groupPinsReorder': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $order = $params['order'] ?? null;
+                    if ($groupId <= 0 || !is_array($order)) return $this->json(['error' => 'Missing groupId or order[]'], 400);
+                    $order = array_values(array_unique(array_filter(array_map('strval', $order))));
+                    if (!$order) return $this->json(['error' => 'Missing order[]'], 400);
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $stG = $pdo->prepare('SELECT 1 FROM groups WHERE group_id = :g LIMIT 1');
+                    $stG->execute([':g' => $groupId]);
+                    if (!$stG->fetchColumn()) return $this->json(['error' => 'Group not found'], 404);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $myRole = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($myRole, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Moderator required'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        // Existing pins in current display order.
+                        $stPins = $pdo->prepare('SELECT post_uri FROM group_pins WHERE group_id = :g ORDER BY COALESCE(sort_order, 0) ASC, pinned_at DESC');
+                        $stPins->execute([':g' => $groupId]);
+                        $existingOrdered = $stPins->fetchAll(\PDO::FETCH_COLUMN, 0) ?: [];
+                        $existingSet = array_fill_keys(array_map('strval', $existingOrdered), true);
+
+                        // Only keep URIs that currently exist as pins.
+                        $filtered = [];
+                        foreach ($order as $u) {
+                            if (isset($existingSet[$u])) $filtered[] = $u;
+                        }
+
+                        // Append remaining pins, preserving current order.
+                        $mentioned = array_fill_keys($filtered, true);
+                        $rest = [];
+                        foreach ($existingOrdered as $u) {
+                            $u = (string)$u;
+                            if (!isset($mentioned[$u])) $rest[] = $u;
+                        }
+
+                        $final = array_values(array_merge($filtered, $rest));
+                        $i = 0;
+                        $stUp = $pdo->prepare('UPDATE group_pins SET sort_order = :o WHERE group_id = :g AND post_uri = :u');
+                        foreach ($final as $u) {
+                            $stUp->execute([':o' => $i, ':g' => $groupId, ':u' => $u]);
+                            $i++;
+                        }
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $actorDid,
+                            ':act' => 'group.pin.reorder',
+                            ':sub' => null,
+                            ':det' => json_encode(['count' => count($final)], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true]);
+                }
+
+                case 'groupPinRemove': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $postUri = trim((string)($params['postUri'] ?? ''));
+                    if ($groupId <= 0 || $postUri === '') return $this->json(['error' => 'Missing groupId or postUri'], 400);
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $stG = $pdo->prepare('SELECT 1 FROM groups WHERE group_id = :g LIMIT 1');
+                    $stG->execute([':g' => $groupId]);
+                    if (!$stG->fetchColumn()) return $this->json(['error' => 'Group not found'], 404);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $myRole = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($myRole, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Moderator required'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $pdo->prepare('DELETE FROM group_pins WHERE group_id = :g AND post_uri = :u')
+                            ->execute([':g' => $groupId, ':u' => $postUri]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $actorDid,
+                            ':act' => 'group.pin.remove',
+                            ':sub' => $postUri,
+                            ':det' => null,
+                            ':t' => $now,
+                        ]);
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true]);
                 }
 
                 case 'groupPostSubmit': {
@@ -3546,7 +4022,8 @@ class Api extends ParentController
 
                         // Unban does not auto-rejoin; member can join again.
                         $pdo->prepare('UPDATE group_members
-                            SET state = "pending",
+                            SET state = "",
+                                role = "member",
                                 joined_at = NULL,
                                 banned_at = NULL,
                                 ban_note = NULL,
@@ -3576,6 +4053,256 @@ class Api extends ParentController
                         $pdo->rollBack();
                         throw $e;
                     }
+                }
+
+                case 'groupMemberInvite': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $memberDid = trim((string)($params['memberDid'] ?? ''));
+                    if ($groupId <= 0 || $memberDid === '') return $this->json(['error' => 'Missing groupId or memberDid'], 400);
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $stG = $pdo->prepare('SELECT 1 FROM groups WHERE group_id = :g LIMIT 1');
+                    $stG->execute([':g' => $groupId]);
+                    if (!$stG->fetchColumn()) return $this->json(['error' => 'Group not found'], 404);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $stHave = $pdo->prepare('SELECT state, banned_at FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stHave->execute([':g' => $groupId, ':did' => $memberDid]);
+                        $row = $stHave->fetch(\PDO::FETCH_ASSOC);
+                        if ($row) {
+                            $curState = (string)($row['state'] ?? '');
+                            $bannedAt = (string)($row['banned_at'] ?? '');
+                            if ($curState === 'member') {
+                                $pdo->rollBack();
+                                return $this->json(['error' => 'User is already a member'], 409);
+                            }
+                            if ($curState === 'blocked' || $bannedAt !== '') {
+                                $pdo->rollBack();
+                                return $this->json(['error' => 'User is blocked/banned'], 409);
+                            }
+                        }
+
+                        $pdo->prepare('INSERT INTO group_members(group_id, member_did, state, role, joined_at, created_at, updated_at)
+                            VALUES(:g,:did,"invited","member",NULL,:t,:t)
+                            ON CONFLICT(group_id, member_did) DO UPDATE SET state=excluded.state, role=excluded.role, joined_at=NULL, updated_at=excluded.updated_at')
+                            ->execute([':g' => $groupId, ':did' => $memberDid, ':t' => $now]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $actorDid,
+                            ':act' => 'group.member.invite',
+                            ':sub' => $memberDid,
+                            ':det' => null,
+                            ':t' => $now,
+                        ]);
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true, 'groupId' => $groupId, 'memberDid' => $memberDid, 'state' => 'invited']);
+                }
+
+                case 'groupMemberInviteRevoke': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $memberDid = trim((string)($params['memberDid'] ?? ''));
+                    if ($groupId <= 0 || $memberDid === '') return $this->json(['error' => 'Missing groupId or memberDid'], 400);
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $stG = $pdo->prepare('SELECT 1 FROM groups WHERE group_id = :g LIMIT 1');
+                    $stG->execute([':g' => $groupId]);
+                    if (!$stG->fetchColumn()) return $this->json(['error' => 'Group not found'], 404);
+
+                    if (!$meIsSuper) {
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $role = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || !in_array($role, ['admin', 'moderator'], true)) {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $stHave = $pdo->prepare('SELECT state FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stHave->execute([':g' => $groupId, ':did' => $memberDid]);
+                        $curState = $stHave->fetchColumn();
+                        if ($curState === false) {
+                            $pdo->rollBack();
+                            return $this->json(['error' => 'Membership not found'], 404);
+                        }
+                        $curState = (string)$curState;
+                        if ($curState !== 'invited') {
+                            $pdo->rollBack();
+                            return $this->json(['error' => 'Not an invited member'], 409);
+                        }
+
+                        $pdo->prepare('DELETE FROM group_members WHERE group_id = :g AND member_did = :did')
+                            ->execute([':g' => $groupId, ':did' => $memberDid]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $actorDid,
+                            ':act' => 'group.member.invite.revoke',
+                            ':sub' => $memberDid,
+                            ':det' => null,
+                            ':t' => $now,
+                        ]);
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true]);
+                }
+
+                case 'groupMemberSetRole': {
+                    $groupId = isset($params['groupId']) ? (int)$params['groupId'] : 0;
+                    $memberDid = trim((string)($params['memberDid'] ?? ''));
+                    $role = trim((string)($params['role'] ?? ''));
+                    if ($groupId <= 0 || $memberDid === '' || $role === '') return $this->json(['error' => 'Missing groupId, memberDid, or role'], 400);
+                    if (!in_array($role, ['member', 'moderator'], true)) return $this->json(['error' => 'Invalid role'], 400);
+
+                    $actorDid = (string)($session['did'] ?? '');
+                    if ($actorDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $meIsSuper = false;
+                    if (!empty($jwt['ok']) && !empty($jwt['isSuper'])) {
+                        $meIsSuper = true;
+                    } else {
+                        try {
+                            $u = new User();
+                            if ($u->isRegistered()) {
+                                $ui = UserInfo::getByID((int)$u->getUserID());
+                                $meIsSuper = $ui && method_exists($ui, 'isSuperUser') ? (bool)$ui->isSuperUser() : false;
+                            }
+                        } catch (\Throwable $e) {
+                            $meIsSuper = false;
+                        }
+                    }
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $stG = $pdo->prepare('SELECT 1 FROM groups WHERE group_id = :g LIMIT 1');
+                    $stG->execute([':g' => $groupId]);
+                    if (!$stG->fetchColumn()) return $this->json(['error' => 'Group not found'], 404);
+
+                    if (!$meIsSuper) {
+                        // Role management is admin-only (moderators can't promote/demote).
+                        $stRole = $pdo->prepare('SELECT gm.state, gm.role FROM group_members gm WHERE gm.group_id = :g AND gm.member_did = :me LIMIT 1');
+                        $stRole->execute([':g' => $groupId, ':me' => $actorDid]);
+                        $mr = $stRole->fetch(\PDO::FETCH_ASSOC);
+                        $state = (string)($mr['state'] ?? '');
+                        $myRole = (string)($mr['role'] ?? '');
+                        if ($state !== 'member' || $myRole !== 'admin') {
+                            return $this->json(['error' => 'Admin required'], 403);
+                        }
+                    }
+
+                    $now = gmdate('c');
+                    $pdo->beginTransaction();
+                    try {
+                        $stHave = $pdo->prepare('SELECT state, role FROM group_members WHERE group_id = :g AND member_did = :did LIMIT 1');
+                        $stHave->execute([':g' => $groupId, ':did' => $memberDid]);
+                        $row = $stHave->fetch(\PDO::FETCH_ASSOC);
+                        if (!$row) {
+                            $pdo->rollBack();
+                            return $this->json(['error' => 'Membership not found'], 404);
+                        }
+                        $curState = (string)($row['state'] ?? '');
+                        $curRole = (string)($row['role'] ?? '');
+                        if ($curState === 'blocked') {
+                            $pdo->rollBack();
+                            return $this->json(['error' => 'Member is blocked'], 409);
+                        }
+                        if ($curRole === $role) {
+                            $pdo->rollBack();
+                            return $this->json(['ok' => true, 'updated' => 0]);
+                        }
+
+                        $pdo->prepare('UPDATE group_members SET role = :r, updated_at = :t WHERE group_id = :g AND member_did = :did')
+                            ->execute([':r' => $role, ':t' => $now, ':g' => $groupId, ':did' => $memberDid]);
+
+                        $pdo->prepare('INSERT INTO group_audit(group_id, actor_did, action, subject, detail, created_at)
+                            VALUES(:g,:a,:act,:sub,:det,:t)')->execute([
+                            ':g' => $groupId,
+                            ':a' => $actorDid,
+                            ':act' => 'group.member.role.set',
+                            ':sub' => $memberDid,
+                            ':det' => json_encode(['prevRole' => $curRole, 'role' => $role], JSON_UNESCAPED_SLASHES),
+                            ':t' => $now,
+                        ]);
+
+                        $pdo->commit();
+                    } catch (\Throwable $e) {
+                        $pdo->rollBack();
+                        throw $e;
+                    }
+
+                    return $this->json(['ok' => true, 'updated' => 1]);
                 }
 
                 case 'groupInviteCreate': {
@@ -3803,6 +4530,92 @@ class Api extends ParentController
                         // ignore
                     }
                     return $this->json($prof);
+
+                case 'profileUpdate': {
+                    // Update the current actor's profile record.
+                    // Uses com.atproto.repo.putRecord on collection app.bsky.actor.profile with rkey "self".
+                    // Params (all optional):
+                    // - displayName: string|null (empty string clears)
+                    // - description: string|null (empty string clears)
+                    // - avatarBlob: object|null (blob ref from uploadBlob)
+                    // - bannerBlob: object|null (blob ref from uploadBlob)
+                    // - clearAvatar: bool
+                    // - clearBanner: bool
+
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $displayNameIn = $params['displayName'] ?? null;
+                    $descriptionIn = $params['description'] ?? null;
+
+                    $avatarBlob = $params['avatarBlob'] ?? null;
+                    $bannerBlob = $params['bannerBlob'] ?? null;
+
+                    $clearAvatar = !empty($params['clearAvatar']);
+                    $clearBanner = !empty($params['clearBanner']);
+
+                    // Load existing record to preserve unknown fields where possible.
+                    $existing = null;
+                    try {
+                        $existing = $this->xrpcSession('GET', 'com.atproto.repo.getRecord', $session, [
+                            'repo' => $meDid,
+                            'collection' => 'app.bsky.actor.profile',
+                            'rkey' => 'self',
+                        ]);
+                    } catch (\Throwable $e) {
+                        $existing = null;
+                    }
+
+                    $record = [];
+                    if (is_array($existing) && isset($existing['value']) && is_array($existing['value'])) {
+                        $record = $existing['value'];
+                    }
+                    if (!is_array($record)) $record = [];
+                    $record['$type'] = 'app.bsky.actor.profile';
+
+                    if ($displayNameIn !== null) {
+                        $dn = trim((string)$displayNameIn);
+                        if ($dn === '') unset($record['displayName']);
+                        else $record['displayName'] = $dn;
+                    }
+
+                    if ($descriptionIn !== null) {
+                        $desc = trim((string)$descriptionIn);
+                        if ($desc === '') unset($record['description']);
+                        else $record['description'] = $desc;
+                    }
+
+                    if ($clearAvatar) {
+                        unset($record['avatar']);
+                    } elseif (is_array($avatarBlob) && $avatarBlob) {
+                        $record['avatar'] = $avatarBlob;
+                    }
+
+                    if ($clearBanner) {
+                        unset($record['banner']);
+                    } elseif (is_array($bannerBlob) && $bannerBlob) {
+                        $record['banner'] = $bannerBlob;
+                    }
+
+                    $put = $this->xrpcSession('POST', 'com.atproto.repo.putRecord', $session, [], [
+                        'repo' => $meDid,
+                        'collection' => 'app.bsky.actor.profile',
+                        'rkey' => 'self',
+                        'record' => $record,
+                    ]);
+
+                    // Refresh profile + cache for immediate UI parity.
+                    $prof = $this->xrpcSession('GET', 'app.bsky.actor.getProfile', $session, ['actor' => $meDid]);
+                    try {
+                        $pdo = $this->cacheDb();
+                        $this->cacheMigrate($pdo);
+                        if (is_array($prof)) $this->cacheUpsertProfile($pdo, $prof);
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+
+                    return $this->json(['ok' => true, 'put' => $put, 'profile' => $prof]);
+                }
 
                 case 'getProfiles': { // batch with chunking (>25 safe)
                     $actors = $params['actors'] ?? [];
@@ -4043,6 +4856,122 @@ class Api extends ParentController
                     return $this->json($this->createRecord($session, 'app.bsky.feed.post', $record));
                 }
 
+                case 'schedulePost': {
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $scheduledAtIn = trim((string)($params['scheduledAt'] ?? ''));
+                    if ($scheduledAtIn === '') return $this->json(['error' => 'Missing scheduledAt'], 400);
+                    $ts = $this->parseIsoToTimestamp($scheduledAtIn);
+                    if ($ts === null) return $this->json(['error' => 'Invalid scheduledAt'], 400);
+
+                    $now = time();
+                    if ($ts <= ($now + 10)) {
+                        return $this->json(['error' => 'scheduledAt must be in the future'], 400);
+                    }
+
+                    $kind = strtolower(trim((string)($params['kind'] ?? 'post')));
+                    if ($kind !== 'post' && $kind !== 'thread') $kind = 'post';
+
+                    // We store a "ready-to-publish" payload (facets/embed already built client-side).
+                    $payload = ['v' => 1];
+                    $interactions = (isset($params['interactions']) && is_array($params['interactions'])) ? $params['interactions'] : null;
+                    if (is_array($interactions)) $payload['interactions'] = $interactions;
+
+                    if ($kind === 'thread') {
+                        $partsIn = (isset($params['parts']) && is_array($params['parts'])) ? $params['parts'] : [];
+                        $parts = [];
+                        foreach (array_slice($partsIn, 0, 10) as $p) {
+                            if (!is_array($p)) continue;
+                            $text = trim((string)($p['text'] ?? ''));
+                            if ($text === '') continue;
+                            $part = ['text' => $text];
+                            if (!empty($p['langs']) && is_array($p['langs'])) $part['langs'] = array_values($p['langs']);
+                            if (!empty($p['facets']) && is_array($p['facets'])) $part['facets'] = $p['facets'];
+                            if (!empty($p['embed']) && is_array($p['embed'])) $part['embed'] = $p['embed'];
+                            $parts[] = $part;
+                        }
+                        if (!$parts) return $this->json(['error' => 'Missing parts'], 400);
+                        $payload['parts'] = $parts;
+                    } else {
+                        $postIn = (isset($params['post']) && is_array($params['post'])) ? $params['post'] : null;
+                        if (!is_array($postIn)) return $this->json(['error' => 'Missing post'], 400);
+                        $text = trim((string)($postIn['text'] ?? ''));
+                        if ($text === '') return $this->json(['error' => 'Missing text'], 400);
+                        $post = ['text' => $text];
+                        if (!empty($postIn['langs']) && is_array($postIn['langs'])) $post['langs'] = array_values($postIn['langs']);
+                        if (!empty($postIn['facets']) && is_array($postIn['facets'])) $post['facets'] = $postIn['facets'];
+                        if (!empty($postIn['embed']) && is_array($postIn['embed'])) $post['embed'] = $postIn['embed'];
+                        $payload['post'] = $post;
+                    }
+
+                    $payloadJson = json_encode($payload, JSON_UNESCAPED_SLASHES);
+                    if ($payloadJson === false) return $this->json(['error' => 'Failed to encode payload'], 500);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $scheduledIso = gmdate('c', $ts);
+                    $nowIso = gmdate('c');
+
+                    $st = $pdo->prepare('INSERT INTO scheduled_posts(actor_did, state, kind, scheduled_at, payload_json, attempts, last_error, next_attempt_at, result_uri, result_cid, created_at, updated_at)
+                        VALUES(:a, "pending", :k, :s, :p, 0, NULL, NULL, NULL, NULL, :c, :u)');
+                    $st->execute([
+                        ':a' => $meDid,
+                        ':k' => $kind,
+                        ':s' => $scheduledIso,
+                        ':p' => $payloadJson,
+                        ':c' => $nowIso,
+                        ':u' => $nowIso,
+                    ]);
+
+                    $id = (int)$pdo->lastInsertId();
+                    return $this->json(['ok' => true, 'id' => $id, 'scheduledAt' => $scheduledIso, 'kind' => $kind]);
+                }
+
+                case 'listScheduledPosts': {
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+                    $limit = (int)($params['limit'] ?? 50);
+                    $includeDone = !empty($params['includeDone']);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+                    $items = $this->scheduledPostsListInternal($pdo, $meDid, $limit, $includeDone);
+                    return $this->json(['ok' => true, 'items' => $items]);
+                }
+
+                case 'cancelScheduledPost': {
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $id = (int)($params['id'] ?? 0);
+                    if ($id <= 0) return $this->json(['error' => 'Missing id'], 400);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $nowIso = gmdate('c');
+                    $st = $pdo->prepare('UPDATE scheduled_posts
+                        SET state="canceled", updated_at=:u
+                        WHERE actor_did=:a AND id=:id AND state IN ("pending","posting")');
+                    $st->execute([':u' => $nowIso, ':a' => $meDid, ':id' => $id]);
+
+                    return $this->json(['ok' => true, 'canceled' => $st->rowCount() > 0]);
+                }
+
+                case 'processScheduledPosts': {
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+                    $max = (int)($params['max'] ?? 25);
+
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $out = $this->processScheduledPostsInternal($pdo, $session, $meDid, $max);
+                    return $this->json($out);
+                }
+
                 case 'createThreadGate': {
                     // Create a threadgate record for a post (reply controls).
                     // NOTE: per lexicon, rkey of threadgate must match the post rkey.
@@ -4151,6 +5080,18 @@ class Api extends ParentController
                     return $this->json($this->deleteRecord($session, 'app.bsky.feed.repost', $rkey));
                 }
 
+                case 'listMyLikeRecords': {
+                    $limit = min(100, max(1, (int)($params['limit'] ?? 50)));
+                    $cursor = isset($params['cursor']) ? (string)$params['cursor'] : null;
+                    return $this->json($this->listRecords($session, 'app.bsky.feed.like', $limit, $cursor));
+                }
+
+                case 'listMyRepostRecords': {
+                    $limit = min(100, max(1, (int)($params['limit'] ?? 50)));
+                    $cursor = isset($params['cursor']) ? (string)$params['cursor'] : null;
+                    return $this->json($this->listRecords($session, 'app.bsky.feed.repost', $limit, $cursor));
+                }
+
                 /* ---- per-post context (for interactions modal) ---- */
 
                 case 'getLikes':
@@ -4198,6 +5139,139 @@ class Api extends ParentController
                             'cursor' => $params['cursor'] ?? null,
                         ]));
 
+                case 'getKnownFollowers': {
+                    // “Followers you know” parity.
+                    // Prefer app.bsky.graph.getKnownFollowers (if supported by the AppView).
+                    // Params:
+                    // - actor: did or handle (required)
+                    // - limit: max people to return (default 10, max 50)
+                    // - cursor: pass-through (only used for the native endpoint)
+                    // - pagesMax: fallback cap for pagination (default 10, max 50)
+                    $actor = trim((string)($params['actor'] ?? ''));
+                    if ($actor === '') return $this->json(['error' => 'Missing actor'], 400);
+
+                    $limit = (int)($params['limit'] ?? 10);
+                    if ($limit < 1) $limit = 1;
+                    if ($limit > 50) $limit = 50;
+
+                    $cursor = isset($params['cursor']) ? (string)$params['cursor'] : null;
+                    $pagesMax = (int)($params['pagesMax'] ?? 10);
+                    if ($pagesMax < 1) $pagesMax = 1;
+                    if ($pagesMax > 50) $pagesMax = 50;
+
+                    // 1) Native endpoint.
+                    try {
+                        $res = $this->xrpcSession('GET', 'app.bsky.graph.getKnownFollowers', $session, [
+                            'actor' => $actor,
+                            'limit' => $limit,
+                            'cursor' => $cursor,
+                        ]);
+                        if (is_array($res)) {
+                            $res['ok'] = true;
+                            $res['source'] = 'app.bsky.graph.getKnownFollowers';
+                        }
+                        return $this->json($res);
+                    } catch (\Throwable $e) {
+                        // fallback below
+                    }
+
+                    // 2) Best-effort fallback: intersect actor followers with viewer's following set.
+                    $meDid = (string)($session['did'] ?? '');
+                    if ($meDid === '') return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $myFollowing = [];
+                    $warnings = [];
+
+                    // Prefer SQLite cache for viewer following set.
+                    try {
+                        $pdo = $this->cacheDb();
+                        $this->cacheMigrate($pdo);
+                        $snap = $this->cacheMetaGet($pdo, $meDid, 'last_snapshot_following');
+                        $sid = $snap ? (int)$snap : 0;
+                        if ($sid > 0) {
+                            $st = $pdo->prepare('SELECT other_did FROM edges WHERE snapshot_id = :sid AND kind = "following"');
+                            $st->execute([':sid' => $sid]);
+                            $myFollowing = array_values(array_unique(array_filter(array_map('strval', $st->fetchAll(\PDO::FETCH_COLUMN) ?: []))));
+                        } else {
+                            $warnings[] = 'No cached following snapshot. Run cacheSync to improve fallback results.';
+                        }
+                    } catch (\Throwable $e) {
+                        $warnings[] = 'SQLite cache unavailable for following set; using network fallback.';
+                        $myFollowing = [];
+                    }
+
+                    // If no cache following set, build from network (bounded).
+                    if (!$myFollowing) {
+                        $followSet = [];
+                        $cur = null;
+                        for ($i = 0; $i < $pagesMax; $i++) {
+                            $page = $this->xrpcSession('GET', 'app.bsky.graph.getFollows', $session, [
+                                'actor' => $meDid,
+                                'limit' => 100,
+                                'cursor' => $cur,
+                            ]);
+                            foreach (($page['follows'] ?? []) as $p) {
+                                $did = is_array($p) ? (string)($p['did'] ?? '') : '';
+                                if ($did !== '') $followSet[$did] = true;
+                            }
+                            $cur = isset($page['cursor']) ? (string)$page['cursor'] : null;
+                            if (!$cur) break;
+                        }
+                        $myFollowing = array_keys($followSet);
+                        if (!$myFollowing) {
+                            return $this->json([
+                                'ok' => false,
+                                'error' => 'Could not determine your following set (cache missing and network fallback returned none).',
+                                'warnings' => $warnings,
+                            ], 503);
+                        }
+                    }
+
+                    $myFollowingSet = array_fill_keys($myFollowing, true);
+
+                    $out = [];
+                    $cur = null;
+                    for ($i = 0; $i < $pagesMax && count($out) < $limit; $i++) {
+                        $page = $this->xrpcSession('GET', 'app.bsky.graph.getFollowers', $session, [
+                            'actor' => $actor,
+                            'limit' => 100,
+                            'cursor' => $cur,
+                        ]);
+                        $batch = $page['followers'] ?? [];
+                        foreach ($batch as $p) {
+                            if (!is_array($p)) continue;
+                            $did = (string)($p['did'] ?? '');
+                            if ($did === '' || empty($myFollowingSet[$did])) continue;
+                            $out[$did] = $p;
+                            if (count($out) >= $limit) break;
+                        }
+                        $cur = isset($page['cursor']) ? (string)$page['cursor'] : null;
+                        if (!$cur) break;
+                    }
+
+                    $followers = array_values($out);
+
+                    // Opportunistically store returned profiles for richer cache-first rendering elsewhere.
+                    try {
+                        $pdo = $this->cacheDb();
+                        $this->cacheMigrate($pdo);
+                        foreach ($followers as $p) {
+                            if (is_array($p)) $this->cacheUpsertProfile($pdo, $p);
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+
+                    return $this->json([
+                        'ok' => true,
+                        'source' => 'computed',
+                        'actor' => $actor,
+                        'followers' => $followers,
+                        'limit' => $limit,
+                        'warnings' => $warnings,
+                    ]);
+                }
+
                 case 'getBlocks':
                     return $this->json($this->xrpcSession('GET', 'app.bsky.graph.getBlocks',
                         $session, [
@@ -4219,6 +5293,64 @@ class Api extends ParentController
                             'limit'  => (int)($params['limit'] ?? 50),
                             'cursor' => $params['cursor'] ?? null,
                         ]));
+
+                case 'getList':
+                    // Fetch list details + members.
+                    // Params:
+                    // - list: at://... URI (preferred)
+                    // - limit/cursor
+                    $listUri = (string)($params['list'] ?? $params['uri'] ?? '');
+                    $listUri = trim($listUri);
+                    if ($listUri === '') return $this->json(['error' => 'Missing list'], 400);
+                    return $this->json($this->xrpcSession('GET', 'app.bsky.graph.getList',
+                        $session, [
+                            'list'   => $listUri,
+                            'limit'  => (int)($params['limit'] ?? 50),
+                            'cursor' => $params['cursor'] ?? null,
+                        ]));
+
+                case 'listsIncludingActor': {
+                    // Lists that include an actor (optional; only if server exposes a compatible endpoint).
+                    // Params:
+                    // - actor: did or handle
+                    // - limit/cursor
+                    $actor = trim((string)($params['actor'] ?? ''));
+                    if ($actor === '') $actor = (string)($session['did'] ?? '');
+                    if ($actor === '') return $this->json(['error' => 'Missing actor'], 400);
+
+                    $limit = (int)($params['limit'] ?? 50);
+                    $cursor = $params['cursor'] ?? null;
+
+                    $warnings = [];
+                    $attempts = [
+                        // Best-effort guesses; different appviews may expose different names.
+                        ['nsid' => 'app.bsky.graph.getListsContainingActor', 'params' => ['actor' => $actor, 'limit' => $limit, 'cursor' => $cursor]],
+                        ['nsid' => 'app.bsky.graph.getListsContainingActor', 'params' => ['did' => $actor, 'limit' => $limit, 'cursor' => $cursor]],
+                        ['nsid' => 'app.bsky.unspecced.getListsContainingActor', 'params' => ['actor' => $actor, 'limit' => $limit, 'cursor' => $cursor]],
+                    ];
+
+                    foreach ($attempts as $a) {
+                        try {
+                            $res = $this->xrpcSession('GET', (string)$a['nsid'], $session, (array)$a['params']);
+                            return $this->json([
+                                'ok' => true,
+                                'actor' => $actor,
+                                'source' => (string)$a['nsid'],
+                                'result' => $res,
+                                'warnings' => array_values(array_unique($warnings)),
+                            ]);
+                        } catch (\Throwable $e) {
+                            $warnings[] = 'Not available: ' . (string)$a['nsid'];
+                        }
+                    }
+
+                    return $this->json([
+                        'ok' => false,
+                        'actor' => $actor,
+                        'error' => 'This server does not expose a lists-including-actor endpoint.',
+                        'warnings' => array_values(array_unique($warnings)),
+                    ], 501);
+                }
 
                 case 'resolveHandles': {
                     // Batch resolve @handles to DIDs for richtext mention facets.
@@ -4501,6 +5633,18 @@ class Api extends ParentController
                     return $this->json($this->xrpcSession('POST', 'app.bsky.notification.updateSeen',
                         $session, [], ['seenAt' => $seenAt]));
 
+                case 'getNotificationPreferences':
+                    return $this->json($this->xrpcSession('GET', 'app.bsky.notification.getPreferences',
+                        $session, []));
+
+                case 'putNotificationPreferences': {
+                    if (!array_key_exists('priority', $params)) return $this->json(['error' => 'Missing priority'], 400);
+                    $priorityRaw = $params['priority'];
+                    $priority = (is_bool($priorityRaw)) ? $priorityRaw : ((int)$priorityRaw !== 0);
+                    return $this->json($this->xrpcSession('POST', 'app.bsky.notification.putPreferences',
+                        $session, [], ['priority' => $priority]));
+                }
+
                 case 'getInteractionStats':
                     // Aggregates likes/replies by DID across pages of notifications
                     $days  = max(1, (int)($params['days'] ?? 90));
@@ -4657,6 +5801,124 @@ class Api extends ParentController
                         'unique' => count($unique),
                         'processed' => $processed,
                         'status' => $status,
+                    ]);
+                }
+
+                case 'starterPackGet': {
+                    // Starter packs (if supported by server).
+                    // Params:
+                    // - input: starter pack URL (bsky.app) or at:// URI
+                    // - limit: member limit (best-effort; default 50)
+
+                    $input = trim((string)($params['input'] ?? ''));
+                    $limit = min(200, max(1, (int)($params['limit'] ?? 50)));
+                    if ($input === '') return $this->json(['error' => 'Missing input'], 400);
+
+                    $meDid = $session['did'] ?? null;
+                    if (!$meDid) return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    $normalize = static function (string $raw): ?string {
+                        $raw = trim($raw);
+                        if ($raw === '') return null;
+                        if (stripos($raw, 'at://') === 0) return $raw;
+
+                        // Accept bsky.app starter pack URLs.
+                        // Expected shapes (best-effort):
+                        // - https://bsky.app/starter-pack/{did}/{rkey}
+                        // - https://bsky.app/starter-pack/{handle}/{rkey}
+                        if (preg_match('~^https?://(?:www\.)?bsky\.app/starter-pack/([^/]+)/([^/?#]+)~i', $raw, $m)) {
+                            $actor = trim((string)$m[1]);
+                            $rkey = trim((string)$m[2]);
+                            if ($actor !== '' && $rkey !== '') {
+                                // NOTE: the collection name is best-effort; servers may accept this via getStarterPack.
+                                return 'at://' . $actor . '/app.bsky.graph.starterpack/' . $rkey;
+                            }
+                        }
+
+                        return null;
+                    };
+
+                    $uri = $normalize($input);
+                    if (!$uri) {
+                        return $this->json([
+                            'ok' => false,
+                            'error' => 'Unrecognized starter pack input. Paste a bsky.app starter pack URL or an at:// URI.',
+                        ], 400);
+                    }
+
+                    $raw = null;
+                    $members = null;
+                    $warnings = [];
+
+                    // Try common endpoints/parameter shapes.
+                    $attempts = [
+                        ['method' => 'GET', 'nsid' => 'app.bsky.graph.getStarterPack', 'params' => ['starterPack' => $uri]],
+                        ['method' => 'GET', 'nsid' => 'app.bsky.graph.getStarterPack', 'params' => ['uri' => $uri]],
+                    ];
+
+                    foreach ($attempts as $a) {
+                        try {
+                            $raw = $this->xrpcSession((string)$a['method'], (string)$a['nsid'], $session, (array)$a['params']);
+                            if ($raw) break;
+                        } catch (\Throwable $e) {
+                            $warnings[] = 'Starter pack endpoint not available: ' . (string)$a['nsid'];
+                        }
+                    }
+
+                    if (!$raw) {
+                        // Try a multi-fetch endpoint if present.
+                        try {
+                            $res = $this->xrpcSession('GET', 'app.bsky.graph.getStarterPacks', $session, ['uris' => [$uri]]);
+                            if (is_array($res) && !empty($res['starterPacks'][0])) {
+                                $raw = $res['starterPacks'][0];
+                            }
+                        } catch (\Throwable $e) {
+                            // ignore
+                        }
+                    }
+
+                    if (!$raw) {
+                        return $this->json([
+                            'ok' => false,
+                            'error' => 'Starter packs are not supported by this server.',
+                            'uri' => $uri,
+                            'warnings' => array_values(array_unique($warnings)),
+                        ], 501);
+                    }
+
+                    // Best-effort member list.
+                    if (isset($raw['members']) && is_array($raw['members'])) {
+                        $members = array_slice($raw['members'], 0, $limit);
+                    } elseif (isset($raw['items']) && is_array($raw['items'])) {
+                        $members = array_slice($raw['items'], 0, $limit);
+                    } else {
+                        // Some servers split members into a separate endpoint.
+                        $memberAttempts = [
+                            ['nsid' => 'app.bsky.graph.getStarterPackMembers', 'params' => ['starterPack' => $uri, 'limit' => $limit]],
+                            ['nsid' => 'app.bsky.graph.getStarterPackMembers', 'params' => ['uri' => $uri, 'limit' => $limit]],
+                        ];
+                        foreach ($memberAttempts as $a) {
+                            try {
+                                $mres = $this->xrpcSession('GET', (string)$a['nsid'], $session, (array)$a['params']);
+                                if (is_array($mres)) {
+                                    if (isset($mres['members']) && is_array($mres['members'])) $members = array_slice($mres['members'], 0, $limit);
+                                    elseif (isset($mres['items']) && is_array($mres['items'])) $members = array_slice($mres['items'], 0, $limit);
+                                    elseif (isset($mres['profiles']) && is_array($mres['profiles'])) $members = array_slice($mres['profiles'], 0, $limit);
+                                }
+                                if ($members !== null) break;
+                            } catch (\Throwable $e) {
+                                // ignore
+                            }
+                        }
+                    }
+
+                    return $this->json([
+                        'ok' => true,
+                        'uri' => $uri,
+                        'limit' => $limit,
+                        'starterPack' => $raw,
+                        'members' => $members,
+                        'warnings' => array_values(array_unique($warnings)),
                     ]);
                 }
 
@@ -5499,6 +6761,190 @@ class Api extends ParentController
                     return $this->json($out);
                 }
 
+                case 'trending': {
+                    // Trending view parity.
+                    // If a network trending endpoint is available, use it; otherwise approximate via cached aggregation.
+                    // Params:
+                    // - mode: 'network' | 'cache' (default 'cache')
+                    // - hours: cache window (default 168)
+                    // - limit: max items per section (default 20)
+                    // - maxPosts: max cached posts to scan (default 2000)
+
+                    $mode = (string)($params['mode'] ?? 'cache');
+                    if ($mode !== 'network') $mode = 'cache';
+
+                    $hours = min(24 * 365 * 5, max(1, (int)($params['hours'] ?? (24 * 7))));
+                    $limit = min(50, max(1, (int)($params['limit'] ?? 20)));
+                    $maxPosts = min(5000, max(100, (int)($params['maxPosts'] ?? 2000)));
+
+                    $meDid = $session['did'] ?? null;
+                    if (!$meDid) return $this->json(['error' => 'Could not determine session DID'], 500);
+
+                    // Try network endpoint if requested.
+                    if ($mode === 'network') {
+                        try {
+                            // Not all PDS/appviews expose these; treat as optional.
+                            // If this fails, we fall back to cache aggregation.
+                            $res = $this->xrpcSession('GET', 'app.bsky.unspecced.getTrendingTopics', $session, ['limit' => $limit]);
+                            $topics = (isset($res['topics']) && is_array($res['topics'])) ? $res['topics'] : [];
+
+                            $hashtags = [];
+                            foreach ($topics as $t) {
+                                $tag = trim((string)($t['topic'] ?? $t['tag'] ?? $t['name'] ?? ''));
+                                if ($tag === '') continue;
+                                if ($tag[0] !== '#') $tag = '#' . $tag;
+                                $count = (int)($t['count'] ?? $t['postsCount'] ?? 0);
+                                $hashtags[] = ['tag' => $tag, 'count' => $count];
+                            }
+
+                            return $this->json([
+                                'ok' => true,
+                                'mode' => 'network',
+                                'source' => 'network',
+                                'actorDid' => $meDid,
+                                'windowHours' => null,
+                                'limit' => $limit,
+                                'hashtags' => array_slice($hashtags, 0, $limit),
+                                'links' => [],
+                            ]);
+                        } catch (\Throwable $e) {
+                            // fall through
+                        }
+                    }
+
+                    // Cache aggregation fallback.
+                    $pdo = $this->cacheDb();
+                    $this->cacheMigrate($pdo);
+
+                    $cutoffIso = gmdate('c', time() - ($hours * 3600));
+
+                    $st = $pdo->prepare('SELECT text, raw_json FROM posts WHERE actor_did = :a AND created_at IS NOT NULL AND created_at >= :cut ORDER BY created_at DESC LIMIT :lim');
+                    $st->bindValue(':a', $meDid, \PDO::PARAM_STR);
+                    $st->bindValue(':cut', $cutoffIso, \PDO::PARAM_STR);
+                    $st->bindValue(':lim', $maxPosts, \PDO::PARAM_INT);
+                    $st->execute();
+                    $rows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+
+                    $tagCounts = [];
+                    $hostCounts = [];
+                    $hostSamples = [];
+
+                    $extractHosts = static function (string $text): array {
+                        $out = [];
+                        if ($text === '') return $out;
+                        if (preg_match_all('~https?://[^\s<>()"\\\\]+~i', $text, $m)) {
+                            foreach ($m[0] as $u) {
+                                $u = trim((string)$u);
+                                if ($u === '') continue;
+                                $out[] = $u;
+                            }
+                        }
+                        return $out;
+                    };
+
+                    $extractTags = static function (string $text): array {
+                        $out = [];
+                        if ($text === '') return $out;
+                        // Best-effort hashtag matcher; count Unicode letters/digits/marks/_.
+                        if (preg_match_all('/(^|[^\p{L}\p{M}\p{Nd}_])#([\p{L}\p{M}\p{Nd}_]{2,80})/u', $text, $m)) {
+                            foreach ($m[2] as $tag) {
+                                $tag = strtolower((string)$tag);
+                                if ($tag === '') continue;
+                                $out[] = $tag;
+                            }
+                        }
+                        return $out;
+                    };
+
+                    foreach ($rows as $r) {
+                        $text = trim((string)($r['text'] ?? ''));
+                        $raw = null;
+                        if ($text === '' || !empty($r['raw_json'])) {
+                            $raw = !empty($r['raw_json']) ? json_decode((string)$r['raw_json'], true) : null;
+                        }
+
+                        // Prefer cached posts.text; fall back to decoded record text.
+                        if ($text === '' && $raw) {
+                            $rec = $raw['post']['record'] ?? $raw['record'] ?? null;
+                            if (is_array($rec) && isset($rec['text'])) $text = trim((string)$rec['text']);
+                        }
+
+                        $postTags = array_values(array_unique($extractTags($text)));
+                        foreach ($postTags as $t) {
+                            $tagCounts[$t] = ($tagCounts[$t] ?? 0) + 1;
+                        }
+
+                        $urls = $extractHosts($text);
+
+                        // Also collect facet/embeds URLs when available.
+                        if ($raw) {
+                            try {
+                                $rec = $raw['post']['record'] ?? $raw['record'] ?? [];
+                                $facets = (isset($rec['facets']) && is_array($rec['facets'])) ? $rec['facets'] : [];
+                                foreach ($facets as $facet) {
+                                    $features = (isset($facet['features']) && is_array($facet['features'])) ? $facet['features'] : [];
+                                    foreach ($features as $feat) {
+                                        $u = (string)($feat['uri'] ?? '');
+                                        if ($u !== '' && (stripos($u, 'http://') === 0 || stripos($u, 'https://') === 0)) $urls[] = $u;
+                                    }
+                                }
+
+                                $embed = $raw['post']['embed'] ?? $rec['embed'] ?? null;
+                                if (is_array($embed)) {
+                                    $u = (string)($embed['external']['uri'] ?? '');
+                                    if ($u !== '' && (stripos($u, 'http://') === 0 || stripos($u, 'https://') === 0)) $urls[] = $u;
+                                }
+                            } catch (\Throwable $e) {
+                                // ignore
+                            }
+                        }
+
+                        $urls = array_values(array_unique(array_filter(array_map('strval', $urls))));
+                        foreach ($urls as $u) {
+                            $host = '';
+                            try {
+                                $parts = @parse_url($u);
+                                $host = isset($parts['host']) ? strtolower((string)$parts['host']) : '';
+                            } catch (\Throwable $e) {
+                                $host = '';
+                            }
+                            $host = preg_replace('/^www\./i', '', (string)$host);
+                            if (!$host) continue;
+                            $hostCounts[$host] = ($hostCounts[$host] ?? 0) + 1;
+                            if (!isset($hostSamples[$host])) $hostSamples[$host] = $u;
+                        }
+                    }
+
+                    arsort($tagCounts);
+                    arsort($hostCounts);
+
+                    $hashtags = [];
+                    foreach ($tagCounts as $t => $c) {
+                        $hashtags[] = ['tag' => '#' . $t, 'count' => (int)$c];
+                        if (count($hashtags) >= $limit) break;
+                    }
+
+                    $links = [];
+                    foreach ($hostCounts as $h => $c) {
+                        $links[] = ['host' => $h, 'count' => (int)$c, 'sampleUrl' => $hostSamples[$h] ?? null];
+                        if (count($links) >= $limit) break;
+                    }
+
+                    return $this->json([
+                        'ok' => true,
+                        'mode' => 'cache',
+                        'source' => 'cache',
+                        'actorDid' => $meDid,
+                        'windowHours' => $hours,
+                        'cutoff' => $cutoffIso,
+                        'limit' => $limit,
+                        'maxPosts' => $maxPosts,
+                        'scannedPosts' => count($rows),
+                        'hashtags' => $hashtags,
+                        'links' => $links,
+                    ]);
+                }
+
                 case 'cacheDbInspect': {
                     // Admin-only DB inspector.
                     $this->requireSuperUser($jwt);
@@ -5924,7 +7370,7 @@ class Api extends ParentController
                     // Params:
                     // - q: query string
                     // - mode: 'cache' | 'network'
-                    // - targets: ['people','posts','notifications']
+                    // - targets: ['people','posts','feeds','lists','notifications']
                     // - limit: per-target max results
                     // - hours: cache window for posts/notifications
                     // - postTypes: ['post','reply','repost'] (optional)
@@ -5936,9 +7382,9 @@ class Api extends ParentController
 
                     $targets = (isset($params['targets']) && is_array($params['targets']))
                         ? array_values(array_unique(array_map('strval', $params['targets'])))
-                        : ['people', 'posts', 'notifications'];
+                        : ['people', 'posts', 'feeds', 'notifications'];
                     $targets = array_values(array_filter($targets));
-                    if (!$targets) $targets = ['people', 'posts', 'notifications'];
+                    if (!$targets) $targets = ['people', 'posts', 'feeds', 'notifications'];
 
                     $limit = min(200, max(1, (int)($params['limit'] ?? 50)));
                     $hours = min(24 * 365 * 50, max(1, (int)($params['hours'] ?? (24 * 30))));
@@ -6110,16 +7556,84 @@ class Api extends ParentController
                     };
 
                     if ($mode === 'network') {
-                        // Network mode: only people search is supported here.
+                        // Network mode: supports people + posts + feeds.
+                        // (Notifications are cache-only for now.)
+                        $term = $networkPeopleTerm($q);
+                        $termOk = !($term === '' || strlen($term) < 2);
+
+                        $out['cursors'] = [];
+
                         if (in_array('people', $targets, true)) {
-                            $term = $networkPeopleTerm($q);
-                            if ($term === '' || strlen($term) < 2) {
+                            if (!$termOk) {
                                 $out['results']['people'] = [];
                             } else {
                                 $res = $this->xrpcSession('GET', 'app.bsky.actor.searchActors', $session, ['term' => $term, 'limit' => $limit]);
                                 $out['results']['people'] = $res['actors'] ?? [];
+                                $out['cursors']['people'] = $res['cursor'] ?? null;
                             }
                         }
+
+                        if (in_array('posts', $targets, true)) {
+                            if (!$termOk) {
+                                $out['results']['posts'] = [];
+                            } else {
+                                $res = $this->xrpcSession('GET', 'app.bsky.feed.searchPosts', $session, ['q' => $term, 'limit' => $limit]);
+                                $out['results']['posts'] = $res['posts'] ?? [];
+                                $out['cursors']['posts'] = $res['cursor'] ?? null;
+                            }
+                        }
+
+                        if (in_array('feeds', $targets, true)) {
+                            if (!$termOk) {
+                                $out['results']['feeds'] = [];
+                            } else {
+                                // app.bsky.feed.searchFeeds exists on modern Bluesky/PDS.
+                                // Some deployments may not expose it; treat as optional.
+                                try {
+                                    $res = $this->xrpcSession('GET', 'app.bsky.feed.searchFeeds', $session, ['q' => $term, 'limit' => $limit]);
+                                    $out['results']['feeds'] = $res['feeds'] ?? [];
+                                    $out['cursors']['feeds'] = $res['cursor'] ?? null;
+                                } catch (\Throwable $e) {
+                                    $out['results']['feeds'] = [];
+                                    $out['cursors']['feeds'] = null;
+                                    $out['warnings'] = array_values(array_unique(array_merge(
+                                        isset($out['warnings']) && is_array($out['warnings']) ? $out['warnings'] : [],
+                                        ['Feeds search not available on this server']
+                                    )));
+                                }
+                            }
+                        }
+
+                        if (in_array('lists', $targets, true)) {
+                            if (!$termOk) {
+                                $out['results']['lists'] = [];
+                            } else {
+                                // app.bsky.graph.searchLists exists on modern appviews.
+                                // Some deployments may not expose it; treat as optional.
+                                try {
+                                    $res = $this->xrpcSession('GET', 'app.bsky.graph.searchLists', $session, ['q' => $term, 'limit' => $limit]);
+                                    $out['results']['lists'] = $res['lists'] ?? [];
+                                    $out['cursors']['lists'] = $res['cursor'] ?? null;
+                                } catch (\Throwable $e) {
+                                    $out['results']['lists'] = [];
+                                    $out['cursors']['lists'] = null;
+                                    $out['warnings'] = array_values(array_unique(array_merge(
+                                        isset($out['warnings']) && is_array($out['warnings']) ? $out['warnings'] : [],
+                                        ['Lists search not available on this server']
+                                    )));
+                                }
+                            }
+                        }
+
+                        // Notifications aren't supported in network mode here.
+                        if (in_array('notifications', $targets, true) && !isset($out['results']['notifications'])) {
+                            $out['results']['notifications'] = [];
+                        }
+
+                        if (in_array('lists', $targets, true) && !isset($out['results']['lists'])) {
+                            $out['results']['lists'] = [];
+                        }
+
                         return $this->json($out);
                     }
 
@@ -6248,6 +7762,16 @@ class Api extends ParentController
                         $out['results']['posts'] = $items;
                     }
 
+                    if (in_array('feeds', $targets, true)) {
+                        // No cache table for feeds yet.
+                        $out['results']['feeds'] = [];
+                    }
+
+                    if (in_array('lists', $targets, true)) {
+                        // No cache table for lists yet.
+                        $out['results']['lists'] = [];
+                    }
+
                     if (in_array('notifications', $targets, true)) {
                         $useReasons = $reasons;
                         if (!$useReasons) {
@@ -6277,6 +7801,7 @@ class Api extends ParentController
                     $out['counts'] = [
                         'people' => isset($out['results']['people']) ? count((array)$out['results']['people']) : 0,
                         'posts' => isset($out['results']['posts']) ? count((array)$out['results']['posts']) : 0,
+                        'lists' => isset($out['results']['lists']) ? count((array)$out['results']['lists']) : 0,
                         'notifications' => isset($out['results']['notifications']) ? count((array)$out['results']['notifications']) : 0,
                     ];
 
@@ -6649,6 +8174,301 @@ class Api extends ParentController
         ];
     }
 
+    /* ===================== scheduled posts ===================== */
+
+    protected function parseIsoToTimestamp(?string $iso): ?int
+    {
+        $iso = trim((string)$iso);
+        if ($iso === '') return null;
+        try {
+            $dt = new \DateTimeImmutable($iso);
+            return $dt->getTimestamp();
+        } catch (\Throwable $e) {
+            return null;
+        }
+    }
+
+    protected function scheduledPostsListInternal(\PDO $pdo, string $actorDid, int $limit = 50, bool $includeDone = false): array
+    {
+        $limit = min(200, max(1, (int)$limit));
+        $actorDid = trim((string)$actorDid);
+        if ($actorDid === '') return [];
+
+        $where = 'actor_did = :a';
+        if (!$includeDone) {
+            $where .= ' AND state IN ("pending","posting","failed","error")';
+        }
+
+        $st = $pdo->prepare('SELECT id, actor_did, state, kind, scheduled_at, payload_json, attempts, last_error, next_attempt_at, result_uri, result_cid, created_at, updated_at
+            FROM scheduled_posts
+            WHERE ' . $where . '
+            ORDER BY scheduled_at ASC, id ASC
+            LIMIT :lim');
+        $st->bindValue(':a', $actorDid, \PDO::PARAM_STR);
+        $st->bindValue(':lim', $limit, \PDO::PARAM_INT);
+        $st->execute();
+        $rows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+
+        // Do not expose full payload by default (can include blobs); keep it server-only.
+        foreach ($rows as &$r) {
+            unset($r['payload_json']);
+        }
+        return $rows;
+    }
+
+    protected function processScheduledPostsInternal(\PDO $pdo, array &$session, string $actorDid, int $max = 25): array
+    {
+        $actorDid = trim((string)$actorDid);
+        $max = min(200, max(1, (int)$max));
+        if ($actorDid === '') return ['ok' => false, 'error' => 'Missing actorDid'];
+
+        $now = time();
+        $nowIso = gmdate('c', $now);
+        $stalePostingIso = gmdate('c', $now - 600);
+
+        // Pull due work. Include stale "posting" rows as recovery.
+        $st = $pdo->prepare('SELECT id, kind, scheduled_at, payload_json, attempts
+            FROM scheduled_posts
+            WHERE actor_did = :a
+              AND (
+                (state = "pending" AND scheduled_at <= :now AND (next_attempt_at IS NULL OR next_attempt_at <= :now))
+                OR (state = "posting" AND updated_at IS NOT NULL AND updated_at <= :stale)
+              )
+            ORDER BY scheduled_at ASC, id ASC
+            LIMIT :lim');
+        $st->bindValue(':a', $actorDid, \PDO::PARAM_STR);
+        $st->bindValue(':now', $nowIso, \PDO::PARAM_STR);
+        $st->bindValue(':stale', $stalePostingIso, \PDO::PARAM_STR);
+        $st->bindValue(':lim', $max, \PDO::PARAM_INT);
+        $st->execute();
+        $rows = $st->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+
+        $processed = 0;
+        $posted = 0;
+        $errors = 0;
+        $results = [];
+
+        $stMarkPosting = $pdo->prepare('UPDATE scheduled_posts SET state="posting", last_error=NULL, updated_at=:u WHERE actor_did=:a AND id=:id');
+        $stOk = $pdo->prepare('UPDATE scheduled_posts SET state="posted", attempts=:att, last_error=NULL, next_attempt_at=NULL, result_uri=:uri, result_cid=:cid, updated_at=:u WHERE actor_did=:a AND id=:id');
+        $stFail = $pdo->prepare('UPDATE scheduled_posts SET state=:s, attempts=:att, last_error=:e, next_attempt_at=:n, updated_at=:u WHERE actor_did=:a AND id=:id');
+
+        foreach ($rows as $row) {
+            if ($processed >= $max) break;
+            $id = (int)($row['id'] ?? 0);
+            if ($id <= 0) continue;
+
+            $attempts = (int)($row['attempts'] ?? 0);
+            $attemptsNext = $attempts + 1;
+
+            try {
+                $stMarkPosting->execute([':u' => $nowIso, ':a' => $actorDid, ':id' => $id]);
+
+                $kind = strtolower(trim((string)($row['kind'] ?? 'post')));
+                $payloadRaw = (string)($row['payload_json'] ?? '');
+                $payload = $payloadRaw !== '' ? (json_decode($payloadRaw, true) ?: null) : null;
+                if (!is_array($payload)) {
+                    throw new \RuntimeException('Invalid payload_json');
+                }
+
+                $interactions = (isset($payload['interactions']) && is_array($payload['interactions'])) ? $payload['interactions'] : null;
+
+                $applyGates = function(?string $createdUri, bool $isRootPost) use (&$session, $interactions): void {
+                    $uri = trim((string)$createdUri);
+                    if ($uri === '' || !is_array($interactions)) return;
+
+                    // Postgate: disable embedding/quotes.
+                    try {
+                        $quotesAllowed = $interactions['quotes']['allow'] ?? null;
+                        if ($quotesAllowed === false) {
+                            $rkey = $this->rkeyFromAtUri($uri);
+                            if ($rkey) {
+                                $rec = [
+                                    '$type' => 'app.bsky.feed.postgate',
+                                    'post' => $uri,
+                                    'createdAt' => gmdate('c'),
+                                    'embeddingRules' => [
+                                        ['$type' => 'app.bsky.feed.postgate#disableRule'],
+                                    ],
+                                ];
+                                $this->createRecord($session, 'app.bsky.feed.postgate', $rec, $rkey);
+                            }
+                        }
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+
+                    // Threadgate: reply controls apply to the root post only.
+                    if (!$isRootPost) return;
+                    try {
+                        $reply = $interactions['reply'] ?? null;
+                        if (!is_array($reply)) return;
+                        $mode = strtolower(trim((string)($reply['mode'] ?? 'everyone')));
+                        if ($mode === 'everyone') return;
+
+                        $allowIn = ($mode === 'nobody') ? [] : ($reply['allow'] ?? null);
+                        if ($mode === 'custom' && !is_array($allowIn)) $allowIn = [];
+                        if ($mode !== 'custom' && $mode !== 'nobody') return;
+
+                        $allow = [];
+                        if (is_array($allowIn)) {
+                            foreach ($allowIn as $rule) {
+                                $t = strtolower(trim((string)$rule));
+                                if ($t === 'mention' || $t === 'mentions' || $t === 'mentionrule') {
+                                    $allow[] = ['$type' => 'app.bsky.feed.threadgate#mentionRule'];
+                                } elseif ($t === 'follower' || $t === 'followers' || $t === 'followerrule') {
+                                    $allow[] = ['$type' => 'app.bsky.feed.threadgate#followerRule'];
+                                } elseif ($t === 'following' || $t === 'followingrule') {
+                                    $allow[] = ['$type' => 'app.bsky.feed.threadgate#followingRule'];
+                                } elseif ($t === 'list' || $t === 'listrule') {
+                                    $listUri = trim((string)($reply['listUri'] ?? ''));
+                                    if ($listUri === '') continue;
+                                    $allow[] = ['$type' => 'app.bsky.feed.threadgate#listRule', 'list' => $listUri];
+                                }
+                            }
+                        }
+
+                        $rkey = $this->rkeyFromAtUri($uri);
+                        if (!$rkey) return;
+                        $rec = [
+                            '$type' => 'app.bsky.feed.threadgate',
+                            'post' => $uri,
+                            'createdAt' => gmdate('c'),
+                            'allow' => array_values($allow),
+                        ];
+                        $this->createRecord($session, 'app.bsky.feed.threadgate', $rec, $rkey);
+                    } catch (\Throwable $e) {
+                        // ignore
+                    }
+                };
+
+                $rootCreated = null;
+
+                if ($kind === 'thread') {
+                    $parts = (isset($payload['parts']) && is_array($payload['parts'])) ? $payload['parts'] : [];
+                    $parts = array_slice($parts, 0, 10);
+                    if (!$parts) {
+                        throw new \RuntimeException('Missing parts');
+                    }
+
+                    $rootRef = null;
+                    $parentRef = null;
+                    for ($i = 0; $i < count($parts); $i++) {
+                        $p = $parts[$i];
+                        if (!is_array($p)) continue;
+                        $text = (string)($p['text'] ?? '');
+                        $text = trim($text);
+                        if ($text === '') continue;
+
+                        $record = [
+                            '$type' => 'app.bsky.feed.post',
+                            'text' => $text,
+                            'createdAt' => gmdate('c'),
+                        ];
+                        if (!empty($p['langs']) && is_array($p['langs'])) $record['langs'] = array_values($p['langs']);
+                        if (!empty($p['facets']) && is_array($p['facets'])) $record['facets'] = $p['facets'];
+                        if (!empty($p['embed']) && is_array($p['embed'])) $record['embed'] = $p['embed'];
+
+                        if ($i > 0 && is_array($rootRef) && is_array($parentRef)) {
+                            $record['reply'] = [
+                                'root' => $rootRef,
+                                'parent' => $parentRef,
+                            ];
+                        }
+
+                        $resp = $this->createRecord($session, 'app.bsky.feed.post', $record);
+                        $uri = isset($resp['uri']) ? (string)$resp['uri'] : '';
+                        $cid = isset($resp['cid']) ? (string)$resp['cid'] : '';
+
+                        if ($i === 0) {
+                            $rootCreated = ['uri' => $uri, 'cid' => $cid];
+                            $rootRef = ['uri' => $uri, 'cid' => $cid];
+                        }
+                        $parentRef = ['uri' => $uri, 'cid' => $cid];
+
+                        $applyGates($uri, $i === 0);
+                    }
+
+                    if (!$rootCreated || empty($rootCreated['uri'])) {
+                        throw new \RuntimeException('Thread post failed');
+                    }
+                } else {
+                    $post = (isset($payload['post']) && is_array($payload['post'])) ? $payload['post'] : null;
+                    if (!is_array($post)) {
+                        throw new \RuntimeException('Missing post');
+                    }
+                    $text = trim((string)($post['text'] ?? ''));
+                    if ($text === '') throw new \RuntimeException('Missing text');
+
+                    $record = [
+                        '$type' => 'app.bsky.feed.post',
+                        'text' => $text,
+                        'createdAt' => gmdate('c'),
+                    ];
+                    if (!empty($post['langs']) && is_array($post['langs'])) $record['langs'] = array_values($post['langs']);
+                    if (!empty($post['facets']) && is_array($post['facets'])) $record['facets'] = $post['facets'];
+                    if (!empty($post['embed']) && is_array($post['embed'])) $record['embed'] = $post['embed'];
+
+                    $resp = $this->createRecord($session, 'app.bsky.feed.post', $record);
+                    $uri = isset($resp['uri']) ? (string)$resp['uri'] : '';
+                    $cid = isset($resp['cid']) ? (string)$resp['cid'] : '';
+                    $rootCreated = ['uri' => $uri, 'cid' => $cid];
+
+                    $applyGates($uri, true);
+                }
+
+                $stOk->execute([
+                    ':att' => $attemptsNext,
+                    ':uri' => (string)($rootCreated['uri'] ?? ''),
+                    ':cid' => (string)($rootCreated['cid'] ?? ''),
+                    ':u' => $nowIso,
+                    ':a' => $actorDid,
+                    ':id' => $id,
+                ]);
+
+                $processed++;
+                $posted++;
+                $results[] = ['id' => $id, 'ok' => true, 'uri' => (string)($rootCreated['uri'] ?? ''), 'cid' => (string)($rootCreated['cid'] ?? '')];
+            } catch (\Throwable $e) {
+                $processed++;
+                $errors++;
+
+                $msg = (string)($e->getMessage() ?? 'Scheduled post failed');
+
+                // Conservative retry: a few attempts with backoff, then mark error.
+                $state = ($attemptsNext >= 3) ? 'error' : 'pending';
+                $nextIso = null;
+                if ($state === 'pending') {
+                    $wait = 60 * (int)pow(2, max(0, $attemptsNext - 1));
+                    $wait = min(3600, max(60, $wait));
+                    $nextIso = gmdate('c', time() + $wait);
+                }
+
+                try {
+                    $stFail->execute([
+                        ':s' => $state,
+                        ':att' => $attemptsNext,
+                        ':e' => $msg,
+                        ':n' => $nextIso,
+                        ':u' => $nowIso,
+                        ':a' => $actorDid,
+                        ':id' => $id,
+                    ]);
+                } catch (\Throwable $e2) {
+                    // ignore
+                }
+                $results[] = ['id' => $id, 'ok' => false, 'error' => $msg, 'retryAt' => $nextIso];
+            }
+        }
+
+        return [
+            'ok' => true,
+            'processed' => $processed,
+            'posted' => $posted,
+            'errors' => $errors,
+            'results' => $results,
+        ];
+    }
+
     /* ===================== SQLite cache helpers ===================== */
 
     protected function cacheDir(): string
@@ -6836,6 +8656,21 @@ class Api extends ParentController
                 )');
                 $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_post_hidden_group ON group_post_hidden(group_id, hidden_at)');
 
+                // Group pinned posts / announcements (site-local).
+                $pdo->exec('CREATE TABLE IF NOT EXISTS group_pins (
+                    group_id INTEGER NOT NULL,
+                    post_uri TEXT NOT NULL,
+                    pinned_by_did TEXT NOT NULL,
+                    pinned_at TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    is_announcement INTEGER NOT NULL DEFAULT 0,
+                    note TEXT,
+                    PRIMARY KEY(group_id, post_uri)
+                )');
+                $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_pins_group_time ON group_pins(group_id, pinned_at DESC)');
+                $this->cacheEnsureColumn($pdo, 'group_pins', 'sort_order', 'INTEGER');
+                $this->cacheBackfillGroupPinsSortOrder($pdo);
+
                 // Group phrase filters (keyword/phrase moderation).
                 $pdo->exec('CREATE TABLE IF NOT EXISTS group_phrase_filters (
                     group_id INTEGER NOT NULL,
@@ -6865,6 +8700,25 @@ class Api extends ParentController
 
                 // OAuth background refresh requires client_id to be persisted.
                 $this->cacheEnsureColumn($pdo, 'auth_sessions', 'client_id', 'TEXT');
+
+                // Scheduled posts queue (durable; published by a background job).
+                $pdo->exec('CREATE TABLE IF NOT EXISTS scheduled_posts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    actor_did TEXT NOT NULL,
+                    state TEXT NOT NULL DEFAULT "pending",
+                    kind TEXT NOT NULL DEFAULT "post",
+                    scheduled_at TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    next_attempt_at TEXT,
+                    result_uri TEXT,
+                    result_cid TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )');
+                $pdo->exec('CREATE INDEX IF NOT EXISTS idx_scheduled_posts_actor_state_time ON scheduled_posts(actor_did, state, scheduled_at)');
+                $pdo->exec('CREATE INDEX IF NOT EXISTS idx_scheduled_posts_actor_next_attempt ON scheduled_posts(actor_did, next_attempt_at)');
                 return;
             }
         } catch (\Throwable $e) {
@@ -7143,6 +8997,25 @@ class Api extends ParentController
             // ignore; LIKE fallback will still work using posts.text/raw_json.
         }
 
+        // Scheduled posts queue (durable; published by a background job).
+        $pdo->exec('CREATE TABLE IF NOT EXISTS scheduled_posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            actor_did TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT "pending",
+            kind TEXT NOT NULL DEFAULT "post",
+            scheduled_at TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            next_attempt_at TEXT,
+            result_uri TEXT,
+            result_cid TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_scheduled_posts_actor_state_time ON scheduled_posts(actor_did, state, scheduled_at)');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_scheduled_posts_actor_next_attempt ON scheduled_posts(actor_did, next_attempt_at)');
+
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_snapshots_actor_kind ON snapshots(actor_did, kind, taken_at)');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_edges_actor_kind ON edges(actor_did, kind)');
 
@@ -7268,6 +9141,21 @@ class Api extends ParentController
             PRIMARY KEY(group_id, post_uri)
         )');
         $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_post_hidden_group ON group_post_hidden(group_id, hidden_at)');
+
+        // Group pinned posts / announcements (site-local).
+        $pdo->exec('CREATE TABLE IF NOT EXISTS group_pins (
+            group_id INTEGER NOT NULL,
+            post_uri TEXT NOT NULL,
+            pinned_by_did TEXT NOT NULL,
+            pinned_at TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            is_announcement INTEGER NOT NULL DEFAULT 0,
+            note TEXT,
+            PRIMARY KEY(group_id, post_uri)
+        )');
+        $pdo->exec('CREATE INDEX IF NOT EXISTS idx_group_pins_group_time ON group_pins(group_id, pinned_at DESC)');
+        $this->cacheEnsureColumn($pdo, 'group_pins', 'sort_order', 'INTEGER');
+        $this->cacheBackfillGroupPinsSortOrder($pdo);
 
         // Group phrase filters (keyword/phrase moderation).
         $pdo->exec('CREATE TABLE IF NOT EXISTS group_phrase_filters (
@@ -7893,6 +9781,52 @@ class Api extends ParentController
             $pdo->exec("ALTER TABLE $table ADD COLUMN $column $type");
         } catch (\Throwable $e) {
             // swallow; schema drift isn't fatal for runtime, but may reduce features.
+        }
+    }
+
+    protected function cacheBackfillGroupPinsSortOrder(\PDO $pdo): void
+    {
+        try {
+            $done = $this->cacheMetaGet($pdo, null, 'group_pins_sort_order_backfill_done');
+            if ($done === '1') return;
+
+            // If the table doesn't exist yet (or is missing the column), just bail.
+            $cols = $pdo->query('PRAGMA table_info(group_pins)')->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+            $haveSort = false;
+            foreach ($cols as $c) {
+                if (($c['name'] ?? null) === 'sort_order') { $haveSort = true; break; }
+            }
+            if (!$haveSort) return;
+
+            // Only touch legacy rows that still have NULL sort_order.
+            $nulls = (int)($pdo->query('SELECT COUNT(1) FROM group_pins WHERE sort_order IS NULL')->fetchColumn() ?: 0);
+            if ($nulls <= 0) {
+                $this->cacheMetaSet($pdo, null, 'group_pins_sort_order_backfill_done', '1');
+                return;
+            }
+
+            $groups = $pdo->query('SELECT DISTINCT group_id FROM group_pins WHERE sort_order IS NULL')->fetchAll(\PDO::FETCH_COLUMN, 0) ?: [];
+            $stPins = $pdo->prepare('SELECT post_uri FROM group_pins WHERE group_id = :g ORDER BY pinned_at DESC');
+            $stUp = $pdo->prepare('UPDATE group_pins SET sort_order = :o WHERE group_id = :g AND post_uri = :u');
+
+            $pdo->beginTransaction();
+            foreach ($groups as $gidRaw) {
+                $gid = (int)$gidRaw;
+                $stPins->execute([':g' => $gid]);
+                $uris = $stPins->fetchAll(\PDO::FETCH_COLUMN, 0) ?: [];
+
+                $i = 0;
+                foreach ($uris as $u) {
+                    $u = (string)$u;
+                    $stUp->execute([':o' => $i, ':g' => $gid, ':u' => $u]);
+                    $i++;
+                }
+            }
+            $this->cacheMetaSet($pdo, null, 'group_pins_sort_order_backfill_done', '1');
+            $pdo->commit();
+        } catch (\Throwable $e) {
+            try { if ($pdo->inTransaction()) $pdo->rollBack(); } catch (\Throwable $e2) { /* ignore */ }
+            // Swallow: ordering backfill is a best-effort migration.
         }
     }
 

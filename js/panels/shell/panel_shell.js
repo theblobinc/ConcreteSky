@@ -1,11 +1,14 @@
+import { bindPersistedScrollTop } from '../panel_api.js';
+
 class BskyPanelShell extends HTMLElement {
   static get observedAttributes() {
-    return ['title', 'dense'];
+    return ['title', 'dense', 'persist-key', 'persist-storage'];
   }
 
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
+    this._unbindPersist = null;
   }
 
   connectedCallback() {
@@ -29,10 +32,14 @@ class BskyPanelShell extends HTMLElement {
         :host, *, *::before, *::after{box-sizing:border-box}
         :host{
           display:block;
-          color: var(--bsky-panel-fg, #fff);
-          background: var(--bsky-panel-bg, #070707);
-          border: 1px solid var(--bsky-panel-border, #333);
-          border-radius: var(--bsky-panel-radius, 0px);
+           /* Theme tokens are expected to be provided by :root/host.
+             Components should prefer var(--bsky-*, fallback) over hardcoded colors. */
+           font-family: var(--bsky-font-family, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif);
+
+           color: var(--bsky-panel-fg, var(--bsky-fg, #fff));
+           background: var(--bsky-panel-bg, var(--bsky-bg, #070707));
+           border: 1px solid var(--bsky-panel-border, var(--bsky-border, #333));
+           border-radius: var(--bsky-panel-radius, var(--bsky-radius, 0px));
 
           --_pad: var(--bsky-panel-pad, 0px);
           --_gap: var(--bsky-panel-gap, 0px);
@@ -76,6 +83,19 @@ class BskyPanelShell extends HTMLElement {
         <div class="footer"><slot name="footer"></slot></div>
       </div>
     `;
+
+    // Opt-in scroll persistence: panels can set persist-key="posts" (etc) on the shell.
+    try { this._unbindPersist?.(); } catch {}
+    this._unbindPersist = null;
+    try {
+      const key = String(this.getAttribute('persist-key') || '').trim();
+      if (key) {
+        const storage = String(this.getAttribute('persist-storage') || 'session').trim() || 'session';
+        this._unbindPersist = bindPersistedScrollTop(this.getScroller(), key, { storage });
+      }
+    } catch {
+      // ignore
+    }
   }
 }
 

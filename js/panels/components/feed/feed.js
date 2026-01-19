@@ -1,6 +1,9 @@
 import { call } from '../../../api.js';
 import { identityCss, identityHtml, bindCopyClicks } from '../../../lib/identity.js';
-import { bindInfiniteScroll } from '../../panel_api.js';
+import { PanelListController } from '../../../controllers/panel_list_controller.js';
+import { ListWindowingController } from '../../../controllers/list_windowing_controller.js';
+import { renderListEndcap } from '../../panel_api.js';
+import { renderPostTextHtml } from '../../../components/interactions/utils.js';
 
 const esc = (s) => String(s || '').replace(/[<>&"]/g, (m) =>
   ({'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[m])
@@ -18,8 +21,78 @@ class BskyFeed extends HTMLElement {
     this._scrollTop = 0;
     this._renderedCount = 0;
     this._hasStaticDom = false;
-    this._infiniteScrollEl = null;
-    this._unbindInfiniteScroll = null;
+
+    this._listCtl = new PanelListController(this, {
+      getScroller: () => {
+        try { return this.shadowRoot?.getElementById?.('scroll') || null; } catch { return null; }
+      },
+      itemSelector: 'article.post[data-uri]',
+      keyAttr: 'data-uri',
+      onLoadMore: () => this.loadMore(),
+      enabled: () => true,
+      isLoading: () => !!this.loading,
+      hasMore: () => !!this.cursor,
+      threshold: 280,
+      cooldownMs: 250,
+      ensureKeyVisible: (key) => this._winCtl?.ensureKeyVisible?.(key),
+    });
+
+    this._winCtl = new ListWindowingController(this, {
+      listSelector: '#list',
+      itemSelector: 'article.post[data-uri]',
+      keyAttr: 'data-uri',
+      getRoot: () => this.shadowRoot,
+      getScroller: () => {
+        try { return this.shadowRoot?.getElementById?.('scroll') || null; } catch { return null; }
+      },
+      enabled: () => true,
+      getLayout: () => 'list',
+      minItemsToWindow: 120,
+      estimatePx: 220,
+      overscanItems: 24,
+      keyFor: (it) => String(it?.post?.uri || ''),
+      renderRow: (it) => this._renderFeedPost(it),
+    });
+  }
+
+  disconnectedCallback(){
+    try { this._listCtl?.disconnect?.(); } catch {}
+    try { this._winCtl?.disconnect?.(); } catch {}
+  }
+
+  _renderFeedPost(it){
+    const meDid = window.BSKY?.meDid;
+    const p = it?.post || {};
+    const rec = p?.record || {};
+    const author = p?.author || {};
+
+    const text = renderPostTextHtml(rec?.text || '');
+    const uri = p?.uri || '';
+    const cid = p?.cid || '';
+    const canLike = !!(uri && cid && author.did && meDid && author.did !== meDid);
+    const when = fmtTime(rec?.createdAt || p?.indexedAt || '');
+    const rel = this.followMap[author.did] || {};
+    const following = !!rel.following;
+    const postId = String((p?.uri || '').split('/').pop() || '');
+
+    return `<article class="post" data-uri="${esc(uri)}">
+      <header class="meta">
+        <bsky-lazy-img class="avatar" src="${esc(author.avatar || '')}" alt="" aspect="1/1"></bsky-lazy-img>
+        <div class="who">
+          <div class="name">${identityHtml({ did: author.did, handle: author.handle, displayName: author.displayName }, { showHandle: true, showCopyDid: true })}</div>
+        </div>
+        <div class="time">${esc(when)}</div>
+        <div class="actions">
+          ${author.did && !following ? `<button class="follow-btn" data-follow-did="${esc(author.did)}">Follow</button>` : `<span class="following-badge" ${following?'':'style="display:none"'}>Following</span>`}
+        </div>
+      </header>
+      <div class="text">${text}</div>
+      <footer class="row">
+        <button class="who-liked" data-like-uri="${esc(uri)}" title="See who liked this">♥ Who liked${typeof p.likeCount === 'number' ? ` (${p.likeCount})` : ''}</button>
+        ${canLike ? `<button class="like" disabled title="Like coming soon">♡ Like</button>` : ``}
+        <a class="open" target="_blank" rel="noopener" href="https://bsky.app/profile/${esc(author.handle || author.did)}/post/${esc(postId)}">Open</a>
+      </footer>
+    </article>`;
   }
 
   _isRateLimitError(e) {
@@ -197,39 +270,7 @@ class BskyFeed extends HTMLElement {
   }
 
   render(){
-    const meDid = window.BSKY?.meDid;
-
-    const renderPosts = (items) => items.map(it => {
-      const p = it.post || {};
-      const rec = p.record || {};
-      const author = p.author || {};
-      const text = esc(rec.text || '');
-      const uri = p.uri || '';
-      const cid = p.cid || '';
-      const canLike = !!(uri && cid && author.did && meDid && author.did !== meDid);
-      const when = fmtTime(rec.createdAt || p.indexedAt || '');
-      const rel = this.followMap[author.did] || {};
-      const following = !!rel.following;
-
-      return `<article class="post" data-uri="${esc(uri)}">
-        <header class="meta">
-          <bsky-lazy-img class="avatar" src="${esc(author.avatar || '')}" alt="" aspect="1/1"></bsky-lazy-img>
-          <div class="who">
-            <div class="name">${identityHtml({ did: author.did, handle: author.handle, displayName: author.displayName }, { showHandle: true, showCopyDid: true })}</div>
-          </div>
-          <div class="time">${esc(when)}</div>
-          <div class="actions">
-            ${author.did && !following ? `<button class="follow-btn" data-follow-did="${esc(author.did)}">Follow</button>` : `<span class="following-badge" ${following?'':'style="display:none"'}>Following</span>`}
-          </div>
-        </header>
-        <div class="text">${text}</div>
-        <footer class="row">
-          <button class="who-liked" data-like-uri="${esc(uri)}" title="See who liked this">♥ Who liked${typeof p.likeCount === 'number' ? ` (${p.likeCount})` : ''}</button>
-          ${canLike ? `<button class="like" disabled title="Like coming soon">♡ Like</button>` : ``}
-          <a class="open" target="_blank" rel="noopener" href="https://bsky.app/profile/${esc(author.handle || author.did)}/post/${esc((p.uri || '').split('/').pop() || '')}">Open</a>
-        </footer>
-      </article>`;
-    }).join('');
+    this._winCtl.setItems(this.items || []);
 
     const modal = this.modal.open ? (() => {
       const list = (this.modal.likers || []).map(a => {
@@ -277,36 +318,37 @@ class BskyFeed extends HTMLElement {
       if (this._hasStaticDom) return false;
       this.shadowRoot.innerHTML = `
         <style>
-          :host{display:block}
-          .wrap{background:#000;border:1px solid #222;border-radius:12px;padding:6px}
+          :host{display:block;color:var(--bsky-fg, #fff);font-family:var(--bsky-font-family, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif)}
+          .wrap{background:var(--bsky-bg, #000);border:1px solid var(--bsky-border-subtle, #222);border-radius:12px;padding:6px}
           #scroll{max-height:60vh; overflow:auto; padding:2px}
-          .post{border:1px solid #333; border-radius:10px; padding:12px; margin:10px 0; color:#fff; background:#0b0b0b}
+          .post{border:1px solid var(--bsky-border, #333); border-radius:10px; padding:12px; margin:10px 0; color:var(--bsky-fg, #fff); background:var(--bsky-surface, #0b0b0b)}
           .meta{display:flex; align-items:center; gap:10px; margin-bottom:8px}
-          .avatar{width:36px;height:36px;border-radius:50%;background:#222;object-fit:cover}
+          .avatar{width:36px;height:36px;border-radius:50%;background:var(--bsky-surface-2, #222);object-fit:cover}
           .who{display:flex;flex-direction:column;min-width:0}
           .name{font-weight:700;line-height:1}
-          .handle{color:#bbb;font-size:.9rem;line-height:1}
-          .time{margin-left:auto;color:#888;font-size:.85rem}
+          .handle{color:var(--bsky-muted-fg, #bbb);font-size:.9rem;line-height:1}
+          .time{margin-left:auto;color:var(--bsky-muted-fg, #888);font-size:.85rem}
           .actions{margin-left:12px}
           .following-badge{color:#7bdc86;font-size:.9rem}
           .text{white-space:pre-wrap;line-height:1.35;margin:6px 0 2px}
           .row{margin-top:8px; display:flex; gap:8px; align-items:center}
-          button, .open{background:#121212;border:1px solid #555;color:#fff;padding:6px 10px;border-radius:8px;cursor:pointer;text-decoration:none}
+          button, .open{background:var(--bsky-btn-bg, #121212);border:1px solid var(--bsky-border-soft, #555);color:var(--bsky-fg, #fff);padding:6px 10px;border-radius:8px;cursor:pointer;text-decoration:none}
           button:hover, .open:hover{background:#1b1b1b}
-          .muted{color:#aaa}
-          .err{color:#f88}
+          .muted{color:var(--bsky-muted-fg, #aaa)}
+          .err{color:var(--bsky-danger-fg, #f88)}
+          .win-spacer{width:100%;pointer-events:none;contain:layout size style}
 
           .overlay{position:fixed; inset:0; background:rgba(0,0,0,.6); display:flex; align-items:center; justify-content:center; z-index:99999;}
-          .modal{background:#0b0b0b; color:#fff; border:1px solid #444; border-radius:12px; width:min(760px, 94vw); max-height:80vh; overflow:auto; box-shadow:0 10px 40px rgba(0,0,0,.6);}
-          .head{display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid #333; position:sticky; top:0; background:#0b0b0b}
+          .modal{background:var(--bsky-surface, #0b0b0b); color:var(--bsky-fg, #fff); border:1px solid var(--bsky-border, #444); border-radius:12px; width:min(760px, 94vw); max-height:80vh; overflow:auto; box-shadow:0 10px 40px rgba(0,0,0,.6);}
+          .head{display:flex; align-items:center; justify-content:space-between; padding:12px 14px; border-bottom:1px solid var(--bsky-border, #333); position:sticky; top:0; background:var(--bsky-surface, #0b0b0b)}
           .actions{display:flex; gap:8px}
           .body{padding:12px 14px}
           .likers-list{display:flex; flex-direction:column; gap:10px}
-          .liker{display:flex; justify-content:space-between; align-items:center; border:1px solid #333; border-radius:10px; padding:10px; background:#0f0f0f}
+          .liker{display:flex; justify-content:space-between; align-items:center; border:1px solid var(--bsky-border, #333); border-radius:10px; padding:10px; background:var(--bsky-input-bg, #0f0f0f)}
           .li-meta{display:flex; align-items:center; gap:10px}
-          .li-avatar{width:36px;height:36px;border-radius:50%;object-fit:cover;background:#222}
-          .li-name a{color:#fff; text-decoration:underline}
-          .li-handle{color:#bbb; font-size:.9rem}
+          .li-avatar{width:36px;height:36px;border-radius:50%;object-fit:cover;background:var(--bsky-surface-2, #222)}
+          .li-name a{color:var(--bsky-fg, #fff); text-decoration:underline}
+          .li-handle{color:var(--bsky-muted-fg, #bbb); font-size:.9rem}
           .already{color:#7bdc86; font-size:.9rem}
           .close{border-color:#666}
           #load-more{width:100%}
@@ -318,7 +360,7 @@ class BskyFeed extends HTMLElement {
         <div class="wrap">
           <div id="scroll" tabindex="0">
             <div id="list"></div>
-            <div id="empty" class="muted"></div>
+            <div id="endcap"></div>
             <div id="err" class="err" hidden></div>
           </div>
           <div class="footer">
@@ -341,24 +383,20 @@ class BskyFeed extends HTMLElement {
 
       const listEl = this.shadowRoot.getElementById('list');
       if (listEl) {
-        if (this._renderedCount > this.items.length) {
-          listEl.innerHTML = '';
-          this._renderedCount = 0;
-        }
-
-        if (this._renderedCount === 0) {
-          listEl.innerHTML = renderPosts(this.items);
-          this._renderedCount = this.items.length;
-        } else if (this.items.length > this._renderedCount) {
-          listEl.insertAdjacentHTML('beforeend', renderPosts(this.items.slice(this._renderedCount)));
-          this._renderedCount = this.items.length;
-        }
+        listEl.innerHTML = this._winCtl.innerHtml({ loadingHtml: '', emptyHtml: '' });
+        this._renderedCount = this.items.length;
       }
 
-      const emptyEl = this.shadowRoot.getElementById('empty');
-      if (emptyEl) {
-        if (!this.items.length) emptyEl.textContent = this.loading ? 'Loading…' : 'No posts.';
-        else emptyEl.textContent = '';
+      const endcapEl = this.shadowRoot.getElementById('endcap');
+      if (endcapEl) {
+        const hasMore = !!this.cursor;
+        endcapEl.innerHTML = renderListEndcap({
+          loading: !!this.loading && !this.items.length,
+          loadingMore: !!this.loading && !!this.items.length,
+          hasMore,
+          count: this.items.length,
+          emptyText: 'No posts.',
+        });
       }
 
       const errEl = this.shadowRoot.getElementById('err');
@@ -374,22 +412,14 @@ class BskyFeed extends HTMLElement {
 
       const moreBtn = this.shadowRoot.getElementById('load-more');
       if (moreBtn) {
+        moreBtn.hidden = !this.cursor;
         moreBtn.disabled = !!(this.loading || !this.cursor);
-        moreBtn.textContent = this.cursor ? 'Load more' : 'No more';
-      }
-
-      if (scroller && scroller !== this._infiniteScrollEl) {
-        try { this._unbindInfiniteScroll?.(); } catch {}
-        this._infiniteScrollEl = scroller;
-        this._unbindInfiniteScroll = bindInfiniteScroll(scroller, () => this.loadMore(), {
-          threshold: 280,
-          enabled: () => true,
-          isLoading: () => !!this.loading,
-          hasMore: () => !!this.cursor,
-          initialTick: false,
-        });
+        moreBtn.textContent = 'Load more';
       }
     } catch {}
+
+    this._winCtl.afterRender();
+    this._listCtl.afterRender();
 
     queueMicrotask(() => {
       requestAnimationFrame(() => {

@@ -463,16 +463,16 @@ export class BskyGroupsPanel extends HTMLElement {
 
     this.shadowRoot.innerHTML = `
       <style>
-        :host{display:block;color:#fff}
+        :host{display:block;color:var(--bsky-fg,#fff);font-family:var(--bsky-font-family,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif)}
         .wrap{padding:10px}
         .top{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
         .top .title{font-weight:700}
         .top .spacer{flex:1}
-        .btn{background:#111;border:1px solid #333;color:#fff;padding:6px 10px;cursor:pointer}
+        .btn{background:var(--bsky-btn-bg,#111);border:1px solid var(--bsky-border,#333);color:var(--bsky-fg,#fff);padding:6px 10px;cursor:pointer}
         .btn[disabled]{opacity:.6;cursor:not-allowed}
-        .muted{opacity:.75;font-size:12px}
-        .err{background:#2a0c0c;border:1px solid #5a1c1c;padding:8px 10px;margin:8px 0}
-        .card{border:1px solid #222;background:#0b0b0b;margin:8px 0;padding:10px}
+        .muted{color:var(--bsky-muted-fg,rgba(255,255,255,.75));font-size:12px}
+        .err{background:var(--bsky-danger-bg,#2a0c0c);border:1px solid var(--bsky-danger-border,#5a1c1c);padding:8px 10px;margin:8px 0}
+        .card{border:1px solid var(--bsky-border-soft,#222);background:var(--bsky-surface,#0b0b0b);margin:8px 0;padding:10px}
         .row{display:flex;gap:10px;align-items:flex-start}
         .meta{flex:1;min-width:0}
         .title{font-weight:700}
@@ -480,19 +480,19 @@ export class BskyGroupsPanel extends HTMLElement {
         .desc{margin-top:6px;opacity:.9;white-space:pre-wrap}
         .sub{margin-top:6px;opacity:.75;font-size:12px}
         .actions{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-start}
-        .pending{margin-top:10px;border-top:1px solid #222;padding-top:10px}
+        .pending{margin-top:10px;border-top:1px solid var(--bsky-border-soft,#222);padding-top:10px}
         .pending-title{font-weight:700;font-size:12px;opacity:.85;margin-bottom:8px}
-        .pending-row{display:flex;gap:10px;align-items:center;justify-content:space-between;border:1px solid #1a1a1a;background:#070707;padding:8px;margin:6px 0}
+        .pending-row{display:flex;gap:10px;align-items:center;justify-content:space-between;border:1px solid var(--bsky-border-subtle,#111);background:var(--bsky-bg,#070707);padding:8px;margin:6px 0}
         .pending-did{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:12px;opacity:.95;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
         .pending-actions{display:flex;gap:8px;flex-wrap:wrap}
-        .invite{margin-top:10px;border-top:1px solid #222;padding-top:10px}
+        .invite{margin-top:10px;border-top:1px solid var(--bsky-border-soft,#222);padding-top:10px}
         .invite-title{font-weight:700;font-size:12px;opacity:.85;margin-bottom:8px}
         .invite-actions{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
         .invite-token{margin-top:6px}
         .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace}
-        form{border:1px solid #222;background:#0b0b0b;margin-top:12px;padding:10px}
+        form{border:1px solid var(--bsky-border-soft,#222);background:var(--bsky-surface,#0b0b0b);margin-top:12px;padding:10px}
         label{display:block;font-size:12px;opacity:.8;margin-top:8px}
-        input, textarea, select{width:100%;background:#000;border:1px solid #333;color:#fff;padding:8px}
+        input, textarea, select{width:100%;background:var(--bsky-input-bg,#000);border:1px solid var(--bsky-border,#333);color:var(--bsky-fg,#fff);padding:8px}
         textarea{min-height:70px;resize:vertical}
         .hint{font-size:12px;opacity:.7;margin-top:6px}
       </style>
